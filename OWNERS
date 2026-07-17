@@ -1,0 +1,6 @@
+approvers:
+- gardener-maintainers
+reviewers:
+- gardener-maintainers
+labels:
+- area/extension-f5

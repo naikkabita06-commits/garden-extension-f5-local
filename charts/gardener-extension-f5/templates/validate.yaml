@@ -1,0 +1,5 @@
+{{- /*
+This file exists only to execute chart validations during render.
+It intentionally renders no Kubernetes resources.
+*/ -}}
+{{- include "gardener-extension-f5.validate" . -}}

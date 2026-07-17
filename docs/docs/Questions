@@ -1,0 +1,185 @@
+Q1: When we use F5 for Service type=LoadBalancer, will we register the shoot worker nodes or master nodes for F5 to route traffic from outside the shoot?
+
+Only worker nodes (or directly pod IPs), never masters.
+
+The Gardener control‑plane (masters) is outside the Shoot; data‑plane traffic for Services must go only to Shoot worker node IPs / pod IPs.
+
+The F5 side (via CMP’s LBaaS controller) will automatically add/remove these backends based on Kubernetes Endpoints/Nodes; we do not send traffic to master/control‑plane nodes.
+
+---
+
+Q2: If we do not manually register nodes but only use a VIP, who is responsible for providing this VIP?
+
+Here “VIP” (virtual server IP) is the **client‑facing IP** where users connect (e.g. `203.0.113.10`).  
+
+This VIP is provided by the Airtel cloud / CMP (LBaaS) / network team.
+
+Gardener/F5 extension just **consumes** it via the CRD:
+
+```yaml
+spec:
+  vip: "<virtual server IP provided by Airtel/CMP>"
+```
+
+Gardener does not allocate or own this IP. Any **internal F5 floating/self IPs** used for HA are managed by CMP and are not exposed in this CRD.
+
+---
+
+Q3: How does this VIP function?
+
+The VIP (virtual server IP) is configured on an F5 HA pair by CMP’s LBaaS:
+
+- It is active on the currently‑active F5 device.
+- On failover, the VIP “moves” to the standby device.
+- Clients always hit the same VIP; they never see which physical F5 node is active.
+
+Behind that VIP, F5 (driven by CMP LBaaS) load‑balances traffic to the configured backends (Shoot worker nodes or pod IPs).
+
+In our config, this is the `spec.vip` field:
+
+```yaml
+spec:
+  vip: "203.0.113.10"
+```
+
+---
+
+Q4: If Ingress can be used to route external traffic then why do we need a Service type=LoadBalancer?
+
+They work together:
+
+- An Ingress controller (e.g. NGINX) runs inside the cluster as Pods.
+- To make it reachable from outside, it is fronted by a Service, usually `type: LoadBalancer`.
+- That Service gets an external IP/VIP from F5 via CMP LBaaS.
+- Clients connect to that VIP:
+
+  `Client → F5 VIP → Ingress controller Service → backend Services/Pods`.
+
+So:
+
+- **Ingress** = HTTP/HTTPS routing rules (host/path → Service).
+- **Service type=LoadBalancer** = gives an external IP/VIP (via F5/CMP) to the Ingress controller (and to any other Service you want to expose).
+
+---
+
+Q5: End users have the liberty to deploy another Ingress controller; how will that work?
+
+Users can deploy their own Ingress controller (NGINX, Traefik, etc.) as Pods.
+
+They expose it via their own Service, typically:
+
+```yaml
+kind: Service
+spec:
+  type: LoadBalancer
+```
+
+CMP’s LBaaS (using F5) will then give that Service its own VIP.
+
+Their Ingress controller uses that VIP to receive external traffic and route to its own backend Services.
+
+Multiple Ingress controllers can coexist, each with its own Service/VIP, selected via `IngressClass` or annotations.
+
+---
+
+Q6: In Gardener, how will Ingress and Service type=LoadBalancer function for different Shoots?
+
+Each Shoot is its own Kubernetes cluster:
+
+- Inside each Shoot:
+  - The default Ingress controller (installed by Gardener) has a Service (usually `type: LoadBalancer`) → gets a VIP (from CMP/F5) and routes HTTP(S) for that Shoot only.
+  - Any user‑created `Service` `type=LoadBalancer` also results in CMP/F5 configuring a VIP pointing to that Shoot’s worker nodes/pods.
+
+- The F5‑based LBaaS runs in the Airtel platform; Gardener’s extension only configures what is needed for the Shoot (for example: the control‑plane VIP), using different F5 partitions/VIPs and/or naming to keep tenants/Shoots separated.
+
+So Ingress and LoadBalancer Services are isolated per Shoot, but all are ultimately implemented via F5 through CMP’s LBaaS API.
+
+---
+
+Application plane: if a Service of type=LoadBalancer is created when there are 2 nodes, and later the cluster scales to 3 worker nodes, how does the third node get attached?
+
+Timeline:
+
+- **T0 – Service created, 2 worker nodes**
+
+  - Shoot has worker nodes `node1`, `node2`.
+  - User creates `Service type=LoadBalancer`.
+  - Pods for that Service run on `node1` and `node2`.
+  - Kubernetes writes these into `Endpoints` / `EndpointSlice`:
+    - backend A: `node1-IP:port` (or pod IP)
+    - backend B: `node2-IP:port` (or pod IP)
+  - CMP/F5 LBaaS sees these 2 backends and configures F5:
+    - pool members = `node1`, `node2`
+    - VIP → pool(`node1`,`node2`)
+
+- **T1 – Autoscaling adds 1 more worker node**
+
+  - Cluster scales out: new worker `node3` is created.
+  - Scheduler starts placing Service Pods on `node3`.
+  - Kubernetes updates `Endpoints` / `EndpointSlice`:
+    - backend A: `node1-IP:port`
+    - backend B: `node2-IP:port`
+    - backend C: `node3-IP:port` ← new
+  - The LBaaS controller watching `Endpoints` sees this change and:
+    - compares “what Kubernetes says” vs “what F5 pool currently has”,
+    - calls its API logic again to add `node3-IP:port` as a new pool member.
+  - Pool now = `node1`, `node2`, `node3`.
+
+No manual step:
+
+- Kubernetes updates `Endpoints` when Pods/nodes change.
+- The LBaaS/F5 controller keeps the F5 pool in sync:
+  - new node/pod → add member to pool,
+  - removed node/pod → remove member from pool.
+
+All these nodes are worker nodes or master nodes?
+
+All backends here are **Shoot worker nodes** (their IPs) or **pod IPs on those worker nodes**, never master/control‑plane nodes.
+
+The control plane (kube‑apiserver, etcd, controllers) runs as Pods in the Seed (or in a separate control‑plane cluster) and is fronted by a separate control‑plane VIP (also via F5/CMP). That is a different use‑case from the application plane.
+
+
+
+Mostly yes — this specific “CMP UI only shows my VM” problem is a provider-local / kind artifact, and it should go away when the Shoot workers are real OpenStack VMs.
+
+In a production-like setup with Gardener + provider-openstack:
+
+Shoot worker nodes are created as actual OpenStack Nova instances.
+Those instances can be “visible” to your platform tooling (CMP), and can be selected as pool members if CMP is integrated with OpenStack inventory (or whatever backend registry it uses).
+Then BIG‑IP pool members can correctly be:
+node VM IPs + NodePort (for pool-member-type=nodeport), or
+pod IPs (if you choose IP-mode and your network allows it).
+So the limitation you hit here is because the Shoot workers are not real CMP-managed VMs.
+
+Two important caveats (so it doesn’t surprise you later):
+
+Network reachability still matters
+BIG‑IP must be able to reach the worker node IPs on the NodePort range (typically 30000-32767) or whatever you use.
+Security Groups / firewall rules must allow that path.
+You probably don’t want “manual CMP UI pool member selection” long-term
+Even if CMP can see the worker VMs, the ideal solution is still: when a user creates Service type=LoadBalancer, your integration should automatically register the correct node/pod backends (nodes can scale, be replaced, etc.).
+Otherwise pool membership will drift when nodes are added/removed.
+Net: In prod (OpenStack worker VMs), the “pool members not selectable” issue should not exist as long as CMP can see those worker VMs and BIG‑IP can route to them.
+
+
+Example (REDACTED) curl used by CMP UI to create an LBService.
+
+IMPORTANT: Never paste real cookies/tokens into git; use placeholders.
+
+```bash
+curl 'https://n1devcmp-user.airteldev.com/api/v1/load-balancers/lb_service/' \
+  -H 'accept: application/json' \
+  -H 'content-type: application/x-www-form-urlencoded' \
+  -H 'Ce-Auth: <REDACTED_CE_AUTH>' \
+  -H 'ce-region: dev' \
+  -H 'external-project: qa-first-cell' \
+  -H 'organisation-name: qa-tenant' \
+  -H 'project-id: 3' \
+  -H 'project-name: qa-first-cell' \
+  --data-raw 'name=<UNIQUE_LB_NAME>&flavor_id=25&description=loadbalancer&vpc_id=<VPC_ID>&network_id=<NETWORK_ID>&vpc_name=<VPC_NAME>' \
+  --insecure
+```
+
+Notes:
+- `409 Conflict` means the name already exists.
+- A successful create returns JSON including an `id` and typically `status: Creating`.

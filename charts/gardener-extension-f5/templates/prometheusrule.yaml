@@ -1,0 +1,99 @@
+{{- if .Values.alerts.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "gardener-extension-f5.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardener-extension-f5.labels" . | nindent 4 }}
+    {{- with .Values.alerts.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+  - name: f5-extension.availability
+    rules:
+    - alert: F5ExtensionDown
+      expr: up{job="{{ include "gardener-extension-f5.fullname" . }}"} == 0
+      for: 5m
+      labels:
+        severity: critical
+      annotations:
+        summary: "F5 extension controller is down"
+        description: "The gardener-extension-f5 controller pod has been unreachable for more than 5 minutes. New Shoot provisioning and LB updates are blocked."
+
+    - alert: F5SeedServiceLBDown
+      expr: up{job="{{ .Release.Name }}-seed-service-lb"} == 0
+      for: 5m
+      labels:
+        severity: critical
+      annotations:
+        summary: "seed-service-lb-controller is down"
+        description: "The seed-service-lb-controller pod has been unreachable for more than 5 minutes. The Seed Ingress VIP cannot be updated."
+
+  - name: f5-extension.lbhealth
+    rules:
+    - alert: F5ControlPlaneLBNotReady
+      expr: |
+        kube_customresource_status_condition{
+          customresource_kind="F5LoadBalancerConfig",
+          condition="ControlPlaneLoadBalancerReady",
+          status="true"
+        } == 0
+      for: 10m
+      labels:
+        severity: critical
+      annotations:
+        summary: "F5 control-plane LB not ready for Shoot {{ "{{" }} $labels.name {{ "}}" }}"
+        description: "F5LoadBalancerConfig {{ "{{" }} $labels.namespace {{ "}}" }}/{{ "{{" }} $labels.name {{ "}}" }} has ControlPlaneLoadBalancerReady=False for more than 10 minutes. The Shoot kube-apiserver may be unreachable."
+
+    - alert: F5ApplicationLBNotReady
+      expr: |
+        kube_customresource_status_condition{
+          customresource_kind="F5LoadBalancerConfig",
+          condition="ApplicationLoadBalancerReady",
+          status="true"
+        } == 0
+      for: 15m
+      labels:
+        severity: warning
+      annotations:
+        summary: "F5 application LB not ready for Shoot {{ "{{" }} $labels.name {{ "}}" }}"
+        description: "F5LoadBalancerConfig {{ "{{" }} $labels.namespace {{ "}}" }}/{{ "{{" }} $labels.name {{ "}}" }} has ApplicationLoadBalancerReady=False for more than 15 minutes. Tenant LoadBalancer Services may be missing VIPs."
+
+  - name: f5-extension.cmp
+    rules:
+    - alert: F5CMPHighErrorRate
+      expr: |
+        rate(f5_cmp_api_calls_total{result="error"}[5m])
+        /
+        (rate(f5_cmp_api_calls_total[5m]) + 0.001)
+        > {{ .Values.alerts.cmpErrorRateThreshold }}
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "High CMP API error rate on {{ "{{" }} $labels.controller {{ "}}" }}"
+        description: "The {{ "{{" }} $labels.controller {{ "}}" }} controller is seeing > {{ .Values.alerts.cmpErrorRateThreshold | mul 100 }}% CMP API errors over the last 5 minutes. CMP may be degraded or credentials invalid."
+
+    - alert: F5ReconcileErrors
+      expr: rate(f5_reconcile_errors_total[5m]) > 0
+      for: 10m
+      labels:
+        severity: warning
+      annotations:
+        summary: "F5 controller {{ "{{" }} $labels.controller {{ "}}" }} has persistent reconcile errors"
+        description: "The {{ "{{" }} $labels.controller {{ "}}" }} controller has been logging reconcile errors for more than 10 minutes. Check logs for CMP timeouts, credential issues, or Kubernetes API errors."
+
+    - alert: F5CMPHighLatency
+      expr: |
+        histogram_quantile(0.99,
+          rate(f5_cmp_api_call_duration_seconds_bucket[5m])
+        ) > {{ .Values.alerts.cmpLatencyP99Threshold }}
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "CMP API P99 latency is high ({{ "{{" }} $labels.controller {{ "}}" }}/{{ "{{" }} $labels.operation {{ "}}" }})"
+        description: "CMP API P99 latency for {{ "{{" }} $labels.controller {{ "}}" }}/{{ "{{" }} $labels.operation {{ "}}" }} has exceeded {{ .Values.alerts.cmpLatencyP99Threshold }}s for 5 minutes. This will slow down Shoot reconciliation."
+{{- end }}

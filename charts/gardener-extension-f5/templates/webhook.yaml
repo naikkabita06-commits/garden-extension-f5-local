@@ -1,0 +1,40 @@
+{{- if .Values.webhook.enabled }}
+---
+# Service that exposes the CRD conversion webhook endpoint to the Kubernetes API server.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "gardener-extension-f5.fullname" . }}-webhook
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardener-extension-f5.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "gardener-extension-f5.selectorLabels" . | nindent 4 }}
+  ports:
+  - name: webhook
+    port: 443
+    targetPort: 9443
+    protocol: TCP
+---
+{{- if .Values.webhook.certManager.enabled }}
+# cert-manager Certificate: automatically provisions TLS for the webhook server.
+# Requires cert-manager and an Issuer/ClusterIssuer named by .Values.webhook.certManager.issuerRef.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "gardener-extension-f5.fullname" . }}-webhook-tls
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gardener-extension-f5.labels" . | nindent 4 }}
+spec:
+  secretName: {{ include "gardener-extension-f5.fullname" . }}-webhook-tls
+  dnsNames:
+  - {{ include "gardener-extension-f5.fullname" . }}-webhook
+  - {{ include "gardener-extension-f5.fullname" . }}-webhook.{{ .Release.Namespace }}
+  - {{ include "gardener-extension-f5.fullname" . }}-webhook.{{ .Release.Namespace }}.svc
+  - {{ include "gardener-extension-f5.fullname" . }}-webhook.{{ .Release.Namespace }}.svc.cluster.local
+  issuerRef:
+    {{- toYaml .Values.webhook.certManager.issuerRef | nindent 4 }}
+{{- end }}
+{{- end }}

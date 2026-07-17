@@ -1,0 +1,204 @@
+1. What you get from the Airtel cloud team (one‑time per environment / tenant)
+Using CMP, they:
+
+Create an F5 LB instance for your tenant
+
+CMP automates:
+
+Two F5 VMs (HA pair).
+Connect them to:
+Management network (for APIs),
+VIP subnet (for external IPs),
+Internal/data networks (to reach Seeds/Shoots).
+On the VIP subnet, OpenStack gives 3 infra IPs:
+self IP on VM‑1,
+self IP on VM‑2,
+floating self IP (for HA).
+You don’t use these 3 directly; they’re infra.
+
+Give you these details
+
+After LB is deployed, they provide:
+
+LB name (in CMP).
+BIG‑IP management IP/URL for that LB (on mgmt net):
+e.g. https://10.10.0.25
+Partitions to use:
+one for control‑plane (optional),
+one for applications per tenant / per Shoot (their choice).
+VIP subnet / pool they’ll use for:
+control‑plane VIPs,
+application VIPs.
+CMP LBaaS (CCP) API endpoint and auth:
+e.g. https://ccp-api.airtelcloud.com
+Credentials:
+for CMP API (for our extension),
+for BIG‑IP mgmt (for CIS).
+You will encode these into your configuration/Secrets.
+
+2. Platform setup (what you do once)
+2.1 Deploy Gardener as usual
+Gardener control‑plane in a Seed cluster.
+OpenStack provider extension etc. as normal.
+2.2 Deploy the F5 Gardener extension in the Seed
+You deploy our gardener-extension-f5 controller and create an F5LoadBalancerConfig CR that says:
+
+spec:
+  # Control-plane via CMP
+  ccpApiEndpoint: "https://ccp-api.airtelcloud.com"
+  tenantOrPartition: "tenant1-cp"
+  credentialsSecretRef:
+    name: cmp-lbaas-credentials
+    namespace: garden-f5-system
+  controlPlaneVIP: "203.0.113.10"   # CP VIP CMP allocated for this tenant/shoot set
+
+  # Application plane via CIS talking to BIG-IP mgmt IP
+  enableApplicationLB: true
+  cis:
+    image: "f5networks/k8s-bigip-ctlr:<tag>"
+    bigipUrl: "https://10.10.0.25"  # BIG-IP mgmt IP from CMP
+    partition: "tenant1-app"
+    extraArgs: []
+
+CMP/cloud team chooses/allocates controlPlaneVIP from the VIP pool and tells you.
+bigipUrl is the management IP they give for that LB.
+2.3 DNS and certs
+Agree how api.<shoot>.<domain> will map to the controlPlaneVIP.
+Decide where TLS terminates (BIG‑IP vs apiserver).
+3. What happens when a new Kubernetes cluster (Shoot) is created
+A tenant/customer requests a cluster via Gardener (or your portal). Gardener creates a Shoot. Now the automation kicks in.
+
+3.1 Control‑plane load balancing (kube‑apiserver)
+Gardener F5 extension is triggered (in Seed)
+
+For that Shoot it:
+
+Reads F5LoadBalancerConfig and CMP creds.
+Discovers the kube‑apiserver endpoints in the Seed:
+IP:port list of apiserver Pods.
+Calls CMP LBaaS API
+
+Sends to ccpApiEndpoint:
+
+“Create/Update a Virtual Server on VIP 203.0.113.10:443 with these backends.”
+
+CMP LBaaS:
+
+checks its DB,
+programs F5 via its own internal “F5 LBaaS client”:
+create pool with apiserver backends,
+create monitor,
+create Virtual Server on that VIP.
+Updates status
+
+Stores VS ID/name from CMP,
+Marks control‑plane LB as Ready.
+What the tenant sees for control plane
+
+They get a kubeconfig pointing to https://api.<shoot>.<domain> → 203.0.113.10.
+Path:
+Tenant → DNS → controlPlaneVIP (203.0.113.10) → F5 → apiserver Pods.
+You don’t care about self IPs / floating self IPs; CMP already made F5 HA
+
+3.2 Application load balancing (inside the Shoot, via CIS)
+Now we enable apps to get external VIPs.
+
+F5 extension deploys CIS into the Shoot
+
+In the Shoot cluster, using the Shoot kubeconfig, it creates:
+
+ServiceAccount + ClusterRole + ClusterRoleBinding for CIS.
+
+bigip-login Secret with BIG‑IP creds.
+
+CIS Deployment:
+
+image from spec.cis.image,
+
+args like:
+
+--bigip-url=https://10.10.0.25
+--bigip-partition=tenant1-app-or-<shoot-partition>
+...
+
+Waits until CIS Pods are Ready.
+
+Tenant deploys an application
+
+Inside the Shoot, tenant applies:
+kind: Service
+metadata:
+  name: my-app-svc
+spec:
+  type: LoadBalancer
+  ports:
+    - port: 80
+      targetPort: 8080
+  selector:
+    app: my-app
+
+(Or an Ingress backed by such a Service.)
+
+CIS sees this Service
+
+Watches the Shoot API.
+Sees Service type=LoadBalancer (and/or Ingress).
+Reads its endpoints (Pod IPs / NodePorts on worker nodes).
+CIS talks to BIG‑IP mgmt IP
+
+Uses --bigip-url=https://10.10.0.25.
+
+Calls BIG‑IP REST API to:
+
+Ask CMP/F5 (per policy) to allocate a VIP from the VIP subnet for this Service.
+Create:
+pool with backend Pods,
+monitor,
+Virtual Server on that new app VIP.
+(Exact “allocate VIP” vs “you specify VIP” behaviour is driven by CMP/BIG‑IP config, but from your side it’s just CIS → BIG‑IP.)
+
+CIS writes VIP back to the Service
+
+The Service status becomes:
+
+status:
+  loadBalancer:
+    ingress:
+      - ip: "203.0.113.20"   # app VIP
+
+What the tenant sees for apps
+
+They run kubectl get svc my-app-svc and see EXTERNAL-IP = 203.0.113.20.
+They point their application DNS (e.g. shop.example.com) to 203.0.113.20.
+Path:
+Client → DNS → app VIP (203.0.113.20) → F5 → Shoot worker/pods.
+Autoscaling and node changes:
+
+When Pods or nodes change, Kubernetes Endpoints change.
+CIS sees this and updates the pool members on BIG‑IP automatically.
+No manual work.
+
+4. Summary: “how do we start, what do we get?”
+Start
+
+Ask CMP team to:
+
+Provision an F5 LB instance for your env/tenant,
+Give you:
+BIG‑IP management IP (for CIS),
+CCP/LBaaS API endpoint + creds (for control plane),
+At least one control‑plane VIP from their VIP subnet,
+Partition naming rules.
+Deploy gardener-extension-f5 in the Seed with an F5LoadBalancerConfig that contains:
+
+ccpApiEndpoint, controlPlaneVIP, CMP creds,
+cis.bigipUrl (the mgmt IP) and CIS image/partition.
+What you get, functionally
+
+For each new Shoot:
+
+Control‑plane LB is set up automatically:
+kube‑apiserver behind controlPlaneVIP via CMP LBaaS.
+Application LB is set up automatically:
+CIS runs in the Shoot, talking to BIG‑IP mgmt IP,
+Any Service type=LoadBalancer / Ingress gets its own app VIP on F5.

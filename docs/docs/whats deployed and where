@@ -1,0 +1,137 @@
+Here’s exactly where the extension is deployed and what components exist right now in your Gardener landscape.
+
+Seed/Garden side (management + seed cluster)
+A) Gardener registration objects (in the Garden cluster)
+These are the “plug-in” objects that tell Gardener about the extension and how to install it:
+
+ControllerRegistration/gardener-extension-f5
+ControllerDeployment/gardener-extension-f5
+ControllerInstallation is OnDemand, so Gardener auto-creates one when a Shoot needs it (yours is currently gardener-extension-f5-zn8sj)
+You can see them with:
+
+kubectl --context kind-gardener-local get controllerregistration gardener-extension-f5
+kubectl --context kind-gardener-local get controllerdeployment gardener-extension-f5
+kubectl --context kind-gardener-local get controllerinstallations -A | grep gardener-extension-f5
+
+B) Where the controller Pod actually runs (Seed cluster)
+Gardener installs the extension controller into a generated namespace:
+
+Namespace: extension-gardener-extension-f5-zn8sj
+Workload: Deployment/gardener-extension-f5
+Pod: gardener-extension-f5-... (running)
+Check:
+
+kubectl --context kind-gardener-local -n extension-gardener-extension-f5-zn8sj get deploy,pod -o wide
+
+Per-shoot objects (Seed cluster, shoot technical namespace)
+For your Shoot garden-local/local, the technical namespace is:
+
+shoot--local--local
+Inside that namespace Gardener created the Extension trigger and our controller created the per-shoot config CR:
+
+Extension/f5-loadbalancer (type f5-loadbalancer) ← this triggers reconciliation
+F5LoadBalancerConfig/f5-loadbalancer ← this is the per-shoot input
+Check:
+
+kubectl --context kind-gardener-local -n shoot--local--local get extension
+kubectl --context kind-gardener-local -n shoot--local--local get f5loadbalancerconfig
+
+====================================================================
+Gardener Extension F5 - Implementation Summary (LB + VIP + Virtual Server)
+
+Overview
+- This repository implements a Gardener extension that (a) reconciles a per-Shoot
+	config object and (b) can call CMP/F5 APIs to provision control-plane LB pieces,
+	and (c) deploys F5 CIS into Shoots once the control-plane LB is considered ready.
+
+What was built (already in this repo)
+
+1) Core API types (CRD)
+- API group: f5.extensions.gardener.cloud
+- Kind: F5LoadBalancerConfig
+- Location:
+	- pkg/apis/f5/v1alpha1/types.go
+	- config/crd/f5loadbalancerconfigs.f5.extensions.gardener.cloud.yaml
+
+2) Lifecycle controller (seed-side reconciliation)
+- Location: pkg/controller/lifecycle/
+- Responsibilities (high-level):
+	- Watches per-Shoot Extension + F5LoadBalancerConfig in the Shoot technical namespace.
+	- Validates control-plane VIP input readiness.
+	- (Optionally) calls CMP/F5 APIs to ensure the control-plane VIP/VS.
+	- Writes status back to F5LoadBalancerConfig.
+	- Deploys CIS to the Shoot only when control-plane LB is ready.
+
+3) CMP/F5 HTTP client
+- Location: pkg/f5/client.go
+- Supports Ce-Auth (HMAC) + organisation-name + project-id.
+
+4) Helm chart + Gardener registration objects
+- Helm chart: charts/gardener-extension-f5/
+- Garden install manifests: deploy/garden/
+	- controllerregistration-f5.yaml
+	- controllerdeployment-f5.yaml
+	- controllerinstallation-f5.yaml
+
+5) Developer tools in this repo (to run CMP APIs)
+- scripts/cmp-curl.sh
+	- Curl wrapper that injects required headers and can run arbitrary endpoints via: raw METHOD PATH
+- scripts/cmp-ceauth.py
+	- Generates short-lived Ce-Auth tokens using API key id + secret (HMAC-SHA256)
+- cmd/cmpctl
+	- Small Go CLI for calling CMP endpoints with Ce-Auth.
+	- Extended subcommands for LB workflows:
+		- lbsvc-list, lbsvc-create, lbsvc-get
+		- lbsvc-vip
+		- vs-list, vs-create
+
+Contract / data flow (Gardener)
+1) Shoot is created
+2) Gardener creates Extension objects in the Shoot technical namespace (seed)
+3) The extension controller reconciles and ensures/configures:
+	 - Control-plane VIP/VS (either via CMP API calls or “out-of-band ready” flag)
+4) Once control-plane LB is ready, extension deploys CIS to the Shoot
+5) CIS programs application-plane VIP/VS based on Ingress/Service objects
+
+Where the 3 CMP calls fit (LB → VIP → Virtual Server)
+This is the “same style as the TCPWave DNS integration”, but for LB objects.
+
+A) Create LB (LBService)
+
+	POST /api/v1/load-balancers/lb_service/
+	Content-Type: application/x-www-form-urlencoded
+
+- Required headers:
+	Ce-Auth: <token>
+	organisation-name: qa-tenant
+	project-id: 3
+	ce-region: dev
+	external-project: qa-first-cell
+	project-name: qa-first-cell
+
+B) Create VIP for the LB
+- In many CMP deployments VIPs are created automatically as part of LBService creation.
+- The UI “VIPs” tab usually calls a read endpoint like:
+	GET /api/v1/load-balancers/lb_service/{lbsvc_id}/vip
+- If your CMP has an explicit “create VIP” API, capture the UI Network request URL and
+	we can mirror it in cmpctl/cmp-curl.
+
+C) Create Virtual Server for that LB
+- Swagger you shared earlier indicated VS endpoints shaped like:
+	POST /api/v1/load-balancers/{lb_id}/virtual-servers
+	GET  /api/v1/load-balancers/{lb_id}/virtual-servers
+- In your environment, the LB list objects use a UUID id (e.g. gardener-lb id
+	599255c2-5964-4e05-b58e-8f07cc5ece14). For VS, the exact “lb_id” to use must be
+	taken from the UI Network request (some systems use lbsvc_id, some use a separate id).
+
+Practical next step (so we can finalize the 3 API integration)
+1) From the CMP UI Network tab, capture (paste only URLs, no tokens):
+	 - VIPs tab request URL
+	 - Virtual Servers tab request URL
+2) We will align cmpctl commands to those exact endpoints and required form fields.
+
+
+
+If you mean “can we demonstrate application-plane LB traffic through BIG‑IP with VIP 100.72.200.20?” → Yes. We now have 2 traefik/whoami pods behind the VM port-forwards, and repeated curls to http://100.72.200.20:8081/ clearly alternate Hostname: between the two pods (proves actual load distribution).
+
+If you mean “does the extension fully automate application-plane LB via CIS + the Service→Ingress bridge (i.e., create Service type=LoadBalancer and everything programs BIG‑IP automatically)?” → Not in this environment, because CIS is blocked by missing AS3 on the BIG‑IP (and BIG‑IP also can’t reach node/pod networks here, so nodeport/podIP backends fail). That’s an external dependency/environment limitation, not a unit-testable repo bug.

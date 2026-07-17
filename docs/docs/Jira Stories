@@ -1,0 +1,312 @@
+
+1. Revamped Jira stories (aligned to Airtel CMP + CIS)
+I’ll keep the same numbering but change the actors:
+
+Control‑plane LB: Gardener extension ↔ CMP LBaaS API
+Application LB: CIS in Shoot ↔ BIG‑IP
+VIPs are given by CMP, not read from OpenStack Infra.
+STORY 1 – Foundation + Minimal CRD (unchanged idea, new fields clarified)
+Goal: have a buildable extension and a CRD that describes CMP + CIS config, not raw BIG‑IP.
+
+Key points:
+
+Repo, Makefile, Dockerfile, CI: as already written.
+
+CRD F5LoadBalancerConfig:
+spec:
+  ccpApiEndpoint: "<CMP LBaaS base URL>"   # was bigIpEndpoint
+  tenantOrPartition: "<CMP tenant or F5 partition>"
+  credentialsSecretRef: {...}             # creds for CCP API and/or CIS
+  controlPlaneVIP: "<VIP for kube-apiserver>"
+  enableApplicationLB: true|false         # turn CIS on/off per Shoot
+  cis:
+    image: "f5networks/k8s-bigip-ctlr:<tag>"
+    bigipUrl: "<BIG-IP mgmt URL>"         # used only by CIS in Shoot
+    partition: "<F5 partition for apps>"
+    extraArgs: [...]                      # generic bag for tuning
+
+Register types + generate CRD + sample YAML.
+
+STORY 2 – CMP LBaaS Client + Control‑Plane Actuator Skeleton
+Goal: replace “BIG‑IP client” with a CMP LBaaS client, wire actuator skeleton.
+
+Tasks:
+
+Implement pkg/cmp/client.go (name can vary):
+
+NewClient(log, endpoint, tenant, username, password)
+
+Methods (against CCP API, not BIG‑IP):
+
+EnsureControlPlaneVirtualServer(ctx, vip string, port int32, backends []Backend) (vsID string, err error)
+DeleteControlPlaneVirtualServer(ctx, vsID string) error
+
+
+For now:
+
+Build URLs and payloads,
+Log request, maybe call a stub/mock endpoint,
+No real CMP side‑effects yet.
+Implement actuator skeleton:
+
+Reconcile / Delete called for Extension.
+Read F5LoadBalancerConfig and referenced Secret.
+Create CMP client instance.
+Log what would be done (no real VS yet).
+Add/remove finalizer.
+AC:
+
+Actuator is invoked on Shoot lifecycle.
+We see logs with Shoot, VIP, partition, CCP endpoint.
+CMP client can at least reach a test endpoint (health or mock).
+STORY 3 – kube‑apiserver Discovery + Control‑Plane VS via CMP
+Goal: from Seed, discover apiserver backends and have CMP create the control‑plane virtual server on the configured VIP.
+
+Tasks:
+
+Seed‑side discovery (same logic as you already did):
+
+Find Service/Endpoints for the Shoot’s kube‑apiserver.
+Build []Backend{IP, Port}.
+Use CMP client:
+
+Call EnsureControlPlaneVirtualServer(ctx, controlPlaneVIP, 443, backends).
+Treat it as idempotent:
+If VS already exists, update pool/members instead of failing.
+Status wiring on F5LoadBalancerConfig:
+
+status:
+  vip: "<controlPlaneVIP>"
+  virtualServerName: "<CMP VS ID or name>"
+  conditions:
+    - type: Ready|Progressing|Error
+      status: True/False
+      reason/message: ...
+
+AC:
+
+For a test Shoot, kube‑apiserver is reachable via CP‑VIP (once real CMP is wired).
+Re‑reconcile does not create duplicate VS.
+Status shows VIP, VS id/name, and Ready when CMP returns Active.
+(Note: all of this is via CMP API; it is CMP’s responsibility how it then drives BIG‑IP or CIS internally.)
+
+STORY 4 – VIP Source, Config, and Cleanup (no more OpenStack Infra parsing)
+Goal: formalise how the CP‑VIP is provided and implement proper CMP cleanup with finalizers.
+
+Tasks:
+
+VIP source:
+
+Decide and document:
+Primary source is spec.controlPlaneVIP (provided by CMP/platform).
+Optionally allow no VIP in spec and fetch it from some CMP metadata API later (if they expose that) – but not from Gardener’s OpenStack Infra CR anymore.
+Validate presence of a VIP before attempting VS creation; surface clear status if missing.
+Delete/finalizer:
+
+On Delete:
+Read stored status.virtualServerName (or ID).
+Call DeleteControlPlaneVirtualServer via CMP client.
+Handle “not found” as success.
+Remove finalizer.
+Unit tests:
+
+VIP validation behavior.
+Reconcile/delete happy path using a fake CMP client.
+AC:
+
+VIP comes from config (CMP‑provided), not from OpenStack Infra.
+On Shoot delete, CMP VS is removed; Extension finalizer is cleared.
+Tests exist for VIP handling and basic reconcile/delete.
+STORY 5 – Shoot Client + CIS Basics (RBAC, Secret, Deployment)
+Goal: from the Seed, deploy F5 CIS into the Shoot so it can manage application LBs.
+
+Tasks:
+
+Shoot client:
+
+Read Shoot kubeconfig Secret from Seed.
+Build a cached client per Shoot.
+CIS prerequisites in Shoot:
+
+ServiceAccount for CIS.
+ClusterRole + ClusterRoleBinding.
+bigip-login Secret in kube-system:
+F5/BIG‑IP credentials (or CMP token) as per platform decision.
+CIS Deployment:
+
+Image from spec.cis.image.
+
+Args at minimum:
+
+--bigip-url=<BIG-IP or CMP endpoint for apps>
+--bigip-partition=<app partition>
+--pool-member-type=nodeport
+...
+
+Mount credentials Secret.
+
+Use idempotent apply (create or update).
+
+AC:
+
+For a Shoot with enableApplicationLB=true:
+CIS SA, RBAC, Secret, Deployment exist in the Shoot.
+Reconciliation updates config instead of duplicating objects.
+STORY 6 – CIS Orchestration & Health
+Goal: only roll out CIS when CP‑LB is Ready, monitor its health, and clean it up.
+
+Tasks:
+
+Orchestration:
+
+Deploy CIS only if:
+
+CP‑LB condition Ready=True,
+spec.enableApplicationLB == true.
+Reconcile CIS on spec changes (image, partition, args).
+
+Health:
+
+Wait for CIS Deployment to have a Ready pod.
+
+Optionally inspect Pod status/logs for hard errors (e.g. auth failure).
+
+Reflect in status:
+
+conditions:
+  - type: CISReady
+  - type: AppLBEnabled
+
+Cleanup:
+
+On disable or Shoot delete:
+Delete CIS Deployment, RBAC, and bigip-login Secret in Shoot.
+Integrate into extension’s finalizer flow.
+AC:
+
+CIS is auto‑deployed only when CP‑LB is ready and enabled.
+Status clearly shows CISReady/AppLBEnabled.
+CIS is fully removed on disable/delete.
+STORY 7 – Robustness & Observability
+Goal: solid error handling, retries, logs, metrics across CMP client, CP‑LB, and CIS orchestration.
+
+Tasks (same shape as before, but “F5 client” ⇒ “CMP client + CIS operations”):
+
+Classify transient/permanent errors from:
+CMP API,
+Kubernetes APIs (Seed + Shoot).
+Implement backoff/retry for transient errors.
+Avoid hot loops on bad config (e.g. missing VIP).
+Structured logging (shoot, VIP, CMP VS id, CIS deployment, etc.).
+Basic metrics: reconcile duration, success/failure counts, number of CP VS managed, CIS rollouts, etc.
+STORY 8 – Tests & Docs (updated wording)
+Goal: cover CMP‑based CP‑LB + CIS‑based app LB with unit tests and a few smoke/E2E flows; write operator docs.
+
+Tests:
+
+Unit tests:
+
+CMP client request building + error handling.
+VIP validation logic.
+CIS manifest rendering and apply.
+E2E/smoke:
+
+Shoot with extension enabled:
+CP‑VIP reachable for kubectl.
+With CIS enabled:
+Simple app + Service type=LoadBalancer reachable via CIS‑created app VIP (from BIG‑IP).
+Negative paths: wrong creds, missing VIP, etc., surface clear errors.
+
+Docs:
+
+How to enable CP‑LB and CIS for Shoots.
+What CMP/F5/OpenStack prerequisites are.
+Basic troubleshooting based on conditions and logs.
+2. Explaining the “extra things” in the CMP diagrams
+You mentioned FortiManager, HA, subnets, etc. These are all platform plumbing around F5; Gardener doesn’t implement them but must be aware they exist.
+
+Very briefly:
+
+HA (High Availability)
+
+CMP creates F5 in pairs (active/standby).
+Internal floating/self IPs and dedicated HA networks let one device take over if the other fails.
+This guarantees that both CP‑VIP and app VIPs stay reachable during F5 failures.
+Subnets / Networks
+
+CMP chooses:
+Management subnet: where BIG‑IP/CCP APIs live (Seed and CIS must reach this).
+External subnet(s): where VIPs live, reachable by clients.
+Internal/data subnets: where backend servers (Seed / Shoot workers) live.
+They also attach security groups/firewall rules allowing:
+Seed ↔ CCP API,
+F5 ↔ Seed/Shoot networks.
+FortiManager / Firewalls
+
+FortiManager (or similar) manages firewall policies around those subnets:
+Which VIPs are exposed to Internet,
+Which backend networks F5 may reach,
+Which ports are allowed.
+When CMP provisions a new LB or VS, it also pushes matching firewall rules.
+AAA / Licensing / Monitoring (Prometheus)
+
+AAA: internal auth/accounting for F5 usage.
+Licensing: ensuring each F5 instance is licensed.
+Prometheus: scraping metrics from F5 and LBaaS components.
+All of this is Airtel platform responsibility; Gardener just consumes the exposed pieces (API endpoints, VIPs, connectivity).
+
+3. Exact things we need from Airtel Cloud team
+For control‑plane LB (CP‑VIP)
+CMP LBaaS API contract
+
+Base URL, paths (e.g. /virtual-servers), auth mechanism.
+Request/response schema for:
+Create/Update VS,
+Delete VS,
+Get VS status.
+Idempotency rules (“what if VS already exists?”).
+Access
+
+Network connectivity from Seed to CCP API.
+Service account / credentials (user+pass or token).
+Rate limits and any tenant/partition identifier to pass.
+VIP allocation model for control plane
+
+How is the CP‑VIP per Shoot obtained:
+Manual allocation by platform team (to be filled into spec.controlPlaneVIP), or
+Some CMP API or config source we should read.
+Any constraints (CIDR ranges, overlap rules).
+DNS & certificates
+
+Domain scheme (api.<shoot>.<domain> or similar).
+Who issues/terminates TLS:
+TLS termination on BIG‑IP or pass‑through to kube‑apiserver.
+For application plane (CIS inside Shoots)
+BIG‑IP endpoint and partition for apps
+
+The URL CIS should use in --bigip-url (if CIS talks to BIG‑IP directly).
+Partition / tenant naming convention per Shoot.
+Credentials for CIS
+
+How CIS authenticates:
+BIG‑IP local user, or
+CMP‑provided token.
+How those creds are delivered to the extension so it can create bigip-login Secret in Shoots.
+Expected CIS mode
+
+Which Kubernetes objects CIS should watch (Ingress, Services, custom CRDs).
+Any standard AS3/VS templates they require us to follow.
+Shared/platform level
+Network & firewall rules
+
+Seed nodes must reach:
+CCP API,
+(if needed) BIG‑IP management address used by CIS.
+Shoot worker nodes (and Pods) must be reachable from F5 for app traffic.
+List of subnets and any restrictions our controllers should assume.
+Operational boundaries
+
+Confirmation that:
+All F5 config for apps is through CIS in Shoots.
+Control‑plane VS is configured only via CMP LBaaS (from our extension).
+Any naming/labeling requirements for VS, partitions, or CIS instances.

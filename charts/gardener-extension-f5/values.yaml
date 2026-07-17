@@ -1,0 +1,95 @@
+# SPDX-FileCopyrightText: 2025 SAP SE or an SAP affiliate company and Gardener contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+replicaCount: 1
+
+crds:
+  install: true
+
+alerts:
+  # enabled: set to true to deploy a PrometheusRule CR (requires prometheus-operator in the cluster).
+  enabled: false
+  # additionalLabels: extra labels added to the PrometheusRule (e.g. to match your Prometheus selector).
+  additionalLabels: {}
+  # cmpErrorRateThreshold: fraction (0–1) of CMP API calls that must be errors before alerting. Default 0.1 = 10%.
+  cmpErrorRateThreshold: 0.1
+  # cmpLatencyP99Threshold: P99 latency in seconds above which the high-latency alert fires. Default 10s.
+  cmpLatencyP99Threshold: 10
+
+webhook:
+  # enabled: set to true to deploy the conversion webhook Service (and optionally a cert-manager Certificate).
+  # The webhook endpoint is registered in the extension manager regardless — this only controls the Service/cert objects.
+  # Must be enabled before the CRD conversion strategy is switched to Webhook.
+  enabled: false
+  # certDir: path inside the container where the TLS serving cert and key are mounted.
+  # Override the WEBHOOK_CERT_DIR env var or set here; default is /tmp/k8s-webhook-server/serving-certs.
+  certDir: ""
+  certManager:
+    # enabled: create a cert-manager Certificate resource to auto-provision TLS.
+    enabled: false
+    issuerRef:
+      name: selfsigned-issuer
+      kind: ClusterIssuer
+
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  repository: europe-docker.pkg.dev/gardener-project/public/gardener/extensions/f5
+  tag: latest
+  pullPolicy: IfNotPresent
+
+serviceAccount:
+  create: true
+  name: gardener-extension-f5
+
+rbac:
+  # clusterAdmin: when true, binds the ServiceAccount to cluster-admin instead of the least-privilege ClusterRole.
+  # Keep false for production. Set true only as a last-resort debugging escape hatch.
+  clusterAdmin: false
+
+resources:
+  limits:
+    memory: 256Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+controller:
+  env:
+    # TLS verification for CMP/CCP API calls. Set to "true" only in dev/test environments
+    # where the CMP endpoint uses a self-signed certificate with no CA bundle configured.
+    F5_INSECURE_SKIP_TLS_VERIFY: ""
+
+    # Path to a PEM CA bundle file for verifying the CMP/CCP TLS certificate.
+    # Mount a ConfigMap or Secret containing the CA and set this to its mount path.
+    # Example: /etc/ssl/cmp-ca/ca.crt
+    F5_CA_BUNDLE_PATH: ""
+
+    # Optional: prefix prepended to all CMP API paths (e.g. "/api/v1").
+    F5_HTTP_API_PREFIX: ""
+
+    # Optional: non-mutating probe request used to validate CMP/CCP connectivity and auth.
+    # Defaults are safe (GET /) but can be overridden to hit a known health endpoint.
+    F5_HTTP_PROBE_PATH: ""
+    F5_HTTP_PROBE_METHOD: ""
+
+    # Optional: single-call LBaaS endpoints for control-plane Virtual Server upsert/delete.
+    # Leave empty to use the default multi-step LBService→VIP→VS flow.
+    F5_HTTP_CP_VS_ENSURE_PATH_TEMPLATE: ""
+    F5_HTTP_CP_VS_DELETE_PATH_TEMPLATE: ""
+    F5_HTTP_CP_VS_ENSURE_METHOD: ""
+
+seedServiceLBController:
+  enabled: false
+  # Name of the Secret in the extension namespace that holds CMP credentials.
+  # Required keys: Ce-Auth (or username/password), project-id, organisation-name.
+  bigipSecretName: "f5-cmp-credentials"
+  env: {}
+  resources:
+    limits:
+      memory: 128Mi
+    requests:
+      cpu: 50m
+      memory: 64Mi

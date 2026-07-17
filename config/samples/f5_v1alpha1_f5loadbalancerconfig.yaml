@@ -1,0 +1,30 @@
+apiVersion: f5.extensions.gardener.cloud/v1alpha1
+kind: F5LoadBalancerConfig
+metadata:
+  name: example
+  namespace: garden-f5-system
+spec:
+  # Optional for application-plane-only setup; used for control-plane CMP integration.
+  ccpApiEndpoint: ""
+  tenantOrPartition: "k8s-demo"
+  credentialsSecretRef:
+    name: cmp-f5-credentials
+    namespace: garden-f5-system
+
+  # Optional for application-plane-only setup; used for control-plane LB.
+  controlPlaneVIP: ""
+
+  # If CMP provisions/configures the control-plane VIP/VS out-of-band, set this
+  # to true once it is ready. When false, CIS deployment is blocked.
+  # If omitted, the controller falls back to its current dev-stub behavior.
+  controlPlaneReady: null
+
+  enableApplicationLB: true
+  cis:
+    image: "f5networks/k8s-bigip-ctlr:2.14.0"
+    # Optional: enables Service type=LoadBalancer support by translating Services into Ingresses.
+    # Use an image that contains the /svc-lb-bridge binary (e.g. the extension controller image after rebuilding).
+    bridgeImage: ""
+    bigipUrl: "https://100.65.242.159"
+    partition: "k8s-apps"
+    extraArgs: []

@@ -1,0 +1,279 @@
+1. One‑time setup (Cloud/CMP team vs Gardener team)
+
+Cloud / Airtel / CMP + F5 team provides the *infrastructure side*:
+
+- CMP LBaaS / CCP API endpoint (control‑plane):
+
+  ```yaml
+  spec:
+    ccpApiEndpoint: "https://<CMP-LBaaS-or-CCP-URL>"
+  ```
+
+- Tenant / partition for this environment:
+
+  ```yaml
+  spec:
+    tenantOrPartition: "<CMP tenant or BIG-IP partition>"
+  ```
+
+- Technical user + password/token → stored by platform team in a Secret:
+
+  ```yaml
+  spec:
+    credentialsSecretRef:
+      name: f5-credentials
+      namespace: garden-f5-system
+  ```
+
+- One control‑plane VIP for kube‑apiserver (per Shoot or per tenant):
+
+  ```yaml
+  spec:
+    controlPlaneVIP: "203.0.113.10"
+  ```
+
+- Flag whether application‑plane LB (CIS in Shoots) is enabled and how to run CIS:
+
+  ```yaml
+  spec:
+    enableApplicationLB: true
+    cis:
+      image: "f5networks/k8s-bigip-ctlr:<tag>"
+      extraArgs: []   # generic bag for tuning CIS
+  ```
+
+All of this is put into an `F5LoadBalancerConfig` CRD in the **Seed** cluster
+(one per tenant or per Shoot, depending on design).
+
+Gardener / platform team provides the *controller side*:
+
+- The `gardener-extension-f5` controller in the Seed cluster which:
+  - Watches Shoots and their lifecycle.
+  - For **control‑plane LB**:
+    - Discovers the Shoot’s kube‑apiserver endpoints in the Seed.
+    - Calls the **CMP LBaaS / CCP API** (`ccpApiEndpoint`) using the data from `F5LoadBalancerConfig`.
+  - For **application‑plane LB** (if `enableApplicationLB: true`):
+    - Deploys CIS into the Shoot.
+    - Lets CIS + CMP handle `Service type=LoadBalancer` in the Shoot.
+
+---
+
+2. Control‑plane: kube‑apiserver via CMP control‑plane VIP
+
+When a Shoot is created with the F5 extension enabled:
+
+1. The `F5LoadBalancerConfig` for that Shoot/tenant already exists in the Seed:
+
+   ```yaml
+   apiVersion: f5.extensions.gardener.cloud/v1alpha1
+   kind: F5LoadBalancerConfig
+   metadata:
+     name: <shoot-or-tenant-name>
+     namespace: garden-f5-system
+   spec:
+     ccpApiEndpoint: "https://<CMP-LBaaS-URL>"
+     tenantOrPartition: "k8s"
+     credentialsSecretRef:
+       name: f5-credentials
+       namespace: garden-f5-system
+     controlPlaneVIP: "203.0.113.10"
+     enableApplicationLB: true
+     cis:
+       image: "f5networks/k8s-bigip-ctlr:<tag>"
+       extraArgs: []
+   ```
+
+2. The `gardener-extension-f5` actuator (in the Seed) is called for that Shoot:
+
+   - It reads `F5LoadBalancerConfig.spec` and the referenced Secret.
+   - It discovers the Shoot’s kube‑apiserver Service + Endpoints in the Seed namespace for that Shoot.
+   - It builds the backend list:
+
+     ```go
+     []Backend{
+       {IP: "10.x.y.z", Port: 443},
+       ...
+     }
+     ```
+
+3. The actuator calls the **CMP LBaaS client**:
+
+   ```go
+   EnsureControlPlaneVirtualServer(ctx, controlPlaneVIP, 443, backends)
+   ```
+
+   Against the `ccpApiEndpoint`:
+
+   - CMP LBaaS creates/updates:
+     - A pool with the kube‑apiserver backends.
+     - A health monitor.
+     - A virtual server on `controlPlaneVIP:443` using that pool.
+   - The call is **idempotent**:
+     - If the VS already exists, CMP updates the pool/members instead of failing.
+
+4. The extension updates status on the `F5LoadBalancerConfig`:
+
+   ```yaml
+   status:
+     vip: "203.0.113.10"          # controlPlaneVIP actually used
+     virtualServerName: "cp-apiserver-vs"
+     conditions:
+       - type: Ready
+         status: "True"
+         reason: ControlPlaneConfigured
+         message: "Control-plane virtual server configured on CMP/F5"
+   ```
+
+5. Control‑plane traffic path becomes:
+
+   - Client (kubectl) → DNS → `controlPlaneVIP` (e.g. `203.0.113.10`)
+   - Client → F5/CMP VIP `203.0.113.10`
+   - CMP/F5 → kube‑apiserver Pods/endpoints in the Seed for that Shoot.
+
+**Important:** backends are always **kube‑apiserver Pods / endpoints**, never master node IPs.
+
+---
+
+3. Application‑plane: Services type=LoadBalancer via CIS in the Shoot
+
+When `enableApplicationLB: true`, the extension also orchestrates **CIS** in the Shoot.
+
+1. In the Shoot cluster:
+
+   - Users deploy apps and expose them as:
+
+     ```yaml
+     kind: Service
+     spec:
+       type: LoadBalancer
+       ports:
+         - port: 80
+           targetPort: 8080
+       selector:
+         app: my-app
+     ```
+
+   - Kubernetes in the Shoot:
+     - Allocates NodePorts or uses direct Pod IPs (design‑dependent).
+     - Maintains `Endpoints` / `EndpointSlice` with Pod backends on **worker** nodes.
+
+2. The extension deploys CIS into the Shoot (once control‑plane LB is ready):
+
+   - CIS runs as Pods in the Shoot.
+   - It talks to:
+     - CMP LBaaS / BIG‑IP using credentials from `credentialsSecretRef`.
+     - The Shoot API to watch Services/Ingresses.
+
+3. When a `Service type=LoadBalancer` is created in the Shoot:
+
+   - CIS sees:
+     - Service X of type=LoadBalancer in Shoot Y.
+     - Backends (Pod IPs / NodePorts) from Endpoints.
+   - CIS, via CMP/F5, configures:
+     - A VIP (virtual server IP) for that Service (allocated by CMP from the VIP pool).
+     - A pool with the backends.
+   - CIS writes the VIP back into the Service:
+
+     ```yaml
+     status:
+       loadBalancer:
+         ingress:
+           - ip: "<service-specific-VIP>"
+     ```
+
+4. Application traffic path for that Service:
+
+   - Client → DNS → **Service VIP** (e.g. `203.0.113.20`)
+   - Client → F5/CMP VIP (for that Service)
+   - F5 → Shoot worker nodes / Pods for that Service.
+
+Autoscaling:
+
+- When new worker nodes/Pods appear, Endpoints change.
+- CIS (or the extension, depending on design) reconciles the pool to:
+  - Add new members.
+  - Remove old ones.
+- No manual step needed.
+
+---
+
+4. How Ingress fits into this
+
+For each Shoot, Gardener usually deploys a **default Ingress controller** (e.g. NGINX):
+
+- The Ingress controller runs as Pods in the Shoot.
+- It has a Service, typically `type: LoadBalancer` (e.g. `ingress-nginx-controller`).
+
+The same CIS + CMP logic applies:
+
+- CIS (running in the Shoot) watches that Service.
+- CMP/F5 attaches a VIP to that Service via CIS.
+- The Service’s `status.loadBalancer.ingress` gets that VIP.
+
+Traffic path becomes:
+
+- Client → F5 VIP (Service of the Ingress controller).
+- F5 → Ingress controller Pods.
+- Ingress controller → backend Services/Pods based on Ingress rules.
+
+So:
+
+- **Ingress** = HTTP/HTTPS routing rules (host/path → Service).
+- **Service type=LoadBalancer** = gets an external VIP from CMP/F5 so Ingress can be reached from outside.
+
+If users deploy another Ingress controller:
+
+- They deploy their own Ingress controller Pods and a `Service type=LoadBalancer`.
+- CIS sees that Service and:
+  - Creates another VIP + pool on F5 (via CMP).
+  - Writes that VIP into that Service’s status.
+- Multiple Ingress controllers and multiple LB Services can coexist.
+
+---
+
+5. Multiple Shoots and separation by partition/VIP
+
+For each Shoot:
+
+- It has its own:
+  - Control‑plane VIP (`controlPlaneVIP` in the Seed, per Shoot or per tenant).
+  - Ingress controller Service(s) and user `Service type=LoadBalancer` objects.
+- The F5 extension / CMP keeps them logically separated, for example via:
+  - Different CMP tenants or F5 partitions per tenant/Shoot (`tenantOrPartition`).
+  - Different VIPs per control‑plane vs application‑plane Service.
+
+So:
+
+- **Per Shoot**: its own control‑plane VIP + its own application VIPs, all fronted by CMP/F5.
+- **Per CMP/F5**: multiple partitions/tenants and VIPs, each mapped to the correct Shoot/tenant, as defined in the `F5LoadBalancerConfig` objects.
+
+---
+
+6. VIP vs floating/self IP (clarification)
+
+- **Client‑facing IP (jo client ke liye IP hoga)**:
+  - This is the **virtual server IP (VIP)** where client traffic arrives.
+  - Examples: `controlPlaneVIP` for kube‑apiserver, or per‑Service VIPs in the application plane.
+  - Traffic path always starts at this VIP.
+
+- **Floating/self IPs inside F5 (floating IP jo F5 ka internal IP hai)**:
+  - Internal addresses used by the F5 pair for HA and internal routing.
+  - These are **not** exposed in `F5LoadBalancerConfig`.
+  - They are managed by CMP / F5 operations.
+
+- **Subnets / IP pools**:
+  - The customer/network team decides the subnet/pool from which VIPs will be allocated.
+  - They reserve that in the network and configure it into CMP/F5.
+  - CMP then picks VIPs from this pool when creating control‑plane VS or application LBs.
+
+In summary:
+
+- Clients always see **VIPs** (control‑plane and application).
+- Internal floating/self IPs remain an internal F5/CMP detail.
+- The Gardener F5 extension describes **what** VIPs should exist and **how** they map to Shoots/services, while CMP/F5 handle the internal HA/subnet plumbing.
+jo client ke liye IP hoga wo hoga virtual server IP(VIP)- traffic will come on this 
+
+floating IP is internal IP jo F5 ka internal IP hai 
+
+
+subnet customer decide karta hai aur jaake reserve karta hai

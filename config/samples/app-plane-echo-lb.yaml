@@ -1,0 +1,53 @@
+# Demo: application-plane Service type=LoadBalancer using the svc-lb-bridge.
+#
+# Usage:
+#   VIP=10.1.1.25 envsubst < config/samples/app-plane-echo-lb.yaml | kubectl --kubeconfig /tmp/shoot-pf.kubeconfig apply -f -
+#
+# Notes:
+# - Requires CIS running in the Shoot with bridge enabled (spec.cis.bridgeImage).
+# - The VIP is manually specified via annotation cis.f5.com/ip.
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo-lb
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: echo
+  namespace: demo-lb
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: echo
+  template:
+    metadata:
+      labels:
+        app: echo
+    spec:
+      containers:
+      - name: echo
+        image: traefik/whoami:v1.10.2
+        args:
+        - --port=5678
+        ports:
+        - containerPort: 5678
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: echo-lb
+  namespace: demo-lb
+  annotations:
+    cis.f5.com/ip: "${VIP}"
+spec:
+  selector:
+    app: echo
+  type: LoadBalancer
+  loadBalancerClass: f5.extensions.gardener.cloud/bigip
+  ports:
+  - name: http
+    port: 8081
+    targetPort: 5678

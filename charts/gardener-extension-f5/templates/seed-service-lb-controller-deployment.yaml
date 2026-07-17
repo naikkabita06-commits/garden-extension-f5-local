@@ -1,0 +1,63 @@
+{{- if .Values.seedServiceLBController.enabled -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "gardener-extension-f5.fullname" . }}-seed-service-lb
+  namespace: {{ .Release.Namespace }}
+  labels:
+{{ include "gardener-extension-f5.labels" . | indent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{ include "gardener-extension-f5.fullname" . }}-seed-service-lb
+  template:
+    metadata:
+      labels:
+        app: {{ include "gardener-extension-f5.fullname" . }}-seed-service-lb
+        networking.gardener.cloud/to-dns: allowed
+        networking.gardener.cloud/to-runtime-apiserver: allowed
+        networking.gardener.cloud/to-private-networks: allowed
+        networking.gardener.cloud/to-public-networks: allowed
+        networking.resources.gardener.cloud/to-all-shoots-kube-apiserver-tcp-443: allowed
+{{ include "gardener-extension-f5.labels" . | indent 8 }}
+    spec:
+      serviceAccountName: {{ .Values.serviceAccount.name | default (include "gardener-extension-f5.name" .) }}
+      containers:
+        - name: seed-service-lb-controller
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/seed-service-lb-controller"]
+          env:
+            - name: BIGIP_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.seedServiceLBController.bigipSecretName | quote }}
+                  key: username
+            - name: BIGIP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.seedServiceLBController.bigipSecretName | quote }}
+                  key: password
+{{ range $name, $value := .Values.seedServiceLBController.env }}
+            - name: {{ $name }}
+              value: {{ $value | quote }}
+{{- end }}
+          ports:
+            - containerPort: 8082
+              name: health
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8082
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8082
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+{{- toYaml .Values.seedServiceLBController.resources | nindent 12 }}
+{{- end }}

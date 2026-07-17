@@ -1,0 +1,6 @@
+apiVersion: v2
+name: gardener-extension-f5
+description: Gardener extension controller for F5 BIG-IP
+type: application
+version: 0.1.0
+appVersion: "0.0.0"

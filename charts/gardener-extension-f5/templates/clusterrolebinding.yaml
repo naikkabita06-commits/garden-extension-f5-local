@@ -1,0 +1,63 @@
+{{- /* Least-privilege ClusterRole — created unless rbac.clusterAdmin=true is set (escape hatch). */}}
+{{- if not .Values.rbac.clusterAdmin }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "gardener-extension-f5.fullname" . }}
+  labels:
+{{ include "gardener-extension-f5.labels" . | indent 4 }}
+rules:
+  # Gardener Extension API — read extensions, clear operation annotation, update status.
+  - apiGroups: ["extensions.gardener.cloud"]
+    resources: ["extensions"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: ["extensions.gardener.cloud"]
+    resources: ["extensions/status"]
+    verbs: ["get", "update", "patch"]
+  # F5 CRD — full lifecycle ownership.
+  - apiGroups: ["f5.extensions.gardener.cloud"]
+    resources: ["f5loadbalancerconfigs"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["f5.extensions.gardener.cloud"]
+    resources: ["f5loadbalancerconfigs/status"]
+    verbs: ["get", "update", "patch"]
+  # Core Kubernetes resources.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["services/status"]
+    verbs: ["update", "patch"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  # Leader election.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+{{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "gardener-extension-f5.fullname" . }}
+  labels:
+{{ include "gardener-extension-f5.labels" . | indent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  {{- if .Values.rbac.clusterAdmin }}
+  name: cluster-admin
+  {{- else }}
+  name: {{ include "gardener-extension-f5.fullname" . }}
+  {{- end }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.serviceAccount.name | default (include "gardener-extension-f5.name" .) }}
+    namespace: {{ .Release.Namespace }}

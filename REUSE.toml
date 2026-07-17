@@ -1,0 +1,10 @@
+version = 1
+SPDX-PackageName = "gardener-extension-f5"
+SPDX-PackageSupplier = "SAP SE or an SAP affiliate company and Gardener contributors"
+SPDX-PackageDownloadLocation = "https://github.com/gardener/gardener-extension-f5"
+
+[[annotations]]
+path = [".gitignore", ".dockerignore", "VERSION", "go.mod", "go.sum", "**/*.md"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2025 SAP SE or an SAP affiliate company and Gardener contributors"
+SPDX-License-Identifier = "Apache-2.0"

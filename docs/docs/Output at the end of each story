@@ -1,0 +1,238 @@
+# Output at the end of each story (CMP + BIG‑IP mgmt IP + CIS)
+
+This assumes:
+
+- **All control‑plane F5 config** (kube‑apiserver VIP) goes via **CMP LBaaS API**.
+- **All application F5 config** in Shoots goes via **CIS** talking directly to **BIG‑IP management IP** from CMP.
+- No VIPs are read from OpenStack Infrastructure status.
+
+---
+
+## Story 1 (Days 1–2): Foundation + Minimal CRD
+
+**Goal**
+
+Have a buildable extension and a minimal `F5LoadBalancerConfig` CRD that captures CMP + CIS + BIG‑IP mgmt info.
+
+**What exists at the end**
+
+- Extension builds (`go build` / `go test`) and Docker image builds.
+- Controller pod can start in a test cluster (no real logic).
+- `F5LoadBalancerConfig` CRD is applied successfully.
+- Example YAMLs exist showing:
+
+  ```yaml
+  spec:
+    ccpApiEndpoint: "<CMP LBaaS URL>"
+    tenantOrPartition: "<control-plane partition>"
+    credentialsSecretRef: {...}
+    controlPlaneVIP: "<kube-apiserver VIP>"
+
+    enableApplicationLB: true
+    cis:
+      image: "f5networks/k8s-bigip-ctlr:<tag>"
+      bigipUrl: "<BIG-IP mgmt URL from CMP>"
+      partition: "<app partition>"
+      extraArgs: []
+  ```
+
+---
+
+## Story 2 (Days 3–5): CMP Client + Control‑Plane Actuator Skeleton
+
+**Goal**
+
+Wire Gardener → extension and have a CMP client that can log intended actions.
+
+**What exists at the end**
+
+- Gardener calls the extension’s actuator on Shoot create/update/delete.
+- The actuator:
+
+  - Reads `F5LoadBalancerConfig` and CMP Secret.
+  - Creates a CMP client instance.
+  - Logs which VIP, tenant/partition, and (dummy) backends it would configure.
+
+- A finalizer is added to the Extension resource and removed on delete.
+- CMP client can hit at least a health/mock endpoint with provided creds.
+
+_No real Virtual Server is created on CMP yet._
+
+---
+
+## Story 3 (Days 6–8): kube‑apiserver Discovery + Real CMP Control‑Plane VS
+
+**Goal**
+
+Make the Shoot’s kube‑apiserver reachable via the CMP‑managed `controlPlaneVIP`.
+
+**What exists at the end**
+
+- Seed‑side logic to discover kube‑apiserver endpoints for a Shoot is implemented.
+- On reconcile:
+
+  - A backend list `[]Backend{IP,Port}` is built from these endpoints.
+  - The CMP client calls `EnsureControlPlaneVirtualServer` to create/update a VS on `controlPlaneVIP:443`.
+
+- On CMP side:
+
+  - There is an actual VS for that Shoot’s kube‑apiserver.
+
+- For a test Shoot (once DNS/certs are wired):
+
+  - `kubectl` to `https://<controlPlaneVIP>:443` reaches the apiserver.
+
+- `F5LoadBalancerConfig.status` contains:
+
+  ```yaml
+  status:
+    vip: "<controlPlaneVIP>"
+    virtualServerName: "<CMP VS ID or name>"
+    conditions:
+      - type: Ready
+        status: "True"
+        reason: "ControlPlaneConfigured"
+        message: "Control-plane virtual server configured on CMP/F5"
+  ```
+
+- Re‑reconciling does not create duplicate VS entries on CMP.
+
+---
+
+## Story 4 (Days 9–11): VIP Validation + CMP Cleanup
+
+**Goal**
+
+Use `spec.controlPlaneVIP` as authoritative, validate it, and clean up CMP VS on delete.
+
+**What exists at the end**
+
+- If `spec.controlPlaneVIP` is missing or invalid:
+
+  - Reconcile fails early with `Ready=False` and a clear status message.
+  - No calls are made to CMP; no hot loop.
+
+- On Shoot/extension delete:
+
+  - The controller reads `status.virtualServerName`.
+  - Calls `DeleteControlPlaneVirtualServer` on CMP.
+  - Ignores “not found” as success.
+  - Removes the finalizer when cleanup succeeds.
+
+- Unit tests exist and pass for:
+
+  - VIP validation.
+  - Happy‑path reconcile and delete using a fake CMP client.
+
+Result: control‑plane LB lifecycle is safe and leaves no orphaned VS in CMP.
+
+---
+
+## Story 5 (Days 12–14): Shoot Client + CIS Deployment in Shoots
+
+**Goal**
+
+From the Seed, deploy CIS into Shoots so it can configure app VIPs on BIG‑IP via the mgmt IP.
+
+**What exists at the end**
+
+- A Shoot client factory:
+
+  - Reads each Shoot’s kubeconfig Secret.
+  - Creates/caches K8s clients for Shoots.
+
+- For Shoots with `enableApplicationLB=true` **and** Ready CP‑LB:
+
+  - In each Shoot:
+
+    - A CIS `ServiceAccount`, `ClusterRole`, and `ClusterRoleBinding` exist.
+    - A `bigip-login` Secret exists in `kube-system` with BIG‑IP mgmt credentials.
+    - A CIS `Deployment` exists with:
+
+      ```text
+      --bigip-url=<spec.cis.bigipUrl>       # BIG-IP mgmt URL from CMP
+      --bigip-partition=<spec.cis.partition>
+      ...
+      ```
+
+      and mounts `bigip-login` Secret.
+
+- Reconciliation is idempotent:
+
+  - Re-running updates existing CIS resources (RBAC, Secret, Deployment) instead of duplicating.
+
+At this point CIS is installed and configured to talk to BIG‑IP mgmt IP; health checks are minimal.
+
+---
+
+## Story 6 (Days 15–18): CIS Orchestration, Health, Robustness, Tests & Docs
+
+**Goal**
+
+Only run CIS when appropriate, reflect its health, handle failures reasonably, and document/test the MVP.
+
+**What exists at the end**
+
+- **Orchestration:**
+
+  - CIS is deployed/kept only if:
+
+    - CP‑LB `Ready=True`, and
+    - `enableApplicationLB == true`.
+
+  - On disable or Shoot delete:
+
+    - CIS Deployment, RBAC, and `bigip-login` Secret are deleted from the Shoot.
+    - This is part of the extension’s finalizer flow.
+
+- **Health:**
+
+  - The controller waits for CIS Deployment pods to be Ready.
+  - `F5LoadBalancerConfig.status` shows:
+
+    ```yaml
+    conditions:
+      - type: CISReady
+        status: "True" | "False"
+      - type: AppLBEnabled
+        status: "True" | "False"
+    ```
+
+  - Errors like wrong BIG‑IP creds or unreachable `bigipUrl` are surfaced with clear messages.
+
+- **Robustness:**
+
+  - Transient errors from CMP, Seed API, or Shoot API are retried with backoff.
+  - Permanent config errors (missing VIP, invalid `bigipUrl`, bad creds) cause clear `Error` conditions, not hot loops.
+
+- **Tests:**
+
+  - Unit tests exist for:
+
+    - CMP client request building and error paths.
+    - CIS manifest rendering and apply behavior.
+
+  - At least one smoke/E2E flow is exercised (in dev env):
+
+    - CP‑VIP: `kubectl` to a Shoot via `controlPlaneVIP`.
+    - If possible, app: simple `Service type=LoadBalancer` in Shoot gets an external IP from F5 (via CIS).
+
+- **Docs:**
+
+  - A short operator guide explains:
+
+    - What to obtain from CMP/F5:
+
+      - LB name, BIG‑IP mgmt URL, CP‑VIP values, partitions, credentials.
+      - CCP/LBaaS API endpoint and auth.
+      - Network/firewall expectations (Seed ↔ CMP, CIS ↔ BIG‑IP mgmt, F5 ↔ Seed/Shoots).
+
+    - How to configure `F5LoadBalancerConfig`.
+    - How CP‑VIP and app VIP flows work.
+    - How to interpret status conditions and logs.
+
+After Story 6, the MVP is:
+
+- Able to configure **control‑plane LB** via CMP (per Shoot).
+- Able to deploy CIS into Shoots and let it configure **application VIPs** on BIG‑IP via the management IP.
+- Reasonably robust, with minimal tests and documentation for internal use.

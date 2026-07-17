@@ -1,0 +1,113 @@
+# gardenlet-airtelcloud-values.yaml
+# Generated from Gardener "Deploy a gardenlet manually" reference:
+# https://gardener.cloud/docs/gardener/deployment/deploy_gardenlet_manually/#deploy-a-gardenlet-manually
+#
+# Target topology (as described by you):
+# - Garden cluster context: kind-gardener-local
+# - Seed cluster context:  kind-gardener-local2
+#
+# IMPORTANT (kind networking):
+# - The default kubeconfig server for kind-gardener-local is usually https://127.0.0.1:<random-port>.
+#   That endpoint is NOT reachable from inside the seed kind cluster.
+# - Use the Garden control-plane container IP over the Docker network instead:
+#     https://172.18.0.8:6443
+#
+# How to use:
+# 1) Create a bootstrap token Secret in the Garden cluster (namespace kube-system) as per doc.
+# 2) Replace <BOOTSTRAP_TOKEN_ID>.<BOOTSTRAP_TOKEN_SECRET> below.
+# 3) Deploy gardenlet into the Seed cluster:
+#      helm install gardenlet /path/to/gardener/charts/gardener/gardenlet \
+#        --kube-context kind-gardener-local2 \
+#        --namespace garden --create-namespace \
+#        -f gardenlet-airtelcloud-values.yaml \
+#        --wait
+
+replicaCount: 1
+
+config:
+  apiVersion: gardenlet.config.gardener.cloud/v1alpha1
+  kind: GardenletConfiguration
+
+  gardenClientConnection:
+    # bootstrapKubeconfig is used only for TLS bootstrapping (CSR) against the Garden apiserver.
+    bootstrapKubeconfig:
+      name: gardenlet-kubeconfig-bootstrap
+      namespace: garden
+      kubeconfig: |
+        apiVersion: v1
+        kind: Config
+        current-context: gardenlet-bootstrap@default
+        clusters:
+        - cluster:
+            certificate-authority-data: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSURCVENDQWUyZ0F3SUJBZ0lJT1dlY0Z1MkN1d2t3RFFZSktvWklodmNOQVFFTEJRQXdGVEVUTUJFR0ExVUUKQXhNS2EzVmlaWEp1WlhSbGN6QWVGdzB5TmpBek1UY3dOek15TlRGYUZ3MHpOakF6TVRRd056TTNOVEZhTUJVeApFekFSQmdOVkJBTVRDbXQxWW1WeWJtVjBaWE13Z2dFaU1BMEdDU3FHU0liM0RRRUJBUVVBQTRJQkR3QXdnZ0VLCkFvSUJBUURXam1EZ2NhR24yOW5HV2dNTlhwNWZMZG9idnQ5YWlYcjNFaDAyYnJPSG5GL2ZuVVZYT2dzL21YdXkKM1NwUmtKV0JTNitITis2S29ZcndraGxSQ2ZyNm5BRTFvMzl2S1d2eUNSV1dyWXN3em90SjhCOXUzNXc2NGZrTgovVWdiVzl2Rjg4WXM5bjRTSzN2c3hIRGgvZ0ZsSTNIckFNUVNiOVl3V0I3R2gvLys0QTIwRmQ5QmFMQ3k3RXYxCnk1dE8vNm9vSUQ5SXd2T0wvSHYzdWRJekIveEhrQUsrc2x3eUQ3TnV4R01CN3JyY3hUbm94R3RSQkdEanlTSisKakh1WSs4V1dIZXkxMkxMOEYzU25sdVJHZlVvektyeDBLK0hqOXZNY0w4S0NaaDErbUZUK3BuTzRDVjFYN0tNNgpaOGlCZktGS2x4OEtpajFrZVBEUy9mSWNiTEpqQWdNQkFBR2pXVEJYTUE0R0ExVWREd0VCL3dRRUF3SUNwREFQCkJnTlZIUk1CQWY4RUJUQURBUUgvTUIwR0ExVWREZ1FXQkJRSXNhTXY4VWYyb3o3L3JCSEdTTlNZTFRXclVEQVYKQmdOVkhSRUVEakFNZ2dwcmRXSmxjbTVsZEdWek1BMEdDU3FHU0liM0RRRUJDd1VBQTRJQkFRQW5BUVdLMjdwYQpHcUs2UXgzNE9wYjd4eWpXK2lEZzMrM1lHZnlQTWFHb1ExMi9iWHhDR0MvRTl4eDVKM0JqYWJyVlBOUjBMMHQ3CjZXd2RGVVV1NkdFbFg3OHZyM2tJZkh5V2hBQklvU1g5c2lPY1FLTGswVlc2cEVsUEJ6dk1YbTNBSHJjUlFjWEcKVVdrR1hvZ2tjUUk3ZGlDSnZwZTJtNkFMMjNtWGpuKzF6Sm5OdGkveGFGeUprVVFnUmpNVy9qd3BDZkxEaHEwbAovUFB4cEE2aFBwVjN6dHAxR2JOeDNDd1NKNHR6TTlZRVBxUnlXZ2xoclZiakJNS09RdmdkdThKdFRaazc2aE5mCk9WVlJMWjJLUGNQRmsyT0RZRGlFc0t0ZlFHNHpEaEVHNE9XaytvUHJ6Z2hMZWtKekJURWptenZ6ZGc1alliQ2oKQjJyTDVUTENIVzVXCi0tLS0tRU5EIENFUlRJRklDQVRFLS0tLS0K
+            server: https://172.18.0.8:6443
+          name: default
+        contexts:
+        - context:
+            cluster: default
+            user: gardenlet-bootstrap
+          name: gardenlet-bootstrap@default
+        users:
+        - name: gardenlet-bootstrap
+          user:
+            token: 07401b.f395accd246ae52d
+
+    # kubeconfigSecret is where gardenlet stores the real kubeconfig after TLS bootstrapping.
+    kubeconfigSecret:
+      name: gardenlet-kubeconfig
+      namespace: garden
+
+  # This `Seed` spec is what gardenlet registers into the Garden cluster.
+  seedConfig:
+    apiVersion: core.gardener.cloud/v1beta1
+    kind: Seed
+    metadata:
+      name: ojasvi-seed
+      labels:
+        environment: evaluation
+    spec:
+      provider:
+        type: airtelcloud
+        region: regionOne
+
+      dns:
+        # v1.139 gardenlet requires credentialsRef on both provider and internal
+        provider:
+          type: tcpwave
+          secretRef:
+            name: tcpwave-credentials
+            namespace: garden
+          credentialsRef:
+            apiVersion: v1
+            kind: Secret
+            name: tcpwave-credentials
+            namespace: garden
+        internal:
+          type: tcpwave
+          domain: internal.ojasvi-seed.airtel.local
+          credentialsRef:
+            apiVersion: v1
+            kind: Secret
+            name: tcpwave-credentials
+            namespace: garden
+
+      ingress:
+        domain: ingress.ojasvi-seed.airtel.local
+        controller:
+          kind: nginx
+
+      extensions:
+      - type: f5-loadbalancer
+
+      # Ensures Seed-managed LoadBalancer Services (e.g., istio ingress gateway)
+      # are created with an immutable loadBalancerClass and any required annotations.
+      # NOTE: These settings apply to all Seed LB Services created by Gardener.
+      settings:
+        loadBalancerServices:
+          class: f5.extensions.gardener.cloud/bigip
+          # VIP is allocated dynamically by CMP LBaaS — no hardcoded annotation needed.
+
+      networks:
+        nodes: 172.18.0.0/16
+        pods: 10.1.134.0/16
+        services: 10.2.0.0/16

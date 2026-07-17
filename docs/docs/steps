@@ -1,0 +1,9 @@
+Terminal A: kubectl -n shoot--local--local port-forward pod/kube-apiserver-574b5f59bc-2mjsg 9443:443 (and don’t type anything else there)
+Terminal B (in order):
+kubectl -n garden-f5-system get deploy gardener-extension-f5 -o wide
+kubectl -n garden-f5-system logs deploy/gardener-extension-f5 --since=24h | grep -E 'Reconciling F5 extension|Reconciled CIS in Shoot|deployment f5-cis-system/f5-cis not ready' || true
+kubectl -n shoot--local--local get f5loadbalancerconfig f5 -o yaml | sed -n '1,260p'
+kubectl --kubeconfig [shoot-direct.kubeconfig](http://_vscodecontentref_/0) -n f5-cis-system get deploy,pods,secret -o wide
+kubectl --kubeconfig [shoot-direct.kubeconfig](http://_vscodecontentref_/1) -n f5-cis-system logs deploy/f5-cis --previous --tail=40
+and
+kubectl --kubeconfig [shoot-direct.kubeconfig](http://_vscodecontentref_/2) -n f5-cis-system run netcheck --image=curlimages/curl:8.5.0 --restart=Never -it --rm -- sh -lc 'curl -k -sS --connect-timeout 5 --max-time 10 https://100.65.242.181/mgmt/shared/appsvcs/info'
