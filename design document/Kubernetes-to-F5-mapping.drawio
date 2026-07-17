@@ -1,0 +1,61 @@
+<mxfile host="app.diagrams.net">
+  <diagram name="Page-1" id="Xl-bx5GHSyk__WVNtzk0">
+    <mxGraphModel dx="677" dy="548" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="850" pageHeight="1100" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="eE4DeY--pc-Jwzox3Kbm-4" edge="1" parent="1" source="eE4DeY--pc-Jwzox3Kbm-3" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="195" y="280" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="eE4DeY--pc-Jwzox3Kbm-3" parent="1" style="shape=process;whiteSpace=wrap;html=1;backgroundOutline=1;" value="&lt;div align=&quot;left&quot;&gt;&amp;nbsp; &amp;nbsp;Kubernetes Service : payments&lt;/div&gt;&lt;div align=&quot;left&quot;&gt;&amp;nbsp; &amp;nbsp;type: Loadbalancer&lt;br&gt;&amp;nbsp; &amp;nbsp;ports:&amp;nbsp;&lt;/div&gt;&lt;div align=&quot;left&quot;&gt;&amp;nbsp; &amp;nbsp; &amp;nbsp; &amp;nbsp; - port: 443&lt;/div&gt;&lt;div align=&quot;left&quot;&gt;&amp;nbsp; &amp;nbsp; &amp;nbsp; &amp;nbsp; &amp;nbsp; nodePort: 32443&lt;/div&gt;" vertex="1">
+          <mxGeometry height="120" width="230" x="80" y="80" as="geometry" />
+        </mxCell>
+        <mxCell id="eE4DeY--pc-Jwzox3Kbm-8" edge="1" parent="1" source="eE4DeY--pc-Jwzox3Kbm-5" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" target="eE4DeY--pc-Jwzox3Kbm-7">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="eE4DeY--pc-Jwzox3Kbm-5" parent="1" style="whiteSpace=wrap;html=1;" value="CMP LB Service&lt;br&gt;payments-prod" vertex="1">
+          <mxGeometry height="60" width="120" x="135" y="280" as="geometry" />
+        </mxCell>
+        <mxCell id="eE4DeY--pc-Jwzox3Kbm-7" parent="1" style="whiteSpace=wrap;html=1;" value="VIP&lt;br&gt;10.20.30.40" vertex="1">
+          <mxGeometry height="60" width="120" x="135" y="400" as="geometry" />
+        </mxCell>
+        <mxCell id="eE4DeY--pc-Jwzox3Kbm-10" edge="1" parent="1" source="eE4DeY--pc-Jwzox3Kbm-9" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="195" y="650" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="eE4DeY--pc-Jwzox3Kbm-9" parent="1" style="whiteSpace=wrap;html=1;" value="Virtual Server&lt;br&gt;10.20.30.40:443/TCP" vertex="1">
+          <mxGeometry height="60" width="120" x="135" y="520" as="geometry" />
+        </mxCell>
+        <mxCell id="eE4DeY--pc-Jwzox3Kbm-11" parent="1" style="whiteSpace=wrap;html=1;" value="Pool: payemts-443" vertex="1">
+          <mxGeometry height="60" width="200" x="90" y="650" as="geometry" />
+        </mxCell>
+        <mxCell id="eE4DeY--pc-Jwzox3Kbm-13" edge="1" parent="1" source="eE4DeY--pc-Jwzox3Kbm-11" style="endArrow=block;dashed=1;endFill=0;endSize=12;html=1;rounded=0;exitX=0.82;exitY=1.017;exitDx=0;exitDy=0;exitPerimeter=0;" value="">
+          <mxGeometry relative="1" width="160" as="geometry">
+            <mxPoint x="220" y="720" as="sourcePoint" />
+            <mxPoint x="254" y="810" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="eE4DeY--pc-Jwzox3Kbm-14" edge="1" parent="1" source="eE4DeY--pc-Jwzox3Kbm-11" style="endArrow=block;dashed=1;endFill=0;endSize=12;html=1;rounded=0;exitX=0.25;exitY=1;exitDx=0;exitDy=0;" value="">
+          <mxGeometry relative="1" width="160" as="geometry">
+            <mxPoint x="58" y="740" as="sourcePoint" />
+            <mxPoint x="140" y="810" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="eE4DeY--pc-Jwzox3Kbm-15" parent="1" style="text;html=1;whiteSpace=wrap;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;rounded=0;" value="&lt;div&gt;node-a:32443&lt;/div&gt;10.1.01.11" vertex="1">
+          <mxGeometry height="30" width="80" x="100" y="820" as="geometry" />
+        </mxCell>
+        <mxCell id="eE4DeY--pc-Jwzox3Kbm-16" parent="1" style="text;html=1;whiteSpace=wrap;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;rounded=0;" value="&lt;div&gt;node-b:32443&lt;/div&gt;10.1.0.12" vertex="1">
+          <mxGeometry height="30" width="80" x="230" y="820" as="geometry" />
+        </mxCell>
+        <UserObject label="&lt;table&gt;&lt;thead&gt;&lt;tr&gt;&lt;th&gt;Kubernetes object&lt;/th&gt;&lt;th&gt;&amp;nbsp; &amp;nbsp; &amp;nbsp; &amp;nbsp; &amp;nbsp;CMP/F5 object&lt;/th&gt;&lt;/tr&gt;&lt;/thead&gt;&lt;tbody&gt;&lt;tr&gt;&lt;td&gt;&lt;code&gt;Service type=LoadBalancer&lt;/code&gt;&lt;/td&gt;&lt;td&gt;&amp;nbsp; &amp;nbsp; &amp;nbsp; &amp;nbsp; &amp;nbsp;LB Service + VIP&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;Each Service port&lt;/td&gt;&lt;td&gt;&amp;nbsp; &amp;nbsp; &amp;nbsp; &amp;nbsp; &amp;nbsp;Virtual Server + Pool&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;Eligible Node&lt;/td&gt;&lt;td&gt;&amp;nbsp; &amp;nbsp; &amp;nbsp; &amp;nbsp; &amp;nbsp;Backend Member&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;&lt;code&gt;Service.port&lt;/code&gt;&lt;/td&gt;&lt;td&gt;&amp;nbsp; &amp;nbsp; &amp;nbsp; &amp;nbsp; &amp;nbsp;Frontend/listener port&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;&lt;code&gt;Service.nodePort&lt;/code&gt;&lt;/td&gt;&lt;td&gt;&amp;nbsp; &amp;nbsp; &amp;nbsp; &amp;nbsp; &amp;nbsp;Backend member port&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;Node &lt;code&gt;InternalIP&lt;/code&gt;&lt;/td&gt;&lt;td&gt;&amp;nbsp; &amp;nbsp; &amp;nbsp; &amp;nbsp; &amp;nbsp;Backend resource IP&lt;/td&gt;&lt;/tr&gt;&lt;/tbody&gt;&lt;/table&gt;" link="&lt;table&gt;&lt;thead&gt;&lt;tr&gt;&lt;th&gt;Kubernetes object&lt;/th&gt;&lt;th&gt;CMP/F5 object&lt;/th&gt;&lt;/tr&gt;&lt;/thead&gt;&lt;tbody&gt;&lt;tr&gt;&lt;td&gt;&lt;code&gt;Service type=LoadBalancer&lt;/code&gt;&lt;/td&gt;&lt;td&gt;LB Service + VIP&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;Each Service port&lt;/td&gt;&lt;td&gt;Virtual Server + Pool&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;Eligible Node&lt;/td&gt;&lt;td&gt;Backend Member&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;&lt;code&gt;Service.port&lt;/code&gt;&lt;/td&gt;&lt;td&gt;Frontend/listener port&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;&lt;code&gt;Service.nodePort&lt;/code&gt;&lt;/td&gt;&lt;td&gt;Backend member port&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;Node &lt;code&gt;InternalIP&lt;/code&gt;&lt;/td&gt;&lt;td&gt;Backend resource IP&lt;/td&gt;&lt;/tr&gt;&lt;/tbody&gt;&lt;/table&gt;" id="eE4DeY--pc-Jwzox3Kbm-17">
+          <mxCell parent="1" style="text;whiteSpace=wrap;html=1;" vertex="1">
+            <mxGeometry height="160" width="400" x="80" y="900" as="geometry" />
+          </mxCell>
+        </UserObject>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
