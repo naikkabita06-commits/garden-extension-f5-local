@@ -73,14 +73,23 @@ func (s *stubCMP) DeleteLBServiceVIP(_ context.Context, _, _ string) error {
 func (s *stubCMP) CreateLBVirtualServer(_ context.Context, _ string, q url.Values) (json.RawMessage, error) {
 	s.createVSN++
 	s.lastVSQ = q
-	return json.RawMessage(`{"id":"vs-001","name":"test-vs"}`), nil
+	created := json.RawMessage(`{"id":"vs-001","name":"test-vs"}`)
+	s.vsList = append(s.vsList, created)
+	return created, nil
 }
 func (s *stubCMP) ListLBVirtualServers(_ context.Context, _ string) ([]json.RawMessage, error) {
 	s.listVSN++
 	return append([]json.RawMessage(nil), s.vsList...), nil
 }
-func (s *stubCMP) DeleteLBVirtualServer(_ context.Context, _, _ string) error {
+func (s *stubCMP) DeleteLBVirtualServer(_ context.Context, _, id string) error {
 	s.deleteVSN++
+	for i, raw := range s.vsList {
+		var item struct{ ID string }
+		if json.Unmarshal(raw, &item) == nil && item.ID == id {
+			s.vsList = append(s.vsList[:i], s.vsList[i+1:]...)
+			break
+		}
+	}
 	return nil
 }
 func (s *stubCMP) SearchNetworkPortsByIP(_ context.Context, ip string) ([]json.RawMessage, error) {
