@@ -13,16 +13,18 @@ type RoutingRuleClient interface {
 }
 
 type RoutingRuleResource struct {
-	ID     string
-	Host   string
-	Path   string
-	PoolID string
+	ID        string
+	Host      string
+	Path      string
+	MatchType string
+	PoolID    string
 }
 
 type RoutingRuleSpec struct {
-	Host   string
-	Path   string
-	PoolID string
+	Host      string
+	Path      string
+	MatchType string
+	PoolID    string
 }
 
 type RoutingRuleManager struct{ client RoutingRuleClient }
@@ -32,9 +34,6 @@ func NewRoutingRuleManager(client RoutingRuleClient) *RoutingRuleManager {
 }
 
 func (m *RoutingRuleManager) Ensure(ctx context.Context, lbServiceID, virtualServerID string, desired []RoutingRuleSpec) ([]RoutingRuleResource, bool, error) {
-	if len(desired) == 0 {
-		return nil, false, nil
-	}
 	if strings.TrimSpace(lbServiceID) == "" || strings.TrimSpace(virtualServerID) == "" {
 		return nil, false, fmt.Errorf("lb service id and virtual server id are required for routing rule reconciliation")
 	}
@@ -44,15 +43,17 @@ func (m *RoutingRuleManager) Ensure(ctx context.Context, lbServiceID, virtualSer
 	}
 	byKey := map[string]RoutingRuleResource{}
 	for _, rule := range existing {
-		byKey[routingRuleKey(rule.Host, rule.Path, rule.PoolID)] = rule
+		byKey[routingRuleKey(rule.Host, rule.Path, rule.MatchType, rule.PoolID)] = rule
 	}
+	desiredKeys := map[string]struct{}{}
 	out := make([]RoutingRuleResource, 0, len(desired))
 	changed := false
 	for _, spec := range desired {
 		if strings.TrimSpace(spec.PoolID) == "" {
 			return out, changed, fmt.Errorf("routing rule pool id must not be empty")
 		}
-		key := routingRuleKey(spec.Host, spec.Path, spec.PoolID)
+		key := routingRuleKey(spec.Host, spec.Path, spec.MatchType, spec.PoolID)
+		desiredKeys[key] = struct{}{}
 		if existing, ok := byKey[key]; ok && strings.TrimSpace(existing.ID) != "" {
 			out = append(out, existing)
 			continue
@@ -62,6 +63,18 @@ func (m *RoutingRuleManager) Ensure(ctx context.Context, lbServiceID, virtualSer
 			return out, changed, fmt.Errorf("creating routing rule host=%s path=%s pool=%s: %w", spec.Host, spec.Path, spec.PoolID, err)
 		}
 		out = append(out, created)
+		changed = true
+	}
+	for key, rule := range byKey {
+		if _, wanted := desiredKeys[key]; wanted {
+			continue
+		}
+		if strings.TrimSpace(rule.ID) == "" {
+			continue
+		}
+		if err := m.client.DeleteRoutingRule(ctx, lbServiceID, virtualServerID, rule.ID); err != nil {
+			return out, changed, fmt.Errorf("deleting obsolete routing rule %s: %w", rule.ID, err)
+		}
 		changed = true
 	}
 	return out, changed, nil
@@ -74,6 +87,10 @@ func (m *RoutingRuleManager) Cleanup(ctx context.Context, lbServiceID, virtualSe
 	return m.client.DeleteRoutingRule(ctx, lbServiceID, virtualServerID, ruleID)
 }
 
-func routingRuleKey(host, path, poolID string) string {
-	return strings.TrimSpace(host) + "|" + strings.TrimSpace(path) + "|" + strings.TrimSpace(poolID)
+func routingRuleKey(host, path, matchType, poolID string) string {
+	mt := strings.ToLower(strings.TrimSpace(matchType))
+	if mt == "" {
+		mt = "prefix"
+	}
+	return strings.ToLower(strings.TrimSpace(host)) + "|" + strings.TrimSpace(path) + "|" + mt + "|" + strings.TrimSpace(poolID)
 }

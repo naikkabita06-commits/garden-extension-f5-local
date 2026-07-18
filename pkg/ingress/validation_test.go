@@ -28,17 +28,17 @@ func TestValidateSupportedAcceptsDefaultBackend(t *testing.T) {
 	}
 }
 
-func TestValidateSupportedAcceptsMultiplePathsForSameBackend(t *testing.T) {
-	ing := &networkingv1.Ingress{Spec: networkingv1.IngressSpec{Rules: []networkingv1.IngressRule{{IngressRuleValue: networkingv1.IngressRuleValue{HTTP: &networkingv1.HTTPIngressRuleValue{Paths: []networkingv1.HTTPIngressPath{{Backend: *ingressBackend("web", 80)}, {Backend: *ingressBackend("web", 80)}}}}}}}}
-	if err := ValidateSupported(ing); err != nil {
-		t.Fatalf("expected same backend to be accepted: %v", err)
+func TestValidateSupportedRejectsMultipleBackendRulesUntilRoutingDeploymentIsEnabled(t *testing.T) {
+	ing := &networkingv1.Ingress{Spec: networkingv1.IngressSpec{Rules: []networkingv1.IngressRule{{IngressRuleValue: networkingv1.IngressRuleValue{HTTP: &networkingv1.HTTPIngressRuleValue{Paths: []networkingv1.HTTPIngressPath{{Path: "/", PathType: pathType(networkingv1.PathTypePrefix), Backend: *ingressBackend("web", 80)}, {Path: "/api", PathType: pathType(networkingv1.PathTypePrefix), Backend: *ingressBackend("api", 8080)}}}}}}}}
+	if err := ValidateSupported(ing); err == nil || !strings.Contains(err.Error(), "multiple backend services or ports") {
+		t.Fatalf("expected multiple backend rejection, got %v", err)
 	}
 }
 
-func TestValidateSupportedRejectsMultipleBackends(t *testing.T) {
-	ing := &networkingv1.Ingress{Spec: networkingv1.IngressSpec{Rules: []networkingv1.IngressRule{{IngressRuleValue: networkingv1.IngressRuleValue{HTTP: &networkingv1.HTTPIngressRuleValue{Paths: []networkingv1.HTTPIngressPath{{Backend: *ingressBackend("web", 80)}, {Backend: *ingressBackend("api", 80)}}}}}}}}
-	if err := ValidateSupported(ing); err == nil || !strings.Contains(err.Error(), "multiple backend") {
-		t.Fatalf("expected multiple backend rejection, got %v", err)
+func TestValidateSupportedRejectsDuplicateRouteConflicts(t *testing.T) {
+	ing := &networkingv1.Ingress{Spec: networkingv1.IngressSpec{Rules: []networkingv1.IngressRule{{IngressRuleValue: networkingv1.IngressRuleValue{HTTP: &networkingv1.HTTPIngressRuleValue{Paths: []networkingv1.HTTPIngressPath{{Path: "/", PathType: pathType(networkingv1.PathTypePrefix), Backend: *ingressBackend("web", 80)}, {Path: "/", PathType: pathType(networkingv1.PathTypePrefix), Backend: *ingressBackend("api", 80)}}}}}}}}
+	if err := ValidateSupported(ing); err == nil || !strings.Contains(err.Error(), "conflicting backends") {
+		t.Fatalf("expected duplicate route conflict rejection, got %v", err)
 	}
 }
 
@@ -51,4 +51,14 @@ func TestValidateSupportedRejectsResourceBackend(t *testing.T) {
 
 func ingressBackend(name string, port int32) *networkingv1.IngressBackend {
 	return &networkingv1.IngressBackend{Service: &networkingv1.IngressServiceBackend{Name: name, Port: networkingv1.ServiceBackendPort{Number: port}}}
+}
+
+func pathType(v networkingv1.PathType) *networkingv1.PathType { return &v }
+
+func TestValidateSupportedRejectsTLSUntilCertificateDeploymentIsEnabled(t *testing.T) {
+	pt := networkingv1.PathTypePrefix
+	ing := &networkingv1.Ingress{Spec: networkingv1.IngressSpec{TLS: []networkingv1.IngressTLS{{SecretName: "web-tls", Hosts: []string{"example.test"}}}, Rules: []networkingv1.IngressRule{{IngressRuleValue: networkingv1.IngressRuleValue{HTTP: &networkingv1.HTTPIngressRuleValue{Paths: []networkingv1.HTTPIngressPath{{Path: "/", PathType: &pt, Backend: *ingressBackend("web", 80)}}}}}}}}
+	if err := ValidateSupported(ing); err == nil || !strings.Contains(err.Error(), "TLS certificate upload") {
+		t.Fatalf("expected TLS unsupported rejection, got %v", err)
+	}
 }

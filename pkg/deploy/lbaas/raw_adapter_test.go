@@ -61,6 +61,7 @@ func TestRawAdapterSearchNetworkPortsByIPParsesCMPShapes(t *testing.T) {
 }
 
 type rawPoolAdapterStub struct {
+	pools         []json.RawMessage
 	createPoolQ   url.Values
 	memberQ       url.Values
 	defaultPool   string
@@ -68,6 +69,9 @@ type rawPoolAdapterStub struct {
 	deletedMember string
 }
 
+func (s *rawPoolAdapterStub) ListLBVirtualServerPools(context.Context, string, string) ([]json.RawMessage, error) {
+	return append([]json.RawMessage(nil), s.pools...), nil
+}
 func (s *rawPoolAdapterStub) CreateLBVirtualServerPool(_ context.Context, _, _ string, q url.Values) (json.RawMessage, error) {
 	s.createPoolQ = q
 	return json.RawMessage(`{"id":"pool-1","pool_name":"pool-web","is_default":false}`), nil
@@ -121,5 +125,16 @@ func TestRawPoolAdapterEncodesSwaggerQueries(t *testing.T) {
 	}
 	if raw.memberQ.Get("node") == "" {
 		t.Fatalf("expected node query payload, got %v", raw.memberQ)
+	}
+}
+
+func TestRawPoolAdapterListsPools(t *testing.T) {
+	raw := &rawPoolAdapterStub{pools: []json.RawMessage{json.RawMessage(`{"id":"pool-1","pool_name":"pool-web"}`)}}
+	pools, err := NewPoolClientFromRaw(raw).ListPools(context.Background(), "lb-1", "vs-1")
+	if err != nil {
+		t.Fatalf("ListPools failed: %v", err)
+	}
+	if len(pools) != 1 || pools[0].ID != "pool-1" || pools[0].Name != "pool-web" {
+		t.Fatalf("unexpected pools: %#v", pools)
 	}
 }

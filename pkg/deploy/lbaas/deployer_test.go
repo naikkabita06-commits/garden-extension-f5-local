@@ -91,6 +91,9 @@ func TestEnsureCreatesLBVIPAndVirtualServer(t *testing.T) {
 	if res.Observed.LBServiceID != "lb-1" || res.Observed.VIPPortID != "7" || res.Observed.VirtualServerID != "vs-1" || res.Observed.VIPAddress != "10.0.0.7" {
 		t.Fatalf("unexpected observed state: %#v", res.Observed)
 	}
+	if res.Observed.Graph.LBServices["lb"].ExternalID != "lb-1" || res.Observed.Graph.VirtualServers["vs"].ExternalID != "vs-1" {
+		t.Fatalf("expected observed graph to contain LB and VS resources: %#v", res.Observed.Graph)
+	}
 	if got := stub.lastVSSpec.MonitorPath; got != "/healthz" {
 		t.Fatalf("expected monitor path, got %q", got)
 	}
@@ -99,7 +102,7 @@ func TestEnsureCreatesLBVIPAndVirtualServer(t *testing.T) {
 func TestEnsureSkipsVirtualServerWhenBackendHashMatches(t *testing.T) {
 	backends := []model.BackendMember{{IP: "10.0.0.1", Port: 30080, Weight: 50}}
 	hash := DesiredBackendHash(80, 30080, backends)
-	stub := &stubClient{}
+	stub := &stubClient{lbServices: []LBService{{ID: "lb-1", Name: "lb"}}, vips: []VIP{{ID: "7", Address: "10.0.0.7"}}}
 	res, err := New(stub, "").Ensure(context.Background(), EnsureRequest{
 		VirtualServer: model.VirtualServer{Name: "vs", FrontendPort: 80, BackendNodePort: 30080, Protocol: "HTTP"},
 		Backends:      backends,
@@ -115,7 +118,7 @@ func TestEnsureSkipsVirtualServerWhenBackendHashMatches(t *testing.T) {
 }
 
 func TestEnsurePreservesExistingVirtualServerWhenHashIsNotManaged(t *testing.T) {
-	stub := &stubClient{}
+	stub := &stubClient{lbServices: []LBService{{ID: "lb-1", Name: "lb"}}, vips: []VIP{{ID: "7", Address: "10.0.0.7"}}}
 	res, err := New(stub, "").Ensure(context.Background(), EnsureRequest{
 		VirtualServer: model.VirtualServer{Name: "vs", FrontendPort: 80, BackendNodePort: 30080, Protocol: "HTTP"},
 		Backends:      []model.BackendMember{{IP: "10.0.0.1", Port: 30080, Weight: 50}},
@@ -130,7 +133,7 @@ func TestEnsurePreservesExistingVirtualServerWhenHashIsNotManaged(t *testing.T) 
 }
 
 func TestEnsureRecreatesExistingVirtualServerWhenHashIsManagedButMissing(t *testing.T) {
-	stub := &stubClient{}
+	stub := &stubClient{lbServices: []LBService{{ID: "lb-1", Name: "lb"}}, vips: []VIP{{ID: "7", Address: "10.0.0.7"}}}
 	res, err := New(stub, "").Ensure(context.Background(), EnsureRequest{
 		VirtualServer:           model.VirtualServer{Name: "vs", FrontendPort: 80, BackendNodePort: 30080, Protocol: "HTTP"},
 		Backends:                []model.BackendMember{{IP: "10.0.0.1", Port: 30080, Weight: 50}},
@@ -243,5 +246,106 @@ func TestCleanupDiscoveredDeletesVirtualServersByPrefixAndAllVIPs(t *testing.T) 
 	}
 	if stub.deletedVS != 1 || stub.deletedVIP != 2 || !res.DeletedVirtualServer || !res.DeletedVIP {
 		t.Fatalf("unexpected cleanup: vs=%d vip=%d result=%#v", stub.deletedVS, stub.deletedVIP, res)
+	}
+}
+
+func TestEnsureFailsWhenBackendPortHasNoResourceID(t *testing.T) {
+	stub := &stubClient{}
+	stub.searchNetworkPorts = func(ip string) []NetworkPort { return []NetworkPort{{ID: 99, ResourceType: "compute", IP: ip}} }
+	_, err := New(stub, "").Ensure(context.Background(), EnsureRequest{
+		VirtualServer: model.VirtualServer{Name: "vs", FrontendPort: 80, BackendNodePort: 30080, Protocol: "HTTP"},
+		Backends:      []model.BackendMember{{IP: "10.0.0.99", Port: 30080, Weight: 50}},
+	})
+	if err == nil {
+		t.Fatal("expected missing CMP resource_id to fail")
+	}
+}
+
+type stackClient struct {
+	*stubClient
+	*stubPoolClient
+	*stubMonitorClient
+	*stubRoutingRuleClient
+}
+
+func TestEnsureStackOrchestratesVirtualServerPoolMonitorMembersAndRules(t *testing.T) {
+	client := &stackClient{
+		stubClient:            &stubClient{},
+		stubPoolClient:        &stubPoolClient{},
+		stubMonitorClient:     &stubMonitorClient{},
+		stubRoutingRuleClient: &stubRoutingRuleClient{},
+	}
+	stack := &model.LoadBalancerStack{
+		LBService: model.LBService{Name: "lb"},
+		VIP:       model.VIP{Name: "vip"},
+		VirtualServers: []model.VirtualServer{{
+			Name: "vs", FrontendPort: 80, BackendNodePort: 30080, Protocol: "HTTP", DefaultPoolName: "pool-web",
+		}},
+		Pools: []model.Pool{{
+			Name: "pool-web", Members: []model.BackendMember{{IP: "10.0.0.1", Port: 30080, Weight: 50}},
+			Monitor: &model.Monitor{Name: "web", Type: "http", Path: "/healthz", Interval: 15},
+		}},
+		RoutingRules: []model.RoutingRule{{Host: "example.com", Path: "/", MatchType: "prefix", PoolName: "pool-web"}},
+	}
+	result, err := NewWithResourceManagers(client, "", client, client, client).EnsureStack(context.Background(), StackEnsureRequest{Stack: stack})
+	if err != nil {
+		t.Fatalf("EnsureStack: %v", err)
+	}
+	if !result.Changed || client.createdLB != 1 || client.createdVIP != 1 || client.createdVS != 1 {
+		t.Fatalf("expected parent graph creation, result=%#v lb=%d vip=%d vs=%d", result, client.createdLB, client.createdVIP, client.createdVS)
+	}
+	if len(client.stubPoolClient.createdPools) != 1 || len(client.stubPoolClient.createdMembers) != 1 || len(client.stubMonitorClient.created) != 1 {
+		t.Fatalf("expected pool/member/monitor reconciliation, pools=%#v members=%#v monitors=%#v", client.stubPoolClient.createdPools, client.stubPoolClient.createdMembers, client.stubMonitorClient.created)
+	}
+	if len(client.stubRoutingRuleClient.created) != 1 || result.Observed.Graph.Pools["vs/pool-web"].ExternalID == "" || len(result.Observed.Graph.RoutingRules) != 1 {
+		t.Fatalf("expected routing and observed graph entries, rules=%#v graph=%#v", client.stubRoutingRuleClient.created, result.Observed.Graph)
+	}
+}
+
+func TestEnsureStackRejectsUnwiredRequiredManagers(t *testing.T) {
+	_, err := New(&stubClient{}, "").EnsureStack(context.Background(), StackEnsureRequest{Stack: &model.LoadBalancerStack{VirtualServers: []model.VirtualServer{{Name: "vs"}}, Pools: []model.Pool{{Name: "pool"}}}})
+	if err == nil {
+		t.Fatal("expected stack reconciliation without PoolManager to fail")
+	}
+}
+
+func TestCleanupGraphDeletesChildrenBeforeParents(t *testing.T) {
+	client := &stackClient{
+		stubClient:            &stubClient{},
+		stubPoolClient:        &stubPoolClient{},
+		stubMonitorClient:     &stubMonitorClient{},
+		stubRoutingRuleClient: &stubRoutingRuleClient{},
+	}
+	graph := model.NewObservedGraph()
+	graph.VirtualServers["vs"] = model.ObservedResource{ExternalID: "vs-1"}
+	graph.VIPs["vip"] = model.ObservedResource{ExternalID: "vip-1"}
+	graph.Pools["vs/pool"] = model.ObservedResource{ExternalID: "pool-1"}
+	graph.Members["vs/pool/compute-1|10.0.0.1|5001|30080"] = model.ObservedResource{ExternalID: "member-1"}
+	graph.Monitors["vs/pool"] = model.ObservedResource{ExternalID: "monitor-1"}
+	graph.RoutingRules["vs/example.com|/|prefix|pool-1"] = model.ObservedResource{ExternalID: "rule-1"}
+	deployer := NewWithResourceManagers(client, "", client, client, client)
+	if err := deployer.CleanupGraph(context.Background(), GraphCleanupRequest{Current: model.ObservedState{LBServiceID: "lb-1", Graph: graph}, DeleteVIP: true, DeleteLBService: true}); err != nil {
+		t.Fatalf("CleanupGraph: %v", err)
+	}
+	if got := client.stubRoutingRuleClient.deleted; len(got) != 1 || got[0] != "rule-1" {
+		t.Fatalf("expected routing-rule cleanup, got %#v", got)
+	}
+	if got := client.stubPoolClient.deletedMemberIDs; len(got) != 1 || got[0] != "member-1" {
+		t.Fatalf("expected member cleanup, got %#v", got)
+	}
+	if client.stubMonitorClient.deleted != "monitor-1" || client.stubPoolClient.deletedPoolID != "pool-1" || client.stubClient.deletedVS != 1 || client.stubClient.deletedVIP != 1 || client.stubClient.deletedLB != 1 {
+		t.Fatalf("expected graph cleanup of monitor/pool/parents: monitor=%q pool=%q vs=%d vip=%d lb=%d", client.stubMonitorClient.deleted, client.stubPoolClient.deletedPoolID, client.stubClient.deletedVS, client.stubClient.deletedVIP, client.stubClient.deletedLB)
+	}
+}
+
+func TestEnsureStackPersistsMemberObservedResources(t *testing.T) {
+	client := &stackClient{stubClient: &stubClient{}, stubPoolClient: &stubPoolClient{}, stubMonitorClient: &stubMonitorClient{}, stubRoutingRuleClient: &stubRoutingRuleClient{}}
+	stack := &model.LoadBalancerStack{LBService: model.LBService{Name: "lb"}, VIP: model.VIP{Name: "vip"}, VirtualServers: []model.VirtualServer{{Name: "vs", FrontendPort: 80, BackendNodePort: 30080, Protocol: "HTTP", DefaultPoolName: "pool"}}, Pools: []model.Pool{{Name: "pool", Members: []model.BackendMember{{IP: "10.0.0.1", Port: 30080, Weight: 1}}}}}
+	result, err := NewWithResourceManagers(client, "", client, client, client).EnsureStack(context.Background(), StackEnsureRequest{Stack: stack})
+	if err != nil {
+		t.Fatalf("EnsureStack: %v", err)
+	}
+	if len(result.Observed.Graph.Members) != 1 {
+		t.Fatalf("expected member observed graph entry, got %#v", result.Observed.Graph.Members)
 	}
 }

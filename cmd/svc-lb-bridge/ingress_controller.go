@@ -256,11 +256,7 @@ func (r *ingressReconciler) getServiceAndNodePort(ctx context.Context, namespace
 			return svc, p.NodePort, nil
 		}
 	}
-	// If only one port exists, use it.
-	if len(svc.Spec.Ports) == 1 {
-		return svc, svc.Spec.Ports[0].NodePort, nil
-	}
-	return svc, 0, nil
+	return svc, 0, fmt.Errorf("service %s/%s has no port matching ingress backend port name=%q number=%d", namespace, name, port.Name, port.Number)
 }
 
 func (r *ingressReconciler) ensureCMPResources(ctx context.Context, ing *networkingv1.Ingress, stack *model.LoadBalancerStack) (*f5client.CMPResourceIDs, string, error) {
