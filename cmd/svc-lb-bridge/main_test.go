@@ -56,7 +56,9 @@ func (s *stubCMP) DeleteLBService(_ context.Context, _ string) error {
 }
 func (s *stubCMP) CreateLBServiceVIP(_ context.Context, _ string) (json.RawMessage, error) {
 	s.createVN++
-	return json.RawMessage(`{"id":101,"ip_address":"10.0.0.10"}`), nil
+	created := json.RawMessage(`{"id":101,"ip_address":"10.0.0.10"}`)
+	s.vips = append(s.vips, created)
+	return created, nil
 }
 func (s *stubCMP) GetLBServiceVIPs(_ context.Context, _ string) ([]json.RawMessage, error) {
 	s.listVIPN++

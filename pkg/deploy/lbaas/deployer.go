@@ -60,6 +60,7 @@ type EnsureResult struct {
 
 func (d *Deployer) Ensure(ctx context.Context, req EnsureRequest) (*EnsureResult, error) {
 	result := &EnsureResult{Observed: req.Current}
+	result.Observed.EnsureGraph()
 	result.BackendHash = DesiredBackendHash(req.VirtualServer.FrontendPort, req.VirtualServer.BackendNodePort, req.Backends)
 
 	lbID, changed, err := d.lbServices.Ensure(ctx, req, result.Observed.LBServiceID)
@@ -67,6 +68,7 @@ func (d *Deployer) Ensure(ctx context.Context, req EnsureRequest) (*EnsureResult
 		return nil, err
 	}
 	result.Observed.LBServiceID = lbID
+	result.Observed.Graph.LBServices[req.LBName] = model.ObservedResource{LogicalID: req.LBName, ExternalID: lbID, Name: req.LBName, Ownership: req.VirtualServer.Ownership}
 	result.Changed = result.Changed || changed
 
 	vipID, vipAddress, changed, err := d.vips.Ensure(ctx, result.Observed.LBServiceID, result.Observed.VIPPortID, result.Observed.VIPAddress)
@@ -75,6 +77,7 @@ func (d *Deployer) Ensure(ctx context.Context, req EnsureRequest) (*EnsureResult
 	}
 	result.Observed.VIPPortID = vipID
 	result.Observed.VIPAddress = vipAddress
+	result.Observed.Graph.VIPs["vip/"+vipID] = model.ObservedResource{LogicalID: "vip/" + vipID, ExternalID: vipID, Address: vipAddress, Ownership: req.VirtualServer.Ownership}
 	result.Changed = result.Changed || changed
 
 	vsID, vsName, changed, err := d.virtualServers.Ensure(ctx, VirtualServerEnsureRequest{
@@ -92,6 +95,7 @@ func (d *Deployer) Ensure(ctx context.Context, req EnsureRequest) (*EnsureResult
 	}
 	result.Observed.VirtualServerID = vsID
 	result.Observed.VirtualServerName = vsName
+	result.Observed.Graph.VirtualServers[req.VirtualServer.Name] = model.ObservedResource{LogicalID: req.VirtualServer.Name, ExternalID: vsID, Name: vsName, Ownership: req.VirtualServer.Ownership}
 	result.Changed = result.Changed || changed
 	return result, nil
 }

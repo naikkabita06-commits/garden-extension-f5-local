@@ -91,6 +91,9 @@ func TestEnsureCreatesLBVIPAndVirtualServer(t *testing.T) {
 	if res.Observed.LBServiceID != "lb-1" || res.Observed.VIPPortID != "7" || res.Observed.VirtualServerID != "vs-1" || res.Observed.VIPAddress != "10.0.0.7" {
 		t.Fatalf("unexpected observed state: %#v", res.Observed)
 	}
+	if res.Observed.Graph.LBServices["lb"].ExternalID != "lb-1" || res.Observed.Graph.VirtualServers["vs"].ExternalID != "vs-1" {
+		t.Fatalf("expected observed graph to contain LB and VS resources: %#v", res.Observed.Graph)
+	}
 	if got := stub.lastVSSpec.MonitorPath; got != "/healthz" {
 		t.Fatalf("expected monitor path, got %q", got)
 	}
@@ -99,7 +102,7 @@ func TestEnsureCreatesLBVIPAndVirtualServer(t *testing.T) {
 func TestEnsureSkipsVirtualServerWhenBackendHashMatches(t *testing.T) {
 	backends := []model.BackendMember{{IP: "10.0.0.1", Port: 30080, Weight: 50}}
 	hash := DesiredBackendHash(80, 30080, backends)
-	stub := &stubClient{}
+	stub := &stubClient{vips: []VIP{{ID: "7", Address: "10.0.0.7"}}}
 	res, err := New(stub, "").Ensure(context.Background(), EnsureRequest{
 		VirtualServer: model.VirtualServer{Name: "vs", FrontendPort: 80, BackendNodePort: 30080, Protocol: "HTTP"},
 		Backends:      backends,
@@ -115,7 +118,7 @@ func TestEnsureSkipsVirtualServerWhenBackendHashMatches(t *testing.T) {
 }
 
 func TestEnsurePreservesExistingVirtualServerWhenHashIsNotManaged(t *testing.T) {
-	stub := &stubClient{}
+	stub := &stubClient{vips: []VIP{{ID: "7", Address: "10.0.0.7"}}}
 	res, err := New(stub, "").Ensure(context.Background(), EnsureRequest{
 		VirtualServer: model.VirtualServer{Name: "vs", FrontendPort: 80, BackendNodePort: 30080, Protocol: "HTTP"},
 		Backends:      []model.BackendMember{{IP: "10.0.0.1", Port: 30080, Weight: 50}},
@@ -130,7 +133,7 @@ func TestEnsurePreservesExistingVirtualServerWhenHashIsNotManaged(t *testing.T) 
 }
 
 func TestEnsureRecreatesExistingVirtualServerWhenHashIsManagedButMissing(t *testing.T) {
-	stub := &stubClient{}
+	stub := &stubClient{vips: []VIP{{ID: "7", Address: "10.0.0.7"}}}
 	res, err := New(stub, "").Ensure(context.Background(), EnsureRequest{
 		VirtualServer:           model.VirtualServer{Name: "vs", FrontendPort: 80, BackendNodePort: 30080, Protocol: "HTTP"},
 		Backends:                []model.BackendMember{{IP: "10.0.0.1", Port: 30080, Weight: 50}},
@@ -243,5 +246,17 @@ func TestCleanupDiscoveredDeletesVirtualServersByPrefixAndAllVIPs(t *testing.T) 
 	}
 	if stub.deletedVS != 1 || stub.deletedVIP != 2 || !res.DeletedVirtualServer || !res.DeletedVIP {
 		t.Fatalf("unexpected cleanup: vs=%d vip=%d result=%#v", stub.deletedVS, stub.deletedVIP, res)
+	}
+}
+
+func TestEnsureFailsWhenBackendPortHasNoResourceID(t *testing.T) {
+	stub := &stubClient{}
+	stub.searchNetworkPorts = func(ip string) []NetworkPort { return []NetworkPort{{ID: 99, ResourceType: "compute", IP: ip}} }
+	_, err := New(stub, "").Ensure(context.Background(), EnsureRequest{
+		VirtualServer: model.VirtualServer{Name: "vs", FrontendPort: 80, BackendNodePort: 30080, Protocol: "HTTP"},
+		Backends:      []model.BackendMember{{IP: "10.0.0.99", Port: 30080, Weight: 50}},
+	})
+	if err == nil {
+		t.Fatal("expected missing CMP resource_id to fail")
 	}
 }

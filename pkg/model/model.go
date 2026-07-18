@@ -60,9 +60,31 @@ type VirtualServer struct {
 // Pool is the desired backend pool for one listener or route.
 type Pool struct {
 	Name      string
+	Service   string
+	PortName  string
+	Port      int32
 	Members   []BackendMember
 	Monitor   *Monitor
 	Ownership Ownership
+}
+
+// RoutingRule is a deterministic host/path rule targeting a named backend pool.
+type RoutingRule struct {
+	Name      string
+	Host      string
+	Path      string
+	MatchType string
+	PoolName  string
+	Priority  int32
+	Ownership Ownership
+}
+
+// Certificate is the desired TLS certificate reference for HTTPS listeners.
+type Certificate struct {
+	Name       string
+	SecretName string
+	Hosts      []string
+	Ownership  Ownership
 }
 
 // BackendMember is the normalized backend representation used by model
@@ -81,14 +103,72 @@ type Monitor struct {
 	Interval int32
 }
 
+// ObservedResource describes one CMP/F5 resource discovered or created by the
+// deployment layer. LogicalID is the deterministic desired-state identifier;
+// ExternalID is the provider ID returned by CMP.
+type ObservedResource struct {
+	LogicalID  string
+	ExternalID string
+	Name       string
+	Address    string
+	Ownership  Ownership
+}
+
+// ObservedGraph is the per-resource provider graph observed during a reconcile.
+// It is the durable shape expected by the stack deployer; the legacy scalar
+// fields on ObservedState below remain only for compatibility with existing
+// status annotations while controllers migrate to graph persistence.
+type ObservedGraph struct {
+	LBServices     map[string]ObservedResource
+	VIPs           map[string]ObservedResource
+	VirtualServers map[string]ObservedResource
+	Pools          map[string]ObservedResource
+	Members        map[string]ObservedResource
+	Monitors       map[string]ObservedResource
+	RoutingRules   map[string]ObservedResource
+	Certificates   map[string]ObservedResource
+}
+
+// NewObservedGraph returns an initialized observed provider graph.
+func NewObservedGraph() ObservedGraph {
+	return ObservedGraph{
+		LBServices:     map[string]ObservedResource{},
+		VIPs:           map[string]ObservedResource{},
+		VirtualServers: map[string]ObservedResource{},
+		Pools:          map[string]ObservedResource{},
+		Members:        map[string]ObservedResource{},
+		Monitors:       map[string]ObservedResource{},
+		RoutingRules:   map[string]ObservedResource{},
+		Certificates:   map[string]ObservedResource{},
+	}
+}
+
 // ObservedState describes provider resources discovered or created by the
-// deployment layer and returned to status writers.
+// deployment layer and returned to status writers. New code should prefer Graph.
 type ObservedState struct {
+	Graph             ObservedGraph
 	LBServiceID       string
 	VIPPortID         string
 	VIPAddress        string
 	VirtualServerID   string
 	VirtualServerName string
+}
+
+// EnsureGraph initializes the observed graph and mirrors legacy scalar IDs into
+// their corresponding graph buckets when present.
+func (s *ObservedState) EnsureGraph() {
+	if s.Graph.LBServices == nil {
+		s.Graph = NewObservedGraph()
+	}
+	if s.LBServiceID != "" {
+		s.Graph.LBServices["legacy/lb-service"] = ObservedResource{LogicalID: "legacy/lb-service", ExternalID: s.LBServiceID}
+	}
+	if s.VIPPortID != "" {
+		s.Graph.VIPs["legacy/vip"] = ObservedResource{LogicalID: "legacy/vip", ExternalID: s.VIPPortID, Address: s.VIPAddress}
+	}
+	if s.VirtualServerID != "" {
+		s.Graph.VirtualServers["legacy/virtual-server"] = ObservedResource{LogicalID: "legacy/virtual-server", ExternalID: s.VirtualServerID, Name: s.VirtualServerName}
+	}
 }
 
 // DeploymentResult is the typed result returned by a deployer after reconciling
@@ -118,5 +198,7 @@ type LoadBalancerStack struct {
 	VIP            VIP
 	VirtualServers []VirtualServer
 	Pools          []Pool
+	RoutingRules   []RoutingRule
+	Certificates   []Certificate
 	Ports          []ServicePort
 }

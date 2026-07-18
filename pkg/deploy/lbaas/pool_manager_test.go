@@ -8,10 +8,12 @@ import (
 )
 
 type stubPoolClient struct {
-	createdPools   []PoolSpec
-	createdMembers []PoolMemberSpec
-	defaultPoolID  string
-	deletedPoolID  string
+	createdPools     []PoolSpec
+	createdMembers   []PoolMemberSpec
+	updatedMembers   []PoolMemberSpec
+	deletedMemberIDs []string
+	defaultPoolID    string
+	deletedPoolID    string
 }
 
 func (s *stubPoolClient) CreatePool(_ context.Context, _, _ string, spec PoolSpec) (PoolResource, error) {
@@ -31,12 +33,14 @@ func (s *stubPoolClient) SetDefaultPool(_ context.Context, _, _, poolID string) 
 }
 func (s *stubPoolClient) CreatePoolMember(_ context.Context, _, _, _ string, spec PoolMemberSpec) (PoolMemberResource, error) {
 	s.createdMembers = append(s.createdMembers, spec)
-	return PoolMemberResource{ID: "member-1", ResourceIP: spec.ResourceIP, Port: spec.Port}, nil
+	return PoolMemberResource{ID: "member-1", ResourceID: spec.ResourceID, ResourceType: spec.ResourceType, ResourceIP: spec.ResourceIP, BackendPortID: spec.BackendPortID, Port: spec.Port, Weight: spec.Weight}, nil
 }
-func (s *stubPoolClient) UpdatePoolMember(context.Context, string, string, string, string, PoolMemberSpec) (PoolMemberResource, error) {
-	return PoolMemberResource{}, nil
+func (s *stubPoolClient) UpdatePoolMember(_ context.Context, _, _, _, memberID string, spec PoolMemberSpec) (PoolMemberResource, error) {
+	s.updatedMembers = append(s.updatedMembers, spec)
+	return PoolMemberResource{ID: memberID, ResourceID: spec.ResourceID, ResourceType: spec.ResourceType, ResourceIP: spec.ResourceIP, BackendPortID: spec.BackendPortID, Port: spec.Port, Weight: spec.Weight}, nil
 }
-func (s *stubPoolClient) DeletePoolMember(context.Context, string, string, string, string) error {
+func (s *stubPoolClient) DeletePoolMember(_ context.Context, _, _, _, memberID string) error {
+	s.deletedMemberIDs = append(s.deletedMemberIDs, memberID)
 	return nil
 }
 

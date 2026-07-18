@@ -56,10 +56,13 @@ type PoolMemberSpec struct {
 }
 
 type PoolManager struct {
-	client PoolClient
+	client  PoolClient
+	members *BackendMemberManager
 }
 
-func NewPoolManager(client PoolClient) *PoolManager { return &PoolManager{client: client} }
+func NewPoolManager(client PoolClient) *PoolManager {
+	return &PoolManager{client: client, members: NewBackendMemberManager(client)}
+}
 
 func (m *PoolManager) Ensure(ctx context.Context, lbServiceID, virtualServerID string, desired model.Pool, members []PoolMemberSpec, setDefault bool) (PoolResource, bool, error) {
 	if strings.TrimSpace(lbServiceID) == "" {
@@ -75,11 +78,11 @@ func (m *PoolManager) Ensure(ctx context.Context, lbServiceID, virtualServerID s
 	if err != nil {
 		return PoolResource{}, false, fmt.Errorf("creating pool %s on virtual server %s: %w", desired.Name, virtualServerID, err)
 	}
-	for _, member := range members {
-		if _, err := m.client.CreatePoolMember(ctx, lbServiceID, virtualServerID, created.ID, member); err != nil {
-			return created, true, fmt.Errorf("creating pool member %s:%d in pool %s: %w", member.ResourceIP, member.Port, created.ID, err)
-		}
+	convergedMembers, _, err := m.members.Ensure(ctx, lbServiceID, virtualServerID, created.ID, created.Members, members)
+	if err != nil {
+		return created, true, err
 	}
+	created.Members = convergedMembers
 	if setDefault {
 		if err := m.client.SetDefaultPool(ctx, lbServiceID, virtualServerID, created.ID); err != nil {
 			return created, true, fmt.Errorf("setting pool %s as default on virtual server %s: %w", created.ID, virtualServerID, err)

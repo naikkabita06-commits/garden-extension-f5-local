@@ -128,7 +128,7 @@ func (m *VirtualServerManager) resolveBackendPort(ctx context.Context, ip string
 				port.ResourceType = "compute"
 			}
 			if strings.TrimSpace(port.ResourceID) == "" {
-				port.ResourceID = ip
+				return NetworkPort{}, fmt.Errorf("CMP network port for backend IP %s has no resource_id", ip)
 			}
 			return port, nil
 		}
