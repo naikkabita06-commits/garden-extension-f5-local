@@ -44,7 +44,9 @@ type stubCMP struct {
 
 func (s *stubCMP) CreateLBService(_ context.Context, _ url.Values) (json.RawMessage, error) {
 	s.createLBN++
-	return json.RawMessage(`{"id":"lb-001"}`), nil
+	created := json.RawMessage(`{"id":"lb-001","name":"app-ns-web"}`)
+	s.lbServices = append(s.lbServices, created)
+	return created, nil
 }
 func (s *stubCMP) ListLBServices(_ context.Context, _ *f5client.ListLoadBalancersOptions) ([]json.RawMessage, error) {
 	s.listLBN++
