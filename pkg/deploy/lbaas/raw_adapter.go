@@ -20,6 +20,7 @@ type RawClient interface {
 	ListLBVirtualServers(ctx context.Context, lbServiceID string) ([]json.RawMessage, error)
 	CreateLBVirtualServer(ctx context.Context, lbServiceID string, query url.Values) (json.RawMessage, error)
 	DeleteLBVirtualServer(ctx context.Context, lbServiceID, vsID string) error
+	SearchNetworkPortsByIP(ctx context.Context, ip string) ([]json.RawMessage, error)
 }
 
 type rawAdapter struct{ raw RawClient }
@@ -171,6 +172,20 @@ func (a rawAdapter) DeleteVirtualServer(ctx context.Context, lbServiceID, vsID s
 	return a.raw.DeleteLBVirtualServer(ctx, lbServiceID, vsID)
 }
 
+func (a rawAdapter) SearchNetworkPortsByIP(ctx context.Context, ip string) ([]NetworkPort, error) {
+	items, err := a.raw.SearchNetworkPortsByIP(ctx, ip)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]NetworkPort, 0, len(items))
+	for _, raw := range items {
+		if port := parseNetworkPort(raw); port.ID != 0 {
+			out = append(out, port)
+		}
+	}
+	return out, nil
+}
+
 func parseVIP(raw json.RawMessage) VIP {
 	var vip struct {
 		ID      string `json:"id"`
@@ -204,4 +219,59 @@ func parseVIP(raw json.RawMessage) VIP {
 		return VIP{ID: fmt.Sprintf("%d", numeric.ID), Address: addr}
 	}
 	return VIP{}
+}
+
+func parseNetworkPort(raw json.RawMessage) NetworkPort {
+	var port struct {
+		ID           int    `json:"id"`
+		IDString     string `json:"id_str"`
+		UUID         string `json:"uuid"`
+		ResourceID   string `json:"resource_id"`
+		DeviceID     string `json:"device_id"`
+		ComputeID    string `json:"compute_id"`
+		ResourceType string `json:"resource_type"`
+		DeviceOwner  string `json:"device_owner"`
+		FixedIP      string `json:"fixed_ip"`
+		IPAddress    string `json:"ip_address"`
+		IP           string `json:"ip"`
+		FixedIPs     []struct {
+			IPAddress string `json:"ip_address"`
+		} `json:"fixed_ips"`
+	}
+	if json.Unmarshal(raw, &port) != nil {
+		return NetworkPort{}
+	}
+	id := port.ID
+	if id == 0 && strings.TrimSpace(port.IDString) != "" {
+		if _, err := fmt.Sscanf(strings.TrimSpace(port.IDString), "%d", &id); err != nil {
+			id = 0
+		}
+	}
+	resourceID := firstNonEmpty(port.ResourceID, port.DeviceID, port.ComputeID, port.UUID)
+	resourceType := strings.TrimSpace(port.ResourceType)
+	if resourceType == "" {
+		resourceType = inferResourceType(port.DeviceOwner)
+	}
+	ip := firstNonEmpty(port.FixedIP, port.IPAddress, port.IP)
+	if ip == "" && len(port.FixedIPs) > 0 {
+		ip = strings.TrimSpace(port.FixedIPs[0].IPAddress)
+	}
+	return NetworkPort{ID: id, ResourceID: resourceID, ResourceType: resourceType, IP: ip}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+func inferResourceType(deviceOwner string) string {
+	owner := strings.ToLower(strings.TrimSpace(deviceOwner))
+	if strings.Contains(owner, "baremetal") {
+		return "baremetal"
+	}
+	return "compute"
 }

@@ -90,12 +90,16 @@ func (m *VirtualServerManager) create(ctx context.Context, lbServiceID, vipPortI
 		spec.MonitorType = vs.Monitor.Type
 		spec.MonitorPath = vs.Monitor.Path
 	}
-	for i, backend := range backends {
+	for _, backend := range backends {
+		port, err := m.resolveBackendPort(ctx, backend.IP)
+		if err != nil {
+			return "", err
+		}
 		spec.Nodes = append(spec.Nodes, BackendNodeSpec{
-			ResourceID:    backend.IP,
-			ResourceType:  "compute",
-			ResourceIP:    backend.IP,
-			BackendPortID: i + 1,
+			ResourceID:    port.ResourceID,
+			ResourceType:  port.ResourceType,
+			ResourceIP:    port.IP,
+			BackendPortID: port.ID,
 			Port:          backend.Port,
 			Weight:        backend.Weight,
 		})
@@ -111,4 +115,23 @@ func (m *VirtualServerManager) create(ctx context.Context, lbServiceID, vipPortI
 		return strings.TrimSpace(created.Name), nil
 	}
 	return vs.Name, nil
+}
+
+func (m *VirtualServerManager) resolveBackendPort(ctx context.Context, ip string) (NetworkPort, error) {
+	ports, err := m.client.SearchNetworkPortsByIP(ctx, ip)
+	if err != nil {
+		return NetworkPort{}, fmt.Errorf("searching CMP network port for backend IP %s: %w", ip, err)
+	}
+	for _, port := range ports {
+		if strings.TrimSpace(port.IP) == strings.TrimSpace(ip) && port.ID != 0 {
+			if strings.TrimSpace(port.ResourceType) == "" {
+				port.ResourceType = "compute"
+			}
+			if strings.TrimSpace(port.ResourceID) == "" {
+				port.ResourceID = ip
+			}
+			return port, nil
+		}
+	}
+	return NetworkPort{}, fmt.Errorf("no CMP network port found for backend IP %s", ip)
 }

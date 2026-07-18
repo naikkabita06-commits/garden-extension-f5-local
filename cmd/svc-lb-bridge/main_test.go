@@ -33,6 +33,7 @@ type stubCMP struct {
 	deleteVSN int
 	deleteVN  int
 	deleteLBN int
+	searchN   int
 	lastVSQ   url.Values
 
 	// Optional canned responses for list calls.
@@ -77,6 +78,10 @@ func (s *stubCMP) ListLBVirtualServers(_ context.Context, _ string) ([]json.RawM
 func (s *stubCMP) DeleteLBVirtualServer(_ context.Context, _, _ string) error {
 	s.deleteVSN++
 	return nil
+}
+func (s *stubCMP) SearchNetworkPortsByIP(_ context.Context, ip string) ([]json.RawMessage, error) {
+	s.searchN++
+	return []json.RawMessage{json.RawMessage(`{"id":5001,"resource_id":"compute-` + ip + `","resource_type":"compute","fixed_ip":"` + ip + `"}`)}, nil
 }
 
 func newTestReconciler(t *testing.T, objs ...client.Object) (*serviceReconciler, client.Client, *stubCMP) {

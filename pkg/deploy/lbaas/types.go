@@ -13,11 +13,19 @@ type Client interface {
 	ListVirtualServers(ctx context.Context, lbServiceID string) ([]VirtualServer, error)
 	CreateVirtualServer(ctx context.Context, lbServiceID string, spec VirtualServerSpec) (VirtualServer, error)
 	DeleteVirtualServer(ctx context.Context, lbServiceID, vsID string) error
+	SearchNetworkPortsByIP(ctx context.Context, ip string) ([]NetworkPort, error)
 }
 
 type LBService struct{ ID, Name string }
 type VIP struct{ ID, Address string }
 type VirtualServer struct{ ID, Name string }
+
+type NetworkPort struct {
+	ID           int
+	ResourceID   string
+	ResourceType string
+	IP           string
+}
 
 type LBServiceSpec struct {
 	Name, Description         string

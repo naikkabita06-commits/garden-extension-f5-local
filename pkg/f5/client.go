@@ -134,6 +134,9 @@ type Client interface {
 	GetLBVirtualServer(ctx context.Context, lbServiceID, vsID string) (json.RawMessage, error)
 	DeleteLBVirtualServer(ctx context.Context, lbServiceID, vsID string) error
 
+	// CMP Network API (v2.1: /networks/ports/search-by-ip/)
+	SearchNetworkPortsByIP(ctx context.Context, ip string) ([]json.RawMessage, error)
+
 	// CMP LBaaS Flavors
 	ListLBFlavors(ctx context.Context) ([]json.RawMessage, error)
 
@@ -1083,6 +1086,21 @@ func (c *client) DeleteLBVirtualServer(ctx context.Context, lbServiceID, vsID st
 	return err
 }
 
+// SearchNetworkPortsByIP calls GET /networks/ports/search-by-ip/?fixed_ip={ip}.
+func (c *client) SearchNetworkPortsByIP(ctx context.Context, ip string) ([]json.RawMessage, error) {
+	ip = strings.TrimSpace(ip)
+	if ip == "" {
+		return nil, fmt.Errorf("ip must not be empty")
+	}
+	q := url.Values{}
+	q.Set("fixed_ip", ip)
+	var out []json.RawMessage
+	if err := c.doRequest(ctx, http.MethodGet, c.networkPath("/ports/search-by-ip/?"+q.Encode()), nil, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ListLBFlavors calls GET /load-balancers/lb-flavor/.
 func (c *client) ListLBFlavors(ctx context.Context) ([]json.RawMessage, error) {
 	var out []json.RawMessage
@@ -1112,6 +1130,16 @@ func (c *client) lbPath(subPath string) string {
 			subPath)
 	}
 	return c.withPrefix("/load-balancers" + subPath)
+}
+
+func (c *client) networkPath(subPath string) string {
+	if c.organisationName != "" && c.projectID != "" {
+		return fmt.Sprintf("/api/v2.1/networks/domain/%s/project/%s/networks%s",
+			url.PathEscape(c.organisationName),
+			url.PathEscape(c.projectID),
+			subPath)
+	}
+	return c.withPrefix("/networks" + subPath)
 }
 
 // doRequest is a small helper for JSON-based HTTP requests.

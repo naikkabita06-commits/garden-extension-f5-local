@@ -20,6 +20,7 @@ type stubClient struct {
 	deletedVS  int
 	deletedVIP int
 	deletedLB  int
+	searchedIP []string
 }
 
 func (s *stubClient) ListLBServices(context.Context) ([]LBService, error) {
@@ -56,6 +57,10 @@ func (s *stubClient) CreateVirtualServer(_ context.Context, _ string, spec Virtu
 func (s *stubClient) DeleteVirtualServer(context.Context, string, string) error {
 	s.deletedVS++
 	return nil
+}
+func (s *stubClient) SearchNetworkPortsByIP(_ context.Context, ip string) ([]NetworkPort, error) {
+	s.searchedIP = append(s.searchedIP, ip)
+	return []NetworkPort{{ID: len(s.searchedIP), ResourceID: "compute-" + ip, ResourceType: "compute", IP: ip}}, nil
 }
 
 func TestEnsureCreatesLBVIPAndVirtualServer(t *testing.T) {
