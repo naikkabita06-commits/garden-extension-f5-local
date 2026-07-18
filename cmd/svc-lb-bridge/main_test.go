@@ -377,3 +377,33 @@ var _ = f5client.CMPResourceIDs{}
 
 // Ensure we don't leave unused imports around in this file.
 var _ = strings.TrimSpace
+
+func TestReconcile_ProgramsAndTracksEveryServicePortIndependently(t *testing.T) {
+	ctx := context.Background()
+	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "multi", Namespace: "ns"}}
+	svc.Spec.Type = corev1.ServiceTypeLoadBalancer
+	svc.Spec.Ports = []corev1.ServicePort{
+		{Name: "http", Port: 80, NodePort: 30080, Protocol: corev1.ProtocolTCP},
+		{Name: "https", Port: 443, NodePort: 30443, Protocol: corev1.ProtocolTCP},
+	}
+	svc.Spec.LoadBalancerClass = ptr.To(defaultLBClass)
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n1"}}
+	node.Status.Addresses = []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "172.18.0.10"}}
+	node.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}
+
+	r, c, stub := newTestReconciler(t, svc, node)
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(svc)}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if stub.createVSN != 2 {
+		t.Fatalf("expected one virtual server per Service port, got %d", stub.createVSN)
+	}
+	got := &corev1.Service{}
+	if err := c.Get(ctx, client.ObjectKeyFromObject(svc), got); err != nil {
+		t.Fatalf("getting Service: %v", err)
+	}
+	observed := readServicePortObserved(got.Annotations)
+	if len(observed) != 2 || observed["http/80/http"].VirtualServerID == "" || observed["https/443/https"].VirtualServerID == "" {
+		t.Fatalf("expected per-port observed virtual servers, got %#v", observed)
+	}
+}
