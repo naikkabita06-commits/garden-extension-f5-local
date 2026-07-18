@@ -9,18 +9,19 @@ import (
 )
 
 type stubClient struct {
-	lbServices []LBService
-	vips       []VIP
-	vsList     []VirtualServer
-	lastLBSpec LBServiceSpec
-	lastVSSpec VirtualServerSpec
-	createdLB  int
-	createdVIP int
-	createdVS  int
-	deletedVS  int
-	deletedVIP int
-	deletedLB  int
-	searchedIP []string
+	lbServices         []LBService
+	vips               []VIP
+	vsList             []VirtualServer
+	lastLBSpec         LBServiceSpec
+	lastVSSpec         VirtualServerSpec
+	createdLB          int
+	createdVIP         int
+	createdVS          int
+	deletedVS          int
+	deletedVIP         int
+	deletedLB          int
+	searchedIP         []string
+	searchNetworkPorts func(string) []NetworkPort
 }
 
 func (s *stubClient) ListLBServices(context.Context) ([]LBService, error) {
@@ -60,6 +61,9 @@ func (s *stubClient) DeleteVirtualServer(context.Context, string, string) error 
 }
 func (s *stubClient) SearchNetworkPortsByIP(_ context.Context, ip string) ([]NetworkPort, error) {
 	s.searchedIP = append(s.searchedIP, ip)
+	if s.searchNetworkPorts != nil {
+		return s.searchNetworkPorts(ip), nil
+	}
 	return []NetworkPort{{ID: len(s.searchedIP), ResourceID: "compute-" + ip, ResourceType: "compute", IP: ip}}, nil
 }
 
@@ -138,6 +142,18 @@ func TestEnsureRecreatesExistingVirtualServerWhenHashIsManagedButMissing(t *test
 	}
 	if stub.deletedVS != 1 || stub.createdVS != 1 || !res.Changed || res.Observed.VirtualServerID != "vs-1" {
 		t.Fatalf("expected VS recreation, created=%d deleted=%d changed=%t observed=%#v", stub.createdVS, stub.deletedVS, res.Changed, res.Observed)
+	}
+}
+
+func TestEnsureFailsWhenBackendPortCannotBeResolved(t *testing.T) {
+	stub := &stubClient{}
+	stub.searchNetworkPorts = func(string) []NetworkPort { return nil }
+	_, err := New(stub, "").Ensure(context.Background(), EnsureRequest{
+		VirtualServer: model.VirtualServer{Name: "vs", FrontendPort: 80, BackendNodePort: 30080, Protocol: "HTTP"},
+		Backends:      []model.BackendMember{{IP: "10.0.0.99", Port: 30080, Weight: 50}},
+	})
+	if err == nil {
+		t.Fatal("expected missing backend port lookup to fail")
 	}
 }
 
