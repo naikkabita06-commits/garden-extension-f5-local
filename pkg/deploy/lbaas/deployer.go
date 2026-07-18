@@ -225,6 +225,13 @@ func (d *Deployer) EnsureStack(ctx context.Context, req StackEnsureRequest) (*St
 			}
 			poolIDs[pool.Name] = resource.ID
 			observed.Graph.Pools[vs.Name+"/"+pool.Name] = model.ObservedResource{LogicalID: vs.Name + "/" + pool.Name, ExternalID: resource.ID, Name: resource.Name, Ownership: pool.Ownership}
+			for _, member := range resource.Members {
+				key := vs.Name + "/" + pool.Name + "/" + poolMemberKey(member.ResourceID, member.ResourceIP, member.BackendPortID, member.Port)
+				observed.Graph.Members[key] = model.ObservedResource{
+					LogicalID: key, ExternalID: member.ID,
+					Name: member.ResourceIP + ":" + fmt.Sprintf("%d", member.Port), Ownership: pool.Ownership,
+				}
+			}
 			changed = changed || poolChanged
 			if d.monitors != nil {
 				monitor, monitorChanged, err := d.monitors.Ensure(ctx, lbID, vsID, resource.ID, pool.Monitor)
@@ -242,7 +249,7 @@ func (d *Deployer) EnsureStack(ctx context.Context, req StackEnsureRequest) (*St
 			for _, rule := range req.Stack.RoutingRules {
 				poolID, ok := poolIDs[rule.PoolName]
 				if !ok {
-					continue
+					return nil, fmt.Errorf("routing rule %q references pool %q that is not attached to virtual server %q", rule.Name, rule.PoolName, vs.Name)
 				}
 				desiredRules = append(desiredRules, RoutingRuleSpec{Host: rule.Host, Path: rule.Path, MatchType: rule.MatchType, PoolID: poolID})
 			}
