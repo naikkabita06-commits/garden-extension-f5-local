@@ -38,8 +38,9 @@ type VirtualServerSpec struct {
 }
 
 type BackendNodeSpec struct {
-	ComputeID     string
-	ComputeIP     string
+	ResourceID    string
+	ResourceType  string
+	ResourceIP    string
 	BackendPortID int
 	Port          int32
 	Weight        int

@@ -143,7 +143,18 @@ func (a rawAdapter) CreateVirtualServer(ctx context.Context, lbServiceID string,
 		q.Set("allowed_cidrs", strings.Join(spec.AllowedCIDRs, ","))
 	}
 	for _, node := range spec.Nodes {
-		b, _ := json.Marshal(map[string]interface{}{"compute_id": node.ComputeID, "compute_ip": node.ComputeIP, "backend_port_id": node.BackendPortID, "port": node.Port, "weight": node.Weight})
+		resourceType := strings.TrimSpace(node.ResourceType)
+		if resourceType == "" {
+			resourceType = "compute"
+		}
+		b, _ := json.Marshal(map[string]interface{}{
+			"resource_id":     node.ResourceID,
+			"resource_type":   resourceType,
+			"resource_ip":     node.ResourceIP,
+			"backend_port_id": node.BackendPortID,
+			"port":            node.Port,
+			"weight":          node.Weight,
+		})
 		q.Add("nodes", string(b))
 	}
 	raw, err := a.raw.CreateLBVirtualServer(ctx, lbServiceID, q)

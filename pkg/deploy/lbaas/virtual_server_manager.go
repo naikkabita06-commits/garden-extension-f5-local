@@ -92,8 +92,9 @@ func (m *VirtualServerManager) create(ctx context.Context, lbServiceID, vipPortI
 	}
 	for i, backend := range backends {
 		spec.Nodes = append(spec.Nodes, BackendNodeSpec{
-			ComputeID:     backend.IP,
-			ComputeIP:     backend.IP,
+			ResourceID:    backend.IP,
+			ResourceType:  "compute",
+			ResourceIP:    backend.IP,
 			BackendPortID: i + 1,
 			Port:          backend.Port,
 			Weight:        backend.Weight,

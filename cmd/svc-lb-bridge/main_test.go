@@ -160,8 +160,9 @@ func TestReconcile_AllocatesVIPAndProgramsCMPVirtualServer(t *testing.T) {
 	}
 	for _, raw := range nodeParams {
 		var n struct {
-			ComputeIP string `json:"compute_ip"`
-			Port      int32  `json:"port"`
+			ResourceIP   string `json:"resource_ip"`
+			ResourceType string `json:"resource_type"`
+			Port         int32  `json:"port"`
 		}
 		if err := json.Unmarshal([]byte(raw), &n); err != nil {
 			t.Fatalf("unmarshal node param %q: %v", raw, err)
@@ -169,8 +170,11 @@ func TestReconcile_AllocatesVIPAndProgramsCMPVirtualServer(t *testing.T) {
 		if n.Port != 30080 {
 			t.Fatalf("expected node port 30080, got %d", n.Port)
 		}
-		if n.ComputeIP != "172.18.0.10" && n.ComputeIP != "172.18.0.11" {
-			t.Fatalf("unexpected compute_ip %q", n.ComputeIP)
+		if n.ResourceType != "compute" {
+			t.Fatalf("expected resource_type=compute, got %q", n.ResourceType)
+		}
+		if n.ResourceIP != "172.18.0.10" && n.ResourceIP != "172.18.0.11" {
+			t.Fatalf("unexpected resource_ip %q", n.ResourceIP)
 		}
 	}
 
