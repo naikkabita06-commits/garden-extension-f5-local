@@ -2,6 +2,7 @@ package service
 
 import (
 	fmt "fmt"
+	"strings"
 
 	lbannotations "github.com/gardener/gardener-extension-f5/pkg/annotations"
 	"github.com/gardener/gardener-extension-f5/pkg/backend"
@@ -26,6 +27,15 @@ func BuildLoadBalancerStack(svc *corev1.Service, cfg lbannotations.LBConfig, nod
 		Owner:     owner,
 		Ownership: model.OwnershipFor(owner, "", "stack", ""),
 		Config:    cfg,
+		LBService: model.LBService{
+			Name:        LBServiceName(svc),
+			Description: fmt.Sprintf("App LB for %s/%s", svc.Namespace, svc.Name),
+			Ownership:   model.OwnershipFor(owner, "", "lb-service", VIPGroup(svc)),
+		},
+		VIP: model.VIP{
+			Name:      VIPName(svc),
+			Ownership: model.OwnershipFor(owner, "", "vip", VIPGroup(svc)),
+		},
 	}
 
 	for _, p := range svc.Spec.Ports {
@@ -38,7 +48,7 @@ func BuildLoadBalancerStack(svc *corev1.Service, cfg lbannotations.LBConfig, nod
 		}
 		sp := model.ServicePort{Name: p.Name, FrontendPort: p.Port, NodePort: p.NodePort, Protocol: proto}
 		vs := model.VirtualServer{
-			Name:             p.Name,
+			Name:             VirtualServerName(svc, p.Port),
 			FrontendPort:     p.Port,
 			BackendNodePort:  p.NodePort,
 			Protocol:         proto,
@@ -49,7 +59,7 @@ func BuildLoadBalancerStack(svc *corev1.Service, cfg lbannotations.LBConfig, nod
 			Monitor:          &model.Monitor{Type: cfg.HealthType, Path: cfg.HealthPath, Interval: cfg.HealthInterval},
 			Ownership:        model.OwnershipFor(owner, "", "virtual-server", ""),
 		}
-		pool := model.Pool{Name: p.Name, Monitor: vs.Monitor, Ownership: model.OwnershipFor(owner, "", "pool", "")}
+		pool := model.Pool{Name: PoolName(svc, p.Port), Monitor: vs.Monitor, Ownership: model.OwnershipFor(owner, "", "pool", VIPGroup(svc))}
 		for _, n := range nodes {
 			member := model.BackendMember{IP: n.IP, Port: p.NodePort, Weight: n.Weight}
 			sp.Backends = append(sp.Backends, member)
@@ -64,4 +74,57 @@ func BuildLoadBalancerStack(svc *corev1.Service, cfg lbannotations.LBConfig, nod
 		return nil, fmt.Errorf("service has no usable LoadBalancer NodePorts")
 	}
 	return stack, nil
+}
+
+// VIPGroup returns the optional shared frontend group configured on the Service.
+func VIPGroup(svc *corev1.Service) string {
+	if svc == nil || svc.Annotations == nil {
+		return ""
+	}
+	return strings.TrimSpace(svc.Annotations[lbannotations.VIPGroup])
+}
+
+// LBServiceName deterministically identifies the parent LBService. Services in
+// the same VIP group deliberately share this parent, while all child resources
+// remain owner-specific.
+func LBServiceName(svc *corev1.Service) string {
+	if svc == nil {
+		return ""
+	}
+	if group := VIPGroup(svc); group != "" {
+		return safeName(fmt.Sprintf("app-group-%s-%s", svc.Namespace, group))
+	}
+	return safeName(fmt.Sprintf("app-%s-%s", svc.Namespace, svc.Name))
+}
+
+func VIPName(svc *corev1.Service) string {
+	if svc == nil {
+		return ""
+	}
+	return safeName(fmt.Sprintf("app-vip-%s-%s", svc.Namespace, svc.Name))
+}
+
+func VirtualServerName(svc *corev1.Service, frontendPort int32) string {
+	if svc == nil {
+		return ""
+	}
+	return safeName(fmt.Sprintf("app-vs-%s-%s-%d", svc.Namespace, svc.Name, frontendPort))
+}
+
+func PoolName(svc *corev1.Service, frontendPort int32) string {
+	if svc == nil {
+		return ""
+	}
+	return safeName(fmt.Sprintf("app-pool-%s-%s-%d", svc.Namespace, svc.Name, frontendPort))
+}
+
+func safeName(name string) string {
+	name = strings.ToLower(strings.TrimSpace(name))
+	name = strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+			return r
+		}
+		return '-'
+	}, name)
+	return strings.Trim(name, "-")
 }

@@ -32,6 +32,28 @@ func TestBuildLoadBalancerStackBuildsPortsAndBackends(t *testing.T) {
 	if len(port.Backends) != 1 || port.Backends[0].IP != "10.0.0.1" || port.Backends[0].Port != 30080 || port.Backends[0].Weight != 50 {
 		t.Fatalf("unexpected backends: %#v", port.Backends)
 	}
+	if stack.LBService.Name != "app-ns-web" || stack.VIP.Name != "app-vip-ns-web" {
+		t.Fatalf("expected deterministic parent resources, got LB=%#v VIP=%#v", stack.LBService, stack.VIP)
+	}
+	if stack.VirtualServers[0].Name != "app-vs-ns-web-80" || stack.Pools[0].Name != "app-pool-ns-web-80" || stack.VirtualServers[0].DefaultPoolName != stack.Pools[0].Name {
+		t.Fatalf("expected deterministic listener and pool graph, got VS=%#v pool=%#v", stack.VirtualServers[0], stack.Pools[0])
+	}
+}
+
+func TestBuildLoadBalancerStackUsesVIPGroupOnlyForSharedParent(t *testing.T) {
+	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "web", Annotations: map[string]string{lbannotations.VIPGroup: "Blue Team"}}}
+	svc.Spec.Ports = []corev1.ServicePort{{Port: 443, NodePort: 30443}}
+
+	stack, err := BuildLoadBalancerStack(svc, lbannotations.DefaultLBConfig(), nil)
+	if err != nil {
+		t.Fatalf("BuildLoadBalancerStack: %v", err)
+	}
+	if stack.LBService.Name != "app-group-ns-blue-team" || stack.LBService.Ownership.SharedGroup != "Blue Team" {
+		t.Fatalf("expected grouped parent LB, got %#v", stack.LBService)
+	}
+	if stack.VirtualServers[0].Name != "app-vs-ns-web-443" || stack.VirtualServers[0].Ownership.SharedGroup != "" {
+		t.Fatalf("expected owner-specific listener, got %#v", stack.VirtualServers[0])
+	}
 }
 
 func TestBuildLoadBalancerStackHonorsProtocolOverride(t *testing.T) {
