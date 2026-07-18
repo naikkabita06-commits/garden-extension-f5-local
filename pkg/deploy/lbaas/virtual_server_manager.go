@@ -117,6 +117,18 @@ func (m *VirtualServerManager) create(ctx context.Context, lbServiceID, vipPortI
 	return vs.Name, nil
 }
 
+func (m *VirtualServerManager) poolMemberSpecs(ctx context.Context, backends []model.BackendMember) ([]PoolMemberSpec, error) {
+	out := make([]PoolMemberSpec, 0, len(backends))
+	for _, backend := range backends {
+		port, err := m.resolveBackendPort(ctx, backend.IP)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, PoolMemberSpec{ResourceID: port.ResourceID, ResourceType: port.ResourceType, ResourceIP: port.IP, BackendPortID: port.ID, Port: backend.Port, Weight: backend.Weight})
+	}
+	return out, nil
+}
+
 func (m *VirtualServerManager) resolveBackendPort(ctx context.Context, ip string) (NetworkPort, error) {
 	ports, err := m.client.SearchNetworkPortsByIP(ctx, ip)
 	if err != nil {
