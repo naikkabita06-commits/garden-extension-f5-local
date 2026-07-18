@@ -225,6 +225,13 @@ func (d *Deployer) EnsureStack(ctx context.Context, req StackEnsureRequest) (*St
 			}
 			poolIDs[pool.Name] = resource.ID
 			observed.Graph.Pools[vs.Name+"/"+pool.Name] = model.ObservedResource{LogicalID: vs.Name + "/" + pool.Name, ExternalID: resource.ID, Name: resource.Name, Ownership: pool.Ownership}
+			for _, member := range resource.Members {
+				key := vs.Name + "/" + pool.Name + "/" + poolMemberKey(member.ResourceID, member.ResourceIP, member.BackendPortID, member.Port)
+				observed.Graph.Members[key] = model.ObservedResource{
+					LogicalID: key, ExternalID: member.ID,
+					Name: member.ResourceIP + ":" + fmt.Sprintf("%d", member.Port), Ownership: pool.Ownership,
+				}
+			}
 			changed = changed || poolChanged
 			if d.monitors != nil {
 				monitor, monitorChanged, err := d.monitors.Ensure(ctx, lbID, vsID, resource.ID, pool.Monitor)
@@ -242,7 +249,7 @@ func (d *Deployer) EnsureStack(ctx context.Context, req StackEnsureRequest) (*St
 			for _, rule := range req.Stack.RoutingRules {
 				poolID, ok := poolIDs[rule.PoolName]
 				if !ok {
-					continue
+					return nil, fmt.Errorf("routing rule %q references pool %q that is not attached to virtual server %q", rule.Name, rule.PoolName, vs.Name)
 				}
 				desiredRules = append(desiredRules, RoutingRuleSpec{Host: rule.Host, Path: rule.Path, MatchType: rule.MatchType, PoolID: poolID})
 			}
@@ -251,12 +258,78 @@ func (d *Deployer) EnsureStack(ctx context.Context, req StackEnsureRequest) (*St
 				return nil, err
 			}
 			for _, rule := range rules {
-				observed.Graph.RoutingRules[routingRuleKey(rule.Host, rule.Path, rule.MatchType, rule.PoolID)] = model.ObservedResource{LogicalID: routingRuleKey(rule.Host, rule.Path, rule.MatchType, rule.PoolID), ExternalID: rule.ID, Ownership: vs.Ownership}
+				key := vs.Name + "/" + routingRuleKey(rule.Host, rule.Path, rule.MatchType, rule.PoolID)
+				observed.Graph.RoutingRules[key] = model.ObservedResource{LogicalID: key, ExternalID: rule.ID, Ownership: vs.Ownership}
 			}
 			changed = changed || rulesChanged
 		}
 	}
+	if err := d.deleteObsoleteVirtualServers(ctx, lbID, &observed, req.Stack); err != nil {
+		return nil, err
+	}
 	return &StackEnsureResult{Observed: observed, Changed: changed}, nil
+}
+
+// deleteObsoleteVirtualServers removes listeners that were previously recorded
+// for this stack but are absent from the desired stack. Its child resources are
+// deleted first, avoiding orphaned pools and routing rules when a Service port
+// is removed.
+func (d *Deployer) deleteObsoleteVirtualServers(ctx context.Context, lbID string, observed *model.ObservedState, stack *model.LoadBalancerStack) error {
+	desired := map[string]struct{}{}
+	for _, vs := range stack.VirtualServers {
+		desired[vs.Name] = struct{}{}
+	}
+	for name, resource := range observed.Graph.VirtualServers {
+		if _, ok := desired[name]; ok || resource.ExternalID == "" {
+			continue
+		}
+		for key, rule := range observed.Graph.RoutingRules {
+			if strings.HasPrefix(key, name+"/") {
+				if d.routingRules == nil {
+					return fmt.Errorf("routing-rule cleanup requires a RoutingRuleManager")
+				}
+				if err := d.routingRules.Cleanup(ctx, lbID, resource.ExternalID, rule.ExternalID); err != nil {
+					return err
+				}
+				delete(observed.Graph.RoutingRules, key)
+			}
+		}
+		for key, pool := range observed.Graph.Pools {
+			if strings.HasPrefix(key, name+"/") {
+				if d.pools == nil {
+					return fmt.Errorf("pool cleanup requires a PoolManager")
+				}
+				for memberKey, member := range observed.Graph.Members {
+					if strings.HasPrefix(memberKey, key+"/") {
+						if err := d.pools.members.client.DeletePoolMember(ctx, lbID, resource.ExternalID, pool.ExternalID, member.ExternalID); err != nil {
+							return err
+						}
+						delete(observed.Graph.Members, memberKey)
+					}
+				}
+				for monitorKey, monitor := range observed.Graph.Monitors {
+					if monitorKey == key {
+						if d.monitors == nil {
+							return fmt.Errorf("monitor cleanup requires a MonitorManager")
+						}
+						if err := d.monitors.Cleanup(ctx, lbID, resource.ExternalID, pool.ExternalID, monitor.ExternalID); err != nil {
+							return err
+						}
+						delete(observed.Graph.Monitors, monitorKey)
+					}
+				}
+				if err := d.pools.Cleanup(ctx, lbID, resource.ExternalID, pool.ExternalID); err != nil {
+					return err
+				}
+				delete(observed.Graph.Pools, key)
+			}
+		}
+		if err := d.client.DeleteVirtualServer(ctx, lbID, resource.ExternalID); err != nil {
+			return err
+		}
+		delete(observed.Graph.VirtualServers, name)
+	}
+	return nil
 }
 
 func stackBackends(stack *model.LoadBalancerStack, vs model.VirtualServer) []model.BackendMember {

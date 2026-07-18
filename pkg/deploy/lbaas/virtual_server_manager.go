@@ -32,12 +32,31 @@ type VirtualServerEnsureRequest struct {
 func (m *VirtualServerManager) Ensure(ctx context.Context, req VirtualServerEnsureRequest) (string, string, bool, error) {
 	currentID := strings.TrimSpace(req.CurrentID)
 	changed := false
-	if currentID == "" {
-		foundID, err := m.findByName(ctx, req.LBServiceID, req.Desired.Name)
-		if err != nil {
-			return "", "", false, err
+	// Re-list listeners on every reconcile. Recorded IDs may have been deleted
+	// outside the extension; a stale graph must never be trusted as existence.
+	listeners, err := m.client.ListVirtualServers(ctx, req.LBServiceID)
+	if err != nil {
+		return "", "", false, err
+	}
+	if currentID != "" {
+		found := false
+		for _, listener := range listeners {
+			if strings.TrimSpace(listener.ID) == currentID {
+				found = true
+				break
+			}
 		}
-		currentID = foundID
+		if !found {
+			currentID = ""
+		}
+	}
+	if currentID == "" {
+		for _, listener := range listeners {
+			if strings.TrimSpace(listener.Name) == req.Desired.Name && strings.TrimSpace(listener.ID) != "" {
+				currentID = strings.TrimSpace(listener.ID)
+				break
+			}
+		}
 	}
 	if currentID != "" {
 		if req.CurrentHash != "" {

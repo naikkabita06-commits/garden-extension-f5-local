@@ -17,11 +17,19 @@ func TestVIPManagerVerifiesCurrentIDAndBackfillsAddress(t *testing.T) {
 	}
 }
 
-func TestVIPManagerRejectsMissingCurrentID(t *testing.T) {
+func TestVIPManagerRejectsReplacementWhenStaleIdentityIsAmbiguous(t *testing.T) {
 	stub := &stubClient{vips: []VIP{{ID: "vip-other", Address: "10.0.0.8"}}}
 	_, _, _, err := NewVIPManager(stub).Ensure(context.Background(), "lb-1", "vip-1", "10.0.0.7")
-	if err == nil || !strings.Contains(err.Error(), "was not found") {
-		t.Fatalf("expected missing current VIP error, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "cannot adopt VIP") {
+		t.Fatalf("expected ambiguous stale VIP error, got %v", err)
+	}
+}
+
+func TestVIPManagerRecreatesDeletedVIPWhenNoOtherVIPExists(t *testing.T) {
+	stub := &stubClient{}
+	id, address, changed, err := NewVIPManager(stub).Ensure(context.Background(), "lb-1", "vip-old", "10.0.0.7")
+	if err != nil || id != "7" || address != "10.0.0.7" || !changed || stub.createdVIP != 1 {
+		t.Fatalf("expected deleted VIP recreation, id=%q address=%q changed=%t created=%d err=%v", id, address, changed, stub.createdVIP, err)
 	}
 }
 

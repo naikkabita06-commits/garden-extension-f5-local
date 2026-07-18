@@ -17,11 +17,11 @@ func TestLBServiceManagerVerifiesCurrentID(t *testing.T) {
 	}
 }
 
-func TestLBServiceManagerRejectsMissingCurrentID(t *testing.T) {
+func TestLBServiceManagerRediscoversMissingCurrentIDByDesiredName(t *testing.T) {
 	stub := &stubClient{lbServices: []LBService{{ID: "lb-other", Name: "app"}}}
-	_, _, err := NewLBServiceManager(stub, "").Ensure(context.Background(), EnsureRequest{LBName: "app"}, "lb-1")
-	if err == nil || !strings.Contains(err.Error(), "was not found") {
-		t.Fatalf("expected missing current LB error, got %v", err)
+	id, changed, err := NewLBServiceManager(stub, "").Ensure(context.Background(), EnsureRequest{LBName: "app"}, "lb-1")
+	if err != nil || id != "lb-other" || changed {
+		t.Fatalf("expected desired LB rediscovery, id=%q changed=%t err=%v", id, changed, err)
 	}
 }
 

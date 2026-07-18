@@ -102,7 +102,7 @@ func TestEnsureCreatesLBVIPAndVirtualServer(t *testing.T) {
 func TestEnsureSkipsVirtualServerWhenBackendHashMatches(t *testing.T) {
 	backends := []model.BackendMember{{IP: "10.0.0.1", Port: 30080, Weight: 50}}
 	hash := DesiredBackendHash(80, 30080, backends)
-	stub := &stubClient{lbServices: []LBService{{ID: "lb-1", Name: "lb"}}, vips: []VIP{{ID: "7", Address: "10.0.0.7"}}}
+	stub := &stubClient{lbServices: []LBService{{ID: "lb-1", Name: "lb"}}, vips: []VIP{{ID: "7", Address: "10.0.0.7"}}, vsList: []VirtualServer{{ID: "vs-1", Name: "vs"}}}
 	res, err := New(stub, "").Ensure(context.Background(), EnsureRequest{
 		VirtualServer: model.VirtualServer{Name: "vs", FrontendPort: 80, BackendNodePort: 30080, Protocol: "HTTP"},
 		Backends:      backends,
@@ -118,7 +118,7 @@ func TestEnsureSkipsVirtualServerWhenBackendHashMatches(t *testing.T) {
 }
 
 func TestEnsurePreservesExistingVirtualServerWhenHashIsNotManaged(t *testing.T) {
-	stub := &stubClient{lbServices: []LBService{{ID: "lb-1", Name: "lb"}}, vips: []VIP{{ID: "7", Address: "10.0.0.7"}}}
+	stub := &stubClient{lbServices: []LBService{{ID: "lb-1", Name: "lb"}}, vips: []VIP{{ID: "7", Address: "10.0.0.7"}}, vsList: []VirtualServer{{ID: "vs-1", Name: "vs"}}}
 	res, err := New(stub, "").Ensure(context.Background(), EnsureRequest{
 		VirtualServer: model.VirtualServer{Name: "vs", FrontendPort: 80, BackendNodePort: 30080, Protocol: "HTTP"},
 		Backends:      []model.BackendMember{{IP: "10.0.0.1", Port: 30080, Weight: 50}},
@@ -143,8 +143,8 @@ func TestEnsureRecreatesExistingVirtualServerWhenHashIsManagedButMissing(t *test
 	if err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
-	if stub.deletedVS != 1 || stub.createdVS != 1 || !res.Changed || res.Observed.VirtualServerID != "vs-1" {
-		t.Fatalf("expected VS recreation, created=%d deleted=%d changed=%t observed=%#v", stub.createdVS, stub.deletedVS, res.Changed, res.Observed)
+	if stub.deletedVS != 0 || stub.createdVS != 1 || !res.Changed || res.Observed.VirtualServerID != "vs-1" {
+		t.Fatalf("expected deleted VS drift to be recreated, created=%d deleted=%d changed=%t observed=%#v", stub.createdVS, stub.deletedVS, res.Changed, res.Observed)
 	}
 }
 
@@ -213,6 +213,47 @@ func TestCleanupPreservesSharedParentResources(t *testing.T) {
 	}
 }
 
+func TestCleanupStackDeletesOnlyRecordedGraphResources(t *testing.T) {
+	stub := &stubClient{}
+	state := model.ObservedState{Graph: model.NewObservedGraph()}
+	state.Graph.LBServices["lb"] = model.ObservedResource{LogicalID: "lb", ExternalID: "lb-1"}
+	state.Graph.VIPs["vip"] = model.ObservedResource{LogicalID: "vip", ExternalID: "vip-1"}
+	state.Graph.VirtualServers["listener"] = model.ObservedResource{LogicalID: "listener", ExternalID: "vs-1"}
+
+	result, err := New(stub, "").CleanupStack(context.Background(), CleanupRequest{Current: state, DeleteVIP: true, DeleteLBService: true})
+	if err != nil {
+		t.Fatalf("CleanupStack: %v", err)
+	}
+	if stub.deletedVS != 1 || stub.deletedVIP != 1 || stub.deletedLB != 1 {
+		t.Fatalf("expected graph resources only to be deleted, got vs=%d vip=%d lb=%d", stub.deletedVS, stub.deletedVIP, stub.deletedLB)
+	}
+	if !result.DeletedVirtualServer || !result.DeletedVIP || !result.DeletedLBService {
+		t.Fatalf("unexpected cleanup result: %#v", result)
+	}
+}
+
+func TestDeleteObsoleteVirtualServersRemovesOnlyUndesiredListener(t *testing.T) {
+	stub := &stubClient{}
+	deployer := New(stub, "")
+	observed := model.ObservedState{Graph: model.NewObservedGraph()}
+	observed.Graph.VirtualServers["keep"] = model.ObservedResource{LogicalID: "keep", ExternalID: "vs-keep"}
+	observed.Graph.VirtualServers["remove"] = model.ObservedResource{LogicalID: "remove", ExternalID: "vs-remove"}
+
+	err := deployer.deleteObsoleteVirtualServers(context.Background(), "lb-1", &observed, &model.LoadBalancerStack{VirtualServers: []model.VirtualServer{{Name: "keep"}}})
+	if err != nil {
+		t.Fatalf("deleteObsoleteVirtualServers: %v", err)
+	}
+	if stub.deletedVS != 1 {
+		t.Fatalf("expected one obsolete listener deletion, got %d", stub.deletedVS)
+	}
+	if _, ok := observed.Graph.VirtualServers["remove"]; ok {
+		t.Fatalf("expected obsolete listener to be removed from graph: %#v", observed.Graph.VirtualServers)
+	}
+	if _, ok := observed.Graph.VirtualServers["keep"]; !ok {
+		t.Fatalf("expected desired listener to remain in graph: %#v", observed.Graph.VirtualServers)
+	}
+}
+
 func lbSpecValue(spec LBServiceSpec, key string) string {
 	switch key {
 	case "flavor_id":
@@ -228,24 +269,6 @@ func lbSpecValue(spec LBServiceSpec, key string) string {
 		return spec.VPCName
 	default:
 		return ""
-	}
-}
-
-func TestCleanupDiscoveredDeletesVirtualServersByPrefixAndAllVIPs(t *testing.T) {
-	stub := &stubClient{
-		vsList: []VirtualServer{{ID: "vs-match", Name: "app-vs-ns-svc-80"}, {ID: "vs-other", Name: "other"}},
-		vips:   []VIP{{ID: "vip-1", Address: "10.0.0.10"}, {ID: "vip-2", Address: "10.0.0.11"}},
-	}
-	res, err := New(stub, "").CleanupDiscovered(context.Background(), CleanupDiscoveryRequest{
-		LBServiceID:             "lb-1",
-		VirtualServerNamePrefix: "app-vs-ns-svc-",
-		DeleteAllVIPs:           true,
-	})
-	if err != nil {
-		t.Fatalf("CleanupDiscovered: %v", err)
-	}
-	if stub.deletedVS != 1 || stub.deletedVIP != 2 || !res.DeletedVirtualServer || !res.DeletedVIP {
-		t.Fatalf("unexpected cleanup: vs=%d vip=%d result=%#v", stub.deletedVS, stub.deletedVIP, res)
 	}
 }
 
