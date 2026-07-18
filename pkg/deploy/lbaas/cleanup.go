@@ -3,7 +3,7 @@ package lbaas
 import (
 	"context"
 	"fmt"
-	"strings"
+	"sort"
 
 	f5client "github.com/gardener/gardener-extension-f5/pkg/f5"
 	"github.com/gardener/gardener-extension-f5/pkg/model"
@@ -19,6 +19,122 @@ type CleanupResult struct {
 	DeletedVirtualServer bool
 	DeletedVIP           bool
 	DeletedLBService     bool
+}
+
+// CleanupStack deletes exactly the provider resources recorded in an observed
+// graph. It intentionally never discovers resources by a display-name prefix
+// and never enumerates all VIPs: both approaches can delete another owner's
+// resources on a shared LBService.
+//
+// Child resources are deleted before their parents in provider dependency
+// order: routing rules, members, monitors, pools, virtual servers, VIP, then
+// the LBService. Parent deletion is opt-in so the caller can retain shared
+// parents after it has validated references in its Kubernetes scope.
+func (d *Deployer) CleanupStack(ctx context.Context, req CleanupRequest) (*CleanupResult, error) {
+	current := req.Current
+	current.EnsureGraph()
+	result := &CleanupResult{}
+	lbID := current.LBServiceID
+	if lbID == "" {
+		for _, resource := range current.Graph.LBServices {
+			lbID = resource.ExternalID
+			break
+		}
+	}
+	if lbID == "" {
+		return result, nil
+	}
+
+	for _, rule := range sortedResources(current.Graph.RoutingRules) {
+		if d.routingRules == nil {
+			return result, fmt.Errorf("routing-rule cleanup requires a RoutingRuleManager")
+		}
+		vsID := virtualServerIDForGraphKey(current.Graph, rule.LogicalID)
+		if err := d.routingRules.Cleanup(ctx, lbID, vsID, rule.ExternalID); err != nil && !f5client.IsNotFound(err) {
+			return result, fmt.Errorf("deleting routing rule %s: %w", rule.ExternalID, err)
+		}
+	}
+	for _, member := range sortedResources(current.Graph.Members) {
+		if d.pools == nil {
+			return result, fmt.Errorf("member cleanup requires a PoolManager")
+		}
+		vsID, poolID := poolParentIDsForGraphKey(current.Graph, member.LogicalID)
+		if err := d.pools.members.client.DeletePoolMember(ctx, lbID, vsID, poolID, member.ExternalID); err != nil && !f5client.IsNotFound(err) {
+			return result, fmt.Errorf("deleting pool member %s: %w", member.ExternalID, err)
+		}
+	}
+	for _, monitor := range sortedResources(current.Graph.Monitors) {
+		if d.monitors == nil {
+			return result, fmt.Errorf("monitor cleanup requires a MonitorManager")
+		}
+		vsID, poolID := poolParentIDsForGraphKey(current.Graph, monitor.LogicalID)
+		if err := d.monitors.Cleanup(ctx, lbID, vsID, poolID, monitor.ExternalID); err != nil && !f5client.IsNotFound(err) {
+			return result, fmt.Errorf("deleting monitor %s: %w", monitor.ExternalID, err)
+		}
+	}
+	for _, pool := range sortedResources(current.Graph.Pools) {
+		if d.pools == nil {
+			return result, fmt.Errorf("pool cleanup requires a PoolManager")
+		}
+		vsID := virtualServerIDForGraphKey(current.Graph, pool.LogicalID)
+		if err := d.pools.Cleanup(ctx, lbID, vsID, pool.ExternalID); err != nil && !f5client.IsNotFound(err) {
+			return result, fmt.Errorf("deleting pool %s: %w", pool.ExternalID, err)
+		}
+	}
+	for _, vs := range sortedResources(current.Graph.VirtualServers) {
+		if err := d.client.DeleteVirtualServer(ctx, lbID, vs.ExternalID); err != nil && !f5client.IsNotFound(err) {
+			return result, fmt.Errorf("deleting virtual server %s: %w", vs.ExternalID, err)
+		}
+		result.DeletedVirtualServer = true
+	}
+	if req.DeleteVIP {
+		for _, vip := range sortedResources(current.Graph.VIPs) {
+			if err := d.client.DeleteVIP(ctx, lbID, vip.ExternalID); err != nil && !f5client.IsNotFound(err) {
+				return result, fmt.Errorf("deleting VIP %s: %w", vip.ExternalID, err)
+			}
+			result.DeletedVIP = true
+		}
+	}
+	if req.DeleteLBService {
+		if err := d.client.DeleteLBService(ctx, lbID); err != nil && !f5client.IsNotFound(err) {
+			return result, fmt.Errorf("deleting LB service %s: %w", lbID, err)
+		}
+		result.DeletedLBService = true
+	}
+	return result, nil
+}
+
+func sortedResources(resources map[string]model.ObservedResource) []model.ObservedResource {
+	keys := make([]string, 0, len(resources))
+	for key := range resources {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	result := make([]model.ObservedResource, 0, len(keys))
+	for _, key := range keys {
+		if resources[key].ExternalID != "" {
+			result = append(result, resources[key])
+		}
+	}
+	return result
+}
+
+func virtualServerIDForGraphKey(graph model.ObservedGraph, key string) string {
+	for name, vs := range graph.VirtualServers {
+		if key == name || len(key) > len(name) && key[:len(name)] == name && key[len(name)] == '/' {
+			return vs.ExternalID
+		}
+	}
+	return ""
+}
+
+func poolParentIDsForGraphKey(graph model.ObservedGraph, key string) (string, string) {
+	for poolKey, pool := range graph.Pools {
+		if key == poolKey || len(key) > len(poolKey) && key[:len(poolKey)] == poolKey && key[len(poolKey)] == '/' {
+			return virtualServerIDForGraphKey(graph, poolKey), pool.ExternalID
+		}
+	}
+	return "", ""
 }
 
 func (d *Deployer) Cleanup(ctx context.Context, req CleanupRequest) (*CleanupResult, error) {
@@ -48,57 +164,6 @@ func (d *Deployer) Cleanup(ctx context.Context, req CleanupRequest) (*CleanupRes
 	return result, nil
 }
 
-type CleanupDiscoveryRequest struct {
-	LBServiceID             string
-	VirtualServerNamePrefix string
-	DeleteAllVIPs           bool
-	DeleteLBService         bool
-}
-
 func (d *Deployer) FindLBServiceIDByName(ctx context.Context, name string) (string, error) {
 	return d.lbServices.findByName(ctx, name)
-}
-
-func (d *Deployer) CleanupDiscovered(ctx context.Context, req CleanupDiscoveryRequest) (*CleanupResult, error) {
-	result := &CleanupResult{}
-	lbID := strings.TrimSpace(req.LBServiceID)
-	if lbID == "" {
-		return result, nil
-	}
-	if strings.TrimSpace(req.VirtualServerNamePrefix) != "" {
-		items, err := d.client.ListVirtualServers(ctx, lbID)
-		if err != nil {
-			return result, err
-		}
-		for _, vs := range items {
-			if strings.HasPrefix(strings.TrimSpace(vs.Name), req.VirtualServerNamePrefix) && strings.TrimSpace(vs.ID) != "" {
-				if err := d.client.DeleteVirtualServer(ctx, lbID, strings.TrimSpace(vs.ID)); err != nil && !f5client.IsNotFound(err) {
-					return result, fmt.Errorf("deleting virtual server %s on LB %s: %w", strings.TrimSpace(vs.ID), lbID, err)
-				}
-				result.DeletedVirtualServer = true
-			}
-		}
-	}
-	if req.DeleteAllVIPs {
-		items, err := d.client.ListVIPs(ctx, lbID)
-		if err != nil {
-			return result, err
-		}
-		for _, vip := range items {
-			if strings.TrimSpace(vip.ID) == "" {
-				continue
-			}
-			if err := d.client.DeleteVIP(ctx, lbID, strings.TrimSpace(vip.ID)); err != nil && !f5client.IsNotFound(err) {
-				return result, fmt.Errorf("deleting VIP %s on LB %s: %w", strings.TrimSpace(vip.ID), lbID, err)
-			}
-			result.DeletedVIP = true
-		}
-	}
-	if req.DeleteLBService {
-		if err := d.client.DeleteLBService(ctx, lbID); err != nil && !f5client.IsNotFound(err) {
-			return result, fmt.Errorf("deleting LB service %s: %w", lbID, err)
-		}
-		result.DeletedLBService = true
-	}
-	return result, nil
 }
