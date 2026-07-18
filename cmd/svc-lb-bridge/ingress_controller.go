@@ -112,6 +112,12 @@ func (r *ingressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		f5metrics.ManagedServicesTotal.WithLabelValues("ingress-lb").Inc()
 	}
 
+	if err := lbingress.ValidateSupported(ing); err != nil {
+		log.Info("skipping unsupported Ingress", "reason", err)
+		r.Recorder.Eventf(ing, corev1.EventTypeWarning, "UnsupportedIngress", "Unsupported F5 Ingress configuration: %v", err)
+		return ctrl.Result{}, nil
+	}
+
 	// Determine protocol: HTTPS if TLS is configured, HTTP otherwise.
 	protocol := lbingress.ProtocolForIngress(ing)
 
