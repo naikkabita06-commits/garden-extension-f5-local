@@ -6,22 +6,25 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"net/url"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gardener/gardener/pkg/logger"
 
+	lbannotations "github.com/gardener/gardener-extension-f5/pkg/annotations"
+	lbbackend "github.com/gardener/gardener-extension-f5/pkg/backend"
+	lbaasdeploy "github.com/gardener/gardener-extension-f5/pkg/deploy/lbaas"
 	f5client "github.com/gardener/gardener-extension-f5/pkg/f5"
+	lbfinalizers "github.com/gardener/gardener-extension-f5/pkg/finalizers"
 	f5metrics "github.com/gardener/gardener-extension-f5/pkg/metrics"
+	"github.com/gardener/gardener-extension-f5/pkg/model"
+	lbservice "github.com/gardener/gardener-extension-f5/pkg/service"
+	lbstatus "github.com/gardener/gardener-extension-f5/pkg/status"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/record"
@@ -47,99 +50,19 @@ const (
 	annVIPAddress      = "f5.extensions.gardener.cloud/vip-address"
 
 	// User-facing input annotations for per-Service LB configuration.
-	annProtocol         = "f5.extensions.gardener.cloud/protocol"                    // TCP, UDP, HTTP, HTTPS
-	annRoutingAlgorithm = "f5.extensions.gardener.cloud/routing-algorithm"           // round_robin, least_connections, etc.
-	annHealthInterval   = "f5.extensions.gardener.cloud/health-check-interval"       // seconds (integer)
-	annHealthType       = "f5.extensions.gardener.cloud/health-check-type"           // tcp (default), http
-	annHealthPath       = "f5.extensions.gardener.cloud/health-check-path"           // HTTP health check path (e.g. /healthz)
-	annSourceRanges     = "f5.extensions.gardener.cloud/source-ranges"               // comma-separated CIDRs (fallback for spec.loadBalancerSourceRanges)
-	annDrainingTimeout  = "f5.extensions.gardener.cloud/connection-draining-timeout" // seconds (integer); 0 = disabled
+	annProtocol         = lbannotations.Protocol
+	annRoutingAlgorithm = lbannotations.RoutingAlgorithm
+	annHealthInterval   = lbannotations.HealthInterval
+	annHealthType       = lbannotations.HealthType
+	annHealthPath       = lbannotations.HealthPath
+	annSourceRanges     = lbannotations.SourceRanges
+	annDrainingTimeout  = lbannotations.DrainingTimeout
 )
 
-// lbServiceConfig holds per-Service LB configuration parsed from annotations.
-type lbServiceConfig struct {
-	RoutingAlgorithm string   // CMP routing algorithm (default: round_robin)
-	HealthInterval   int32    // health check interval in seconds (default: 30)
-	HealthType       string   // health check monitor type: tcp (default), http
-	HealthPath       string   // HTTP health check path (e.g. /healthz); only used when HealthType=http
-	ProtocolOverride string   // if set, overrides auto-detected protocol
-	SourceRanges     []string // allowed source CIDRs (from spec.loadBalancerSourceRanges or annotation)
-	PersistenceType  string   // session persistence type (source_addr for ClientIP affinity)
-	DrainingTimeout  int32    // connection draining timeout in seconds; 0 = not set
-}
-
-func defaultLBServiceConfig() lbServiceConfig {
-	return lbServiceConfig{
-		RoutingAlgorithm: "round_robin",
-		HealthInterval:   30,
-		HealthType:       "tcp",
-	}
-}
+type lbServiceConfig = lbannotations.LBConfig
 
 func parseLBServiceConfig(svc *corev1.Service) lbServiceConfig {
-	cfg := defaultLBServiceConfig()
-	if svc == nil {
-		return cfg
-	}
-
-	// Session affinity: read from spec.sessionAffinity (Kubernetes-native).
-	if svc.Spec.SessionAffinity == corev1.ServiceAffinityClientIP {
-		cfg.PersistenceType = "source_addr"
-	}
-
-	if svc.Annotations == nil {
-		return cfg
-	}
-	if v := strings.TrimSpace(svc.Annotations[annProtocol]); v != "" {
-		upper := strings.ToUpper(v)
-		switch upper {
-		case "TCP", "UDP", "HTTP", "HTTPS":
-			cfg.ProtocolOverride = upper
-		}
-	}
-	if v := strings.TrimSpace(svc.Annotations[annRoutingAlgorithm]); v != "" {
-		cfg.RoutingAlgorithm = v
-	}
-	if v := strings.TrimSpace(svc.Annotations[annHealthInterval]); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			cfg.HealthInterval = int32(n)
-		}
-	}
-
-	// Health check type and path.
-	if v := strings.TrimSpace(svc.Annotations[annHealthType]); v != "" {
-		lower := strings.ToLower(v)
-		switch lower {
-		case "tcp", "http":
-			cfg.HealthType = lower
-		}
-	}
-	if v := strings.TrimSpace(svc.Annotations[annHealthPath]); v != "" {
-		cfg.HealthPath = v
-		if cfg.HealthType == "tcp" {
-			cfg.HealthType = "http" // auto-switch to http when path is set
-		}
-	}
-
-	// Connection draining timeout.
-	if v := strings.TrimSpace(svc.Annotations[annDrainingTimeout]); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
-			cfg.DrainingTimeout = int32(n)
-		}
-	}
-
-	// Source IP filtering: prefer spec.loadBalancerSourceRanges, fall back to annotation.
-	if len(svc.Spec.LoadBalancerSourceRanges) > 0 {
-		cfg.SourceRanges = svc.Spec.LoadBalancerSourceRanges
-	} else if v := strings.TrimSpace(svc.Annotations[annSourceRanges]); v != "" {
-		for _, cidr := range strings.Split(v, ",") {
-			if c := strings.TrimSpace(cidr); c != "" {
-				cfg.SourceRanges = append(cfg.SourceRanges, c)
-			}
-		}
-	}
-
-	return cfg
+	return lbannotations.ParseService(svc)
 }
 
 func main() {
@@ -222,18 +145,7 @@ type serviceReconciler struct {
 	vpcName   string
 }
 
-// cmpLBaaS abstracts the CMP LBaaS operations for testing.
-type cmpLBaaS interface {
-	ListLBServices(ctx context.Context, opts *f5client.ListLoadBalancersOptions) ([]json.RawMessage, error)
-	CreateLBService(ctx context.Context, form url.Values) (json.RawMessage, error)
-	DeleteLBService(ctx context.Context, id string) error
-	CreateLBServiceVIP(ctx context.Context, lbServiceID string) (json.RawMessage, error)
-	GetLBServiceVIPs(ctx context.Context, lbServiceID string) ([]json.RawMessage, error)
-	DeleteLBServiceVIP(ctx context.Context, lbServiceID, vipID string) error
-	ListLBVirtualServers(ctx context.Context, lbServiceID string) ([]json.RawMessage, error)
-	CreateLBVirtualServer(ctx context.Context, lbServiceID string, query url.Values) (json.RawMessage, error)
-	DeleteLBVirtualServer(ctx context.Context, lbServiceID, vsID string) error
-}
+type cmpLBaaS = lbaasdeploy.RawClient
 
 type config struct {
 	CMPEndpoint       string
@@ -338,9 +250,7 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			}
 			r.Recorder.Event(svc, corev1.EventTypeNormal, "DeletedLoadBalancer", "CMP LBaaS resources deleted successfully")
 
-			base := svc.DeepCopy()
-			controllerutil.RemoveFinalizer(svc, finalizerName)
-			if err := r.Patch(ctx, svc, client.MergeFrom(base)); err != nil {
+			if _, err := lbfinalizers.Remove(ctx, r.Client, svc, finalizerName); err != nil {
 				return ctrl.Result{}, err
 			}
 			f5metrics.ManagedServicesTotal.WithLabelValues("seed-service-lb").Dec()
@@ -357,19 +267,9 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 	}
 
-	// Parse per-Service LB configuration from annotations (with defaults).
+	// Build a typed desired-state snapshot before mutating CMP resources.
 	lbCfg := parseLBServiceConfig(svc)
-
-	ports, ok := choosePorts(svc, lbCfg.ProtocolOverride)
-	if !ok {
-		log.Info("skipping: no Service port/nodePort")
-		return ctrl.Result{}, nil
-	}
-	// Use first port for LB Service naming and VIP; create a VS per port.
-	frontendPort := ports[0].FrontendPort
-	nodePort := ports[0].NodePort
-
-	nodeIPs, err := listNodeInternalIPs(ctx, r.Client)
+	nodeIPs, err := lbbackend.ListNodeInternalIPs(ctx, r.Client)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -377,21 +277,31 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		log.Info("skipping: no nodes found")
 		return ctrl.Result{}, nil
 	}
+	nodes := make([]lbbackend.Node, 0, len(nodeIPs))
+	for _, ip := range nodeIPs {
+		nodes = append(nodes, lbbackend.Node{IP: ip, Weight: 50})
+	}
+	stack, err := lbservice.BuildLoadBalancerStack(svc, lbCfg, nodes)
+	if err != nil {
+		log.Info("skipping: cannot build desired load-balancer stack", "reason", err.Error())
+		return ctrl.Result{}, nil
+	}
+	// Use first port for the current seed LB flow.
+	frontendPort := stack.Ports[0].FrontendPort
+	nodePort := stack.Ports[0].NodePort
 
 	// Ensure finalizer so we can cleanup CMP resources.
 	if !controllerutil.ContainsFinalizer(svc, finalizerName) {
-		base := svc.DeepCopy()
-		controllerutil.AddFinalizer(svc, finalizerName)
-		if err := r.Patch(ctx, svc, client.MergeFrom(base)); err != nil {
+		if _, err := lbfinalizers.Ensure(ctx, r.Client, svc, finalizerName); err != nil {
 			return ctrl.Result{}, err
 		}
 		f5metrics.ManagedServicesTotal.WithLabelValues("seed-service-lb").Inc()
 	}
 
 	// Provision via CMP LBaaS: LBService → VIP → VirtualServer
-	protocol := ports[0].Protocol
+	protocol := stack.Ports[0].Protocol
 	cmpStart := time.Now()
-	ids, err := r.ensureCMPResources(ctx, svc, frontendPort, nodePort, nodeIPs, protocol, lbCfg)
+	ids, vip, err := r.ensureCMPResources(ctx, svc, frontendPort, nodePort, nodeIPs, protocol, stack.Config)
 	f5metrics.CMPAPICallDuration.WithLabelValues("seed-service-lb-controller", "EnsureLB").Observe(time.Since(cmpStart).Seconds())
 	if err != nil {
 		f5metrics.CMPAPICallsTotal.WithLabelValues("seed-service-lb-controller", "EnsureLB", "error").Inc()
@@ -414,12 +324,14 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	svc.Annotations[annLBServiceID] = ids.LBServiceID
 	svc.Annotations[annVIPPortID] = ids.VIPPortID
 	svc.Annotations[annVirtualServerID] = ids.VirtualServerID
+	if vip != "" {
+		svc.Annotations[annVIPAddress] = vip
+	}
 	if err := r.Patch(ctx, svc, client.MergeFrom(base)); err != nil {
 		return ctrl.Result{}, err
 	}
 
 	// Set VIP in the Service status from the VIP annotation (if available).
-	vip := svc.Annotations[annVIPAddress]
 	if vip == "" {
 		vip = "pending"
 	}
@@ -427,7 +339,7 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	r.Recorder.Eventf(svc, corev1.EventTypeNormal, "EnsuredLoadBalancer", "CMP LBaaS resources provisioned (LB=%s, VS=%s, VIP=%s, backends=%d)", ids.LBServiceID, ids.VirtualServerID, vip, len(nodeIPs))
 
 	if vip != "" && vip != "pending" {
-		if err := ensureServiceStatusVIP(ctx, r.Client, svc, vip); err != nil {
+		if err := lbstatus.EnsureServiceVIP(ctx, r.Client, svc, vip); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -435,251 +347,70 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	return ctrl.Result{}, nil
 }
 
-func (r *serviceReconciler) ensureCMPResources(ctx context.Context, svc *corev1.Service, frontendPort, nodePort int32, nodeIPs []string, protocol string, cfg lbServiceConfig) (*f5client.CMPResourceIDs, error) {
-	ids := &f5client.CMPResourceIDs{}
-
-	// Step 1: Create or reuse LB Service.
-	existingLBID := svc.Annotations[annLBServiceID]
-	if existingLBID != "" {
-		ids.LBServiceID = existingLBID
-	} else {
-		lbName := sanitizeKey(fmt.Sprintf("seed-%s-%s", svc.Namespace, svc.Name))
-		form := url.Values{}
-		form.Set("name", lbName)
-		form.Set("description", fmt.Sprintf("Seed LB for %s/%s", svc.Namespace, svc.Name))
-		if r.flavorID != 0 {
-			form.Set("flavor_id", fmt.Sprintf("%d", r.flavorID))
-		}
-		if r.networkID != "" {
-			form.Set("network_id", r.networkID)
-		}
-		if r.vpcID != "" {
-			form.Set("vpc_id", r.vpcID)
-		}
-		if r.vpcName != "" {
-			form.Set("vpc_name", r.vpcName)
-		}
-
-		raw, err := r.cmp.CreateLBService(ctx, form)
-		if err != nil {
-			return nil, fmt.Errorf("creating LB service via CMP: %w", err)
-		}
-		var created struct {
-			ID string `json:"id"`
-		}
-		if err := json.Unmarshal(raw, &created); err != nil || created.ID == "" {
-			return nil, fmt.Errorf("parsing LB Service create response: %s", string(raw))
-		}
-		ids.LBServiceID = created.ID
+func (r *serviceReconciler) ensureCMPResources(ctx context.Context, svc *corev1.Service, frontendPort, nodePort int32, nodeIPs []string, protocol string, cfg lbServiceConfig) (*f5client.CMPResourceIDs, string, error) {
+	current := model.ObservedState{}
+	if svc != nil && svc.Annotations != nil {
+		current.LBServiceID = strings.TrimSpace(svc.Annotations[annLBServiceID])
+		current.VIPPortID = strings.TrimSpace(svc.Annotations[annVIPPortID])
+		current.VirtualServerID = strings.TrimSpace(svc.Annotations[annVirtualServerID])
+		current.VIPAddress = strings.TrimSpace(svc.Annotations[annVIPAddress])
 	}
 
-	// Step 2: Create or reuse VIP.
-	existingVIPID := svc.Annotations[annVIPPortID]
-	if existingVIPID != "" {
-		ids.VIPPortID = existingVIPID
-	} else {
-		raw, err := r.cmp.CreateLBServiceVIP(ctx, ids.LBServiceID)
-		if err != nil {
-			return ids, fmt.Errorf("creating VIP via CMP on LB %s: %w", ids.LBServiceID, err)
-		}
-		var created struct {
-			ID int `json:"id"`
-		}
-		if err := json.Unmarshal(raw, &created); err == nil && created.ID != 0 {
-			ids.VIPPortID = fmt.Sprintf("%d", created.ID)
-		} else {
-			var createdStr struct {
-				ID string `json:"id"`
-			}
-			if json.Unmarshal(raw, &createdStr) == nil && createdStr.ID != "" {
-				ids.VIPPortID = createdStr.ID
-			} else {
-				return ids, fmt.Errorf("parsing VIP create response: %s", string(raw))
-			}
-		}
+	members := make([]model.BackendMember, 0, len(nodeIPs))
+	for _, ip := range nodeIPs {
+		members = append(members, model.BackendMember{IP: ip, Port: nodePort, Weight: 50})
 	}
 
-	// Step 3: Create or reuse Virtual Server.
-	existingVSID := svc.Annotations[annVirtualServerID]
-	if existingVSID != "" {
-		ids.VirtualServerID = existingVSID
-	} else {
-		nodes := make([]map[string]interface{}, 0, len(nodeIPs))
-		for i, ip := range nodeIPs {
-			nodes = append(nodes, map[string]interface{}{
-				"compute_id":      fmt.Sprintf("node-%d", i),
-				"compute_ip":      ip,
-				"backend_port_id": i + 1,
-				"port":            nodePort,
-				"weight":          50,
-			})
-		}
-
-		query := url.Values{}
-		query.Set("name", sanitizeKey(fmt.Sprintf("seed-vs-%s-%s-%d", svc.Namespace, svc.Name, frontendPort)))
-		query.Set("vip_port_id", ids.VIPPortID)
-		query.Set("protocol", protocol)
-		query.Set("port", fmt.Sprintf("%d", frontendPort))
-		query.Set("routing_algorithm", cfg.RoutingAlgorithm)
-		query.Set("interval", fmt.Sprintf("%d", cfg.HealthInterval))
-		if cfg.HealthType != "" && cfg.HealthType != "tcp" {
-			query.Set("monitor_type", cfg.HealthType)
-		}
-		if cfg.HealthPath != "" {
-			query.Set("monitor_path", cfg.HealthPath)
-		}
-		if cfg.PersistenceType != "" {
-			query.Set("persistence_type", cfg.PersistenceType)
-		}
-		if cfg.DrainingTimeout > 0 {
-			query.Set("connection_draining_timeout", fmt.Sprintf("%d", cfg.DrainingTimeout))
-		}
-		if r.vpcID != "" {
-			query.Set("vpc_id", r.vpcID)
-		}
-		if len(cfg.SourceRanges) > 0 {
-			query.Set("allowed_cidrs", strings.Join(cfg.SourceRanges, ","))
-		}
-		for _, n := range nodes {
-			nodeJSON, _ := json.Marshal(n)
-			query.Add("nodes", string(nodeJSON))
-		}
-
-		raw, err := r.cmp.CreateLBVirtualServer(ctx, ids.LBServiceID, query)
-		if err != nil {
-			return ids, fmt.Errorf("creating virtual server via CMP: %w", err)
-		}
-		var created struct {
-			ID   string `json:"id"`
-			Name string `json:"name"`
-		}
-		if err := json.Unmarshal(raw, &created); err == nil && (created.ID != "" || created.Name != "") {
-			if created.ID != "" {
-				ids.VirtualServerID = created.ID
-			} else {
-				ids.VirtualServerID = created.Name
-			}
-		}
+	vs := model.VirtualServer{
+		Name:             sanitizeKey(fmt.Sprintf("seed-vs-%s-%s-%d", svc.Namespace, svc.Name, frontendPort)),
+		FrontendPort:     frontendPort,
+		BackendNodePort:  nodePort,
+		Protocol:         protocol,
+		RoutingAlgorithm: cfg.RoutingAlgorithm,
+		PersistenceType:  cfg.PersistenceType,
+		DrainingTimeout:  cfg.DrainingTimeout,
+		SourceRanges:     append([]string(nil), cfg.SourceRanges...),
+		Monitor:          &model.Monitor{Type: cfg.HealthType, Path: cfg.HealthPath, Interval: cfg.HealthInterval},
 	}
-
-	return ids, nil
+	result, err := lbaasdeploy.NewFromRaw(r.cmp, r.vpcID).Ensure(ctx, lbaasdeploy.EnsureRequest{
+		LBName:        sanitizeKey(fmt.Sprintf("seed-%s-%s", svc.Namespace, svc.Name)),
+		LBDescription: fmt.Sprintf("Seed LB for %s/%s", svc.Namespace, svc.Name),
+		FlavorID:      r.flavorID,
+		NetworkID:     r.networkID,
+		VPCID:         r.vpcID,
+		VPCName:       r.vpcName,
+		VirtualServer: vs,
+		Backends:      members,
+		Current:       current,
+	})
+	if err != nil {
+		return nil, current.VIPAddress, err
+	}
+	return &f5client.CMPResourceIDs{
+		LBServiceID:       result.Observed.LBServiceID,
+		VIPPortID:         result.Observed.VIPPortID,
+		VirtualServerID:   result.Observed.VirtualServerID,
+		VirtualServerName: result.Observed.VirtualServerName,
+	}, result.Observed.VIPAddress, nil
 }
 
 func (r *serviceReconciler) cleanupCMPResources(ctx context.Context, svc *corev1.Service) error {
-	lbID := svc.Annotations[annLBServiceID]
-	vipID := svc.Annotations[annVIPPortID]
-	vsID := svc.Annotations[annVirtualServerID]
-
+	observed := model.ObservedState{
+		LBServiceID:     strings.TrimSpace(svc.Annotations[annLBServiceID]),
+		VIPPortID:       strings.TrimSpace(svc.Annotations[annVIPPortID]),
+		VirtualServerID: strings.TrimSpace(svc.Annotations[annVirtualServerID]),
+	}
 	log := ctrl.Log.WithName("seed-service-lb").WithValues(
 		"service", fmt.Sprintf("%s/%s", svc.Namespace, svc.Name),
-		"lbServiceID", lbID, "vipPortID", vipID, "virtualServerID", vsID,
+		"lbServiceID", observed.LBServiceID, "vipPortID", observed.VIPPortID, "virtualServerID", observed.VirtualServerID,
 	)
-
-	if vsID != "" && lbID != "" {
-		log.Info("deleting CMP Virtual Server")
-		if err := r.cmp.DeleteLBVirtualServer(ctx, lbID, vsID); err != nil && !f5client.IsNotFound(err) {
-			return fmt.Errorf("deleting virtual server %s on LB %s: %w", vsID, lbID, err)
-		}
-	}
-	if vipID != "" && lbID != "" {
-		log.Info("deleting CMP VIP")
-		if err := r.cmp.DeleteLBServiceVIP(ctx, lbID, vipID); err != nil && !f5client.IsNotFound(err) {
-			return fmt.Errorf("deleting VIP %s on LB %s: %w", vipID, lbID, err)
-		}
-	}
-	if lbID != "" {
-		log.Info("deleting CMP LB Service")
-		if err := r.cmp.DeleteLBService(ctx, lbID); err != nil && !f5client.IsNotFound(err) {
-			return fmt.Errorf("deleting LB service %s: %w", lbID, err)
-		}
-	}
-	return nil
-}
-
-// portInfo holds the details extracted from a single Service port.
-type portInfo struct {
-	FrontendPort int32
-	NodePort     int32
-	Protocol     string // TCP, UDP, HTTP, or HTTPS
-}
-
-// mapK8sProtocolToCMP maps a Kubernetes Service port protocol to the CMP protocol string.
-// CMP supports: TCP, UDP, HTTP, HTTPS.
-// For SCTP or unrecognised protocols, it defaults to TCP.
-func mapK8sProtocolToCMP(p corev1.Protocol, port int32) string {
-	switch p {
-	case corev1.ProtocolUDP:
-		return "UDP"
-	case corev1.ProtocolTCP:
-		// Detect HTTP/HTTPS by well-known ports; default to TCP.
-		switch port {
-		case 80, 8080:
-			return "HTTP"
-		case 443, 8443:
-			return "HTTPS"
-		default:
-			return "TCP"
-		}
-	default:
-		return "TCP"
-	}
-}
-
-func choosePorts(svc *corev1.Service, protocolOverride string) ([]portInfo, bool) {
-	if svc == nil || len(svc.Spec.Ports) == 0 {
-		return nil, false
-	}
-	var ports []portInfo
-	for _, p := range svc.Spec.Ports {
-		if p.Port == 0 || p.NodePort == 0 {
-			continue
-		}
-		proto := mapK8sProtocolToCMP(p.Protocol, p.Port)
-		if protocolOverride != "" {
-			proto = protocolOverride
-		}
-		ports = append(ports, portInfo{
-			FrontendPort: p.Port,
-			NodePort:     p.NodePort,
-			Protocol:     proto,
-		})
-	}
-	if len(ports) == 0 {
-		return nil, false
-	}
-	return ports, true
-}
-
-func listNodeInternalIPs(ctx context.Context, c client.Client) ([]string, error) {
-	nl := &corev1.NodeList{}
-	if err := c.List(ctx, nl); err != nil {
-		return nil, err
-	}
-
-	out := make([]string, 0, len(nl.Items))
-	for _, n := range nl.Items {
-		for _, a := range n.Status.Addresses {
-			if a.Type == corev1.NodeInternalIP && strings.TrimSpace(a.Address) != "" {
-				out = append(out, strings.TrimSpace(a.Address))
-				break
-			}
-		}
-	}
-	return out, nil
-}
-
-func ensureServiceStatusVIP(ctx context.Context, c client.Client, svc *corev1.Service, vip string) error {
-	current := ""
-	if len(svc.Status.LoadBalancer.Ingress) > 0 {
-		current = strings.TrimSpace(svc.Status.LoadBalancer.Ingress[0].IP)
-	}
-	if current == vip {
-		return nil
-	}
-
-	base := svc.DeepCopy()
-	svc.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: vip}}
-	return c.Status().Patch(ctx, svc, client.MergeFrom(base))
+	log.Info("cleaning CMP LBaaS resources")
+	_, err := lbaasdeploy.NewFromRaw(r.cmp, r.vpcID).Cleanup(ctx, lbaasdeploy.CleanupRequest{
+		Current:         observed,
+		DeleteVIP:       true,
+		DeleteLBService: true,
+	})
+	return err
 }
 
 func sanitizeKey(s string) string {
@@ -698,9 +429,6 @@ func sanitizeKey(s string) string {
 	}
 	return b.String()
 }
-
-// silence unused import warning in case build tags change
-var _ metav1.Time
 
 // listManagedServiceRequests returns reconcile requests for all Seed Services that carry
 // the controller's finalizer. Called on Node events to keep pool members in sync.
