@@ -70,6 +70,7 @@ func BuildLoadBalancerStack(ing *networkingv1.Ingress, cfg lbannotations.LBConfi
 		pool.Members = append(pool.Members, member)
 		port.Backends = append(port.Backends, member)
 	}
+	annotateIngressBackends(ing, stack, owner, opts.ClusterUID, group, pool.Name)
 	vs.DefaultPoolName = pool.Name
 	stack.VirtualServers = append(stack.VirtualServers, vs)
 	stack.Pools = append(stack.Pools, pool)
@@ -135,4 +136,50 @@ func safeName(s string) string {
 		return "x"
 	}
 	return out
+}
+
+func annotateIngressBackends(ing *networkingv1.Ingress, stack *model.LoadBalancerStack, owner model.Owner, clusterUID, group, fallbackPool string) {
+	poolNames := map[string]string{}
+	poolFor := func(be networkingv1.IngressBackend) string {
+		if be.Service == nil {
+			return fallbackPool
+		}
+		key := be.Service.Name + ":" + be.Service.Port.Name + fmt.Sprintf(":%d", be.Service.Port.Number)
+		if name, ok := poolNames[key]; ok {
+			return name
+		}
+		name := safeName("ing-pool-" + ing.Namespace + "-" + be.Service.Name + "-" + be.Service.Port.Name + fmt.Sprintf("-%d", be.Service.Port.Number))
+		poolNames[key] = name
+		stack.Pools = append(stack.Pools, model.Pool{
+			Name:      name,
+			Service:   be.Service.Name,
+			PortName:  be.Service.Port.Name,
+			Port:      be.Service.Port.Number,
+			Monitor:   &model.Monitor{Type: stack.Config.HealthType, Path: stack.Config.HealthPath, Interval: stack.Config.HealthInterval},
+			Ownership: model.OwnershipFor(owner, clusterUID, "pool", group),
+		})
+		return name
+	}
+	priority := int32(1)
+	if ing.Spec.DefaultBackend != nil {
+		stack.RoutingRules = append(stack.RoutingRules, model.RoutingRule{Name: safeName("ing-rule-" + ing.Namespace + "-" + ing.Name + "-default"), Path: "/", MatchType: "default", PoolName: poolFor(*ing.Spec.DefaultBackend), Priority: priority, Ownership: model.OwnershipFor(owner, clusterUID, "routing-rule", group)})
+		priority++
+	}
+	for _, rule := range ing.Spec.Rules {
+		if rule.HTTP == nil {
+			continue
+		}
+		for _, path := range rule.HTTP.Paths {
+			matchType := "prefix"
+			if path.PathType != nil && *path.PathType == networkingv1.PathTypeExact {
+				matchType = "exact"
+			}
+			stack.RoutingRules = append(stack.RoutingRules, model.RoutingRule{Name: safeName(fmt.Sprintf("ing-rule-%s-%s-%d", ing.Namespace, ing.Name, priority)), Host: strings.ToLower(strings.TrimSpace(rule.Host)), Path: path.Path, MatchType: matchType, PoolName: poolFor(path.Backend), Priority: priority, Ownership: model.OwnershipFor(owner, clusterUID, "routing-rule", group)})
+			priority++
+		}
+	}
+	for _, tls := range ing.Spec.TLS {
+		hosts := append([]string(nil), tls.Hosts...)
+		stack.Certificates = append(stack.Certificates, model.Certificate{Name: safeName("ing-cert-" + ing.Namespace + "-" + tls.SecretName), SecretName: tls.SecretName, Hosts: hosts, Ownership: model.OwnershipFor(owner, clusterUID, "certificate", group)})
+	}
 }

@@ -187,6 +187,7 @@ func (a rawAdapter) SearchNetworkPortsByIP(ctx context.Context, ip string) ([]Ne
 }
 
 type RawPoolClient interface {
+	ListLBVirtualServerPools(ctx context.Context, lbServiceID, vsID string) ([]json.RawMessage, error)
 	CreateLBVirtualServerPool(ctx context.Context, lbServiceID, virtualServerID string, query url.Values) (json.RawMessage, error)
 	GetLBVirtualServerPool(ctx context.Context, lbServiceID, virtualServerID, poolID string) (json.RawMessage, error)
 	DeleteLBVirtualServerPool(ctx context.Context, lbServiceID, virtualServerID, poolID string) error
@@ -199,6 +200,20 @@ type RawPoolClient interface {
 type rawPoolAdapter struct{ raw RawPoolClient }
 
 func NewPoolClientFromRaw(raw RawPoolClient) PoolClient { return rawPoolAdapter{raw: raw} }
+
+func (a rawPoolAdapter) ListPools(ctx context.Context, lbServiceID, virtualServerID string) ([]PoolResource, error) {
+	items, err := a.raw.ListLBVirtualServerPools(ctx, lbServiceID, virtualServerID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]PoolResource, 0, len(items))
+	for _, item := range items {
+		if pool := parsePool(item); strings.TrimSpace(pool.ID) != "" {
+			out = append(out, pool)
+		}
+	}
+	return out, nil
+}
 
 func (a rawPoolAdapter) CreatePool(ctx context.Context, lbServiceID, virtualServerID string, spec PoolSpec) (PoolResource, error) {
 	q := poolSpecQuery(spec)
