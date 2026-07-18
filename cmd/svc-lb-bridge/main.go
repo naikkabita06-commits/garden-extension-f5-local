@@ -20,6 +20,7 @@ import (
 	lbfinalizers "github.com/gardener/gardener-extension-f5/pkg/finalizers"
 	f5metrics "github.com/gardener/gardener-extension-f5/pkg/metrics"
 	"github.com/gardener/gardener-extension-f5/pkg/model"
+	lbnetworkpolicy "github.com/gardener/gardener-extension-f5/pkg/networkpolicy"
 	lbservice "github.com/gardener/gardener-extension-f5/pkg/service"
 	lbstatus "github.com/gardener/gardener-extension-f5/pkg/status"
 
@@ -27,9 +28,7 @@ import (
 	discoveryv1 "k8s.io/api/discovery/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/util/intstr"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -347,7 +346,7 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	r.Recorder.Eventf(svc, corev1.EventTypeNormal, "EnsuredLoadBalancer", "CMP LBaaS resources ensured (LB=%s, VIP=%s, ports=%d, backends=%d)", lastIDs.LBServiceID, vip, len(stack.Ports), len(backends))
 
 	// Auto-generate NetworkPolicy allowing ingress to backing pods.
-	if err := r.ensureNetworkPolicy(ctx, svc); err != nil {
+	if err := lbnetworkpolicy.Ensure(ctx, r.Client, svc); err != nil {
 		log.Error(err, "failed to ensure NetworkPolicy for LoadBalancer Service")
 	}
 
@@ -542,69 +541,9 @@ func (r *serviceReconciler) isLBServiceShared(ctx context.Context, self *corev1.
 	return false
 }
 
-// networkPolicyName returns the deterministic name for the auto-generated NetworkPolicy.
-func networkPolicyName(svc *corev1.Service) string {
-	return fmt.Sprintf("f5-lb-allow-%s", svc.Name)
-}
-
-// ensureNetworkPolicy creates or updates a NetworkPolicy that allows ingress traffic
-// to the pods backing this LoadBalancer Service on the Service's target ports.
-// This mirrors GKE/EKS behavior of auto-creating firewall rules for LB Services.
-func (r *serviceReconciler) ensureNetworkPolicy(ctx context.Context, svc *corev1.Service) error {
-	if svc.Spec.Selector == nil || len(svc.Spec.Selector) == 0 {
-		return nil // No pod selector, can't create policy
-	}
-
-	// Build ingress rules for each Service port.
-	var ingressPorts []networkingv1.NetworkPolicyPort
-	for _, p := range svc.Spec.Ports {
-		proto := p.Protocol
-		if proto == "" {
-			proto = corev1.ProtocolTCP
-		}
-		port := intstr.FromInt32(p.Port)
-		ingressPorts = append(ingressPorts, networkingv1.NetworkPolicyPort{
-			Protocol: &proto,
-			Port:     &port,
-		})
-	}
-
-	np := &networkingv1.NetworkPolicy{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      networkPolicyName(svc),
-			Namespace: svc.Namespace,
-		},
-	}
-
-	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, np, func() error {
-		np.Labels = map[string]string{
-			"app.kubernetes.io/managed-by": "svc-lb-bridge",
-			"f5.extensions.gardener.cloud": "network-policy",
-		}
-		np.Spec = networkingv1.NetworkPolicySpec{
-			PodSelector: metav1.LabelSelector{
-				MatchLabels: svc.Spec.Selector,
-			},
-			Ingress: []networkingv1.NetworkPolicyIngressRule{
-				{Ports: ingressPorts},
-			},
-			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
-		}
-		return nil
-	})
-	return err
-}
-
-// cleanupNetworkPolicy removes the auto-generated NetworkPolicy for this Service.
 func (r *serviceReconciler) cleanupNetworkPolicy(ctx context.Context, svc *corev1.Service) {
-	np := &networkingv1.NetworkPolicy{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      networkPolicyName(svc),
-			Namespace: svc.Namespace,
-		},
-	}
-	if err := r.Delete(ctx, np); err != nil && !apierrors.IsNotFound(err) {
-		ctrl.Log.WithName("svc-lb-bridge").Error(err, "failed to delete NetworkPolicy", "networkPolicy", np.Name, "namespace", np.Namespace)
+	if err := lbnetworkpolicy.Delete(ctx, r.Client, svc); err != nil {
+		ctrl.Log.WithName("svc-lb-bridge").Error(err, "failed to delete NetworkPolicy", "networkPolicy", lbnetworkpolicy.Name(svc), "namespace", svc.Namespace)
 	}
 }
 
