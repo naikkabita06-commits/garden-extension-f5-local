@@ -91,6 +91,9 @@ func TestEnsureCreatesLBVIPAndVirtualServer(t *testing.T) {
 	if res.Observed.LBServiceID != "lb-1" || res.Observed.VIPPortID != "7" || res.Observed.VirtualServerID != "vs-1" || res.Observed.VIPAddress != "10.0.0.7" {
 		t.Fatalf("unexpected observed state: %#v", res.Observed)
 	}
+	if res.Observed.Graph.LBServices["lb"].ExternalID != "lb-1" || res.Observed.Graph.VirtualServers["vs"].ExternalID != "vs-1" {
+		t.Fatalf("expected observed graph to contain LB and VS resources: %#v", res.Observed.Graph)
+	}
 	if got := stub.lastVSSpec.MonitorPath; got != "/healthz" {
 		t.Fatalf("expected monitor path, got %q", got)
 	}
