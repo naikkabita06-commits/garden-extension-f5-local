@@ -14,6 +14,7 @@ import (
 	lbbackend "github.com/gardener/gardener-extension-f5/pkg/backend"
 	lbaasdeploy "github.com/gardener/gardener-extension-f5/pkg/deploy/lbaas"
 	f5client "github.com/gardener/gardener-extension-f5/pkg/f5"
+	lbfinalizers "github.com/gardener/gardener-extension-f5/pkg/finalizers"
 	lbingress "github.com/gardener/gardener-extension-f5/pkg/ingress"
 	f5metrics "github.com/gardener/gardener-extension-f5/pkg/metrics"
 	"github.com/gardener/gardener-extension-f5/pkg/model"
@@ -92,9 +93,7 @@ func (r *ingressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			}
 			r.Recorder.Event(ing, corev1.EventTypeNormal, "DeletedLoadBalancer", "CMP LBaaS resources deleted successfully")
 
-			base := ing.DeepCopy()
-			controllerutil.RemoveFinalizer(ing, ingressFinalizerName)
-			if err := r.Patch(ctx, ing, client.MergeFrom(base)); err != nil {
+			if _, err := lbfinalizers.Remove(ctx, r.Client, ing, ingressFinalizerName); err != nil {
 				return ctrl.Result{}, err
 			}
 			f5metrics.ManagedServicesTotal.WithLabelValues("ingress-lb").Dec()
@@ -104,9 +103,7 @@ func (r *ingressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	// Add finalizer.
 	if !controllerutil.ContainsFinalizer(ing, ingressFinalizerName) {
-		base := ing.DeepCopy()
-		controllerutil.AddFinalizer(ing, ingressFinalizerName)
-		if err := r.Patch(ctx, ing, client.MergeFrom(base)); err != nil {
+		if _, err := lbfinalizers.Ensure(ctx, r.Client, ing, ingressFinalizerName); err != nil {
 			return ctrl.Result{}, err
 		}
 		f5metrics.ManagedServicesTotal.WithLabelValues("ingress-lb").Inc()
