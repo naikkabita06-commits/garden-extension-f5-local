@@ -33,3 +33,24 @@ func TestProtocolAndFrontendPortForTLSIngress(t *testing.T) {
 		t.Fatalf("expected 443, got %d", got)
 	}
 }
+
+func TestBuildLoadBalancerStackCapturesRoutingRulesAndCertificates(t *testing.T) {
+	pt := networkingv1.PathTypePrefix
+	ing := &networkingv1.Ingress{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "app", Name: "web"},
+		Spec: networkingv1.IngressSpec{
+			TLS:   []networkingv1.IngressTLS{{SecretName: "web-tls", Hosts: []string{"example.test"}}},
+			Rules: []networkingv1.IngressRule{{Host: "Example.Test", IngressRuleValue: networkingv1.IngressRuleValue{HTTP: &networkingv1.HTTPIngressRuleValue{Paths: []networkingv1.HTTPIngressPath{{Path: "/api", PathType: &pt, Backend: *ingressBackend("api", 8080)}}}}}},
+		},
+	}
+	stack, err := BuildLoadBalancerStack(ing, lbannotations.DefaultLBConfig(), []backend.Node{{IP: "10.0.0.1", Weight: 1}}, BuildOptions{FrontendPort: 443, BackendPort: 30080, Protocol: "HTTPS"})
+	if err != nil {
+		t.Fatalf("BuildLoadBalancerStack: %v", err)
+	}
+	if len(stack.RoutingRules) != 1 || stack.RoutingRules[0].Host != "example.test" || stack.RoutingRules[0].Path != "/api" || stack.RoutingRules[0].MatchType != "prefix" {
+		t.Fatalf("unexpected routing rules: %#v", stack.RoutingRules)
+	}
+	if len(stack.Certificates) != 1 || stack.Certificates[0].SecretName != "web-tls" || len(stack.Certificates[0].Hosts) != 1 {
+		t.Fatalf("unexpected certificates: %#v", stack.Certificates)
+	}
+}

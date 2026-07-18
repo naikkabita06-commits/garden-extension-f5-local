@@ -245,3 +245,15 @@ func TestCleanupDiscoveredDeletesVirtualServersByPrefixAndAllVIPs(t *testing.T) 
 		t.Fatalf("unexpected cleanup: vs=%d vip=%d result=%#v", stub.deletedVS, stub.deletedVIP, res)
 	}
 }
+
+func TestEnsureFailsWhenBackendPortHasNoResourceID(t *testing.T) {
+	stub := &stubClient{}
+	stub.searchNetworkPorts = func(ip string) []NetworkPort { return []NetworkPort{{ID: 99, ResourceType: "compute", IP: ip}} }
+	_, err := New(stub, "").Ensure(context.Background(), EnsureRequest{
+		VirtualServer: model.VirtualServer{Name: "vs", FrontendPort: 80, BackendNodePort: 30080, Protocol: "HTTP"},
+		Backends:      []model.BackendMember{{IP: "10.0.0.99", Port: 30080, Weight: 50}},
+	})
+	if err == nil {
+		t.Fatal("expected missing CMP resource_id to fail")
+	}
+}

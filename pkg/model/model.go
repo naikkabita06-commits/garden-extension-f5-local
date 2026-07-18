@@ -60,9 +60,31 @@ type VirtualServer struct {
 // Pool is the desired backend pool for one listener or route.
 type Pool struct {
 	Name      string
+	Service   string
+	PortName  string
+	Port      int32
 	Members   []BackendMember
 	Monitor   *Monitor
 	Ownership Ownership
+}
+
+// RoutingRule is a deterministic host/path rule targeting a named backend pool.
+type RoutingRule struct {
+	Name      string
+	Host      string
+	Path      string
+	MatchType string
+	PoolName  string
+	Priority  int32
+	Ownership Ownership
+}
+
+// Certificate is the desired TLS certificate reference for HTTPS listeners.
+type Certificate struct {
+	Name       string
+	SecretName string
+	Hosts      []string
+	Ownership  Ownership
 }
 
 // BackendMember is the normalized backend representation used by model
@@ -118,5 +140,7 @@ type LoadBalancerStack struct {
 	VIP            VIP
 	VirtualServers []VirtualServer
 	Pools          []Pool
+	RoutingRules   []RoutingRule
+	Certificates   []Certificate
 	Ports          []ServicePort
 }
