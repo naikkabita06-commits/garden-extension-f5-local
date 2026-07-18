@@ -523,12 +523,6 @@ func (r *serviceReconciler) cleanupCMPResources(ctx context.Context, svc *corev1
 			if err != nil {
 				return err
 			}
-		} else {
-			// Best-effort: delete any VS matching our naming convention when no ID is stored.
-			_, _ = lbaasdeploy.NewFromRaw(r.cmp, r.vpcID).CleanupDiscovered(ctx, lbaasdeploy.CleanupDiscoveryRequest{
-				LBServiceID:             strings.TrimSpace(lbID),
-				VirtualServerNamePrefix: sanitizeKey(fmt.Sprintf("app-vs-%s-%s-", svc.Namespace, svc.Name)),
-			})
 		}
 
 		// If this LBService is shared (vip-group), only delete VIP+LBService when no other
@@ -553,12 +547,6 @@ func (r *serviceReconciler) cleanupCMPResources(ctx context.Context, svc *corev1
 				if err != nil {
 					return err
 				}
-			} else {
-				// Best-effort: delete all VIPs found on the LB.
-				_, _ = lbaasdeploy.NewFromRaw(r.cmp, r.vpcID).CleanupDiscovered(ctx, lbaasdeploy.CleanupDiscoveryRequest{
-					LBServiceID:   strings.TrimSpace(lbID),
-					DeleteAllVIPs: true,
-				})
 			}
 		}
 		if !shared && lbID != "" {

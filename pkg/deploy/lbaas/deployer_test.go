@@ -213,6 +213,25 @@ func TestCleanupPreservesSharedParentResources(t *testing.T) {
 	}
 }
 
+func TestCleanupStackDeletesOnlyRecordedGraphResources(t *testing.T) {
+	stub := &stubClient{}
+	state := model.ObservedState{Graph: model.NewObservedGraph()}
+	state.Graph.LBServices["lb"] = model.ObservedResource{LogicalID: "lb", ExternalID: "lb-1"}
+	state.Graph.VIPs["vip"] = model.ObservedResource{LogicalID: "vip", ExternalID: "vip-1"}
+	state.Graph.VirtualServers["listener"] = model.ObservedResource{LogicalID: "listener", ExternalID: "vs-1"}
+
+	result, err := New(stub, "").CleanupStack(context.Background(), CleanupRequest{Current: state, DeleteVIP: true, DeleteLBService: true})
+	if err != nil {
+		t.Fatalf("CleanupStack: %v", err)
+	}
+	if stub.deletedVS != 1 || stub.deletedVIP != 1 || stub.deletedLB != 1 {
+		t.Fatalf("expected graph resources only to be deleted, got vs=%d vip=%d lb=%d", stub.deletedVS, stub.deletedVIP, stub.deletedLB)
+	}
+	if !result.DeletedVirtualServer || !result.DeletedVIP || !result.DeletedLBService {
+		t.Fatalf("unexpected cleanup result: %#v", result)
+	}
+}
+
 func lbSpecValue(spec LBServiceSpec, key string) string {
 	switch key {
 	case "flavor_id":
@@ -228,24 +247,6 @@ func lbSpecValue(spec LBServiceSpec, key string) string {
 		return spec.VPCName
 	default:
 		return ""
-	}
-}
-
-func TestCleanupDiscoveredDeletesVirtualServersByPrefixAndAllVIPs(t *testing.T) {
-	stub := &stubClient{
-		vsList: []VirtualServer{{ID: "vs-match", Name: "app-vs-ns-svc-80"}, {ID: "vs-other", Name: "other"}},
-		vips:   []VIP{{ID: "vip-1", Address: "10.0.0.10"}, {ID: "vip-2", Address: "10.0.0.11"}},
-	}
-	res, err := New(stub, "").CleanupDiscovered(context.Background(), CleanupDiscoveryRequest{
-		LBServiceID:             "lb-1",
-		VirtualServerNamePrefix: "app-vs-ns-svc-",
-		DeleteAllVIPs:           true,
-	})
-	if err != nil {
-		t.Fatalf("CleanupDiscovered: %v", err)
-	}
-	if stub.deletedVS != 1 || stub.deletedVIP != 2 || !res.DeletedVirtualServer || !res.DeletedVIP {
-		t.Fatalf("unexpected cleanup: vs=%d vip=%d result=%#v", stub.deletedVS, stub.deletedVIP, res)
 	}
 }
 
