@@ -94,10 +94,3 @@ func defaultResourceType(resourceType string) string {
 	}
 	return resourceType
 }
-
-func (m *BackendMemberManager) Cleanup(ctx context.Context, lbServiceID, virtualServerID, poolID, memberID string) error {
-	if strings.TrimSpace(lbServiceID) == "" || strings.TrimSpace(virtualServerID) == "" || strings.TrimSpace(poolID) == "" || strings.TrimSpace(memberID) == "" {
-		return nil
-	}
-	return m.client.DeletePoolMember(ctx, lbServiceID, virtualServerID, poolID, memberID)
-}

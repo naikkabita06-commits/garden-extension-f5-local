@@ -224,12 +224,7 @@ func (d *Deployer) EnsureStack(ctx context.Context, req StackEnsureRequest) (*St
 				return nil, err
 			}
 			poolIDs[pool.Name] = resource.ID
-			poolKey := vs.Name + "/" + pool.Name
-			observed.Graph.Pools[poolKey] = model.ObservedResource{LogicalID: poolKey, ExternalID: resource.ID, Name: resource.Name, Ownership: pool.Ownership}
-			for _, member := range resource.Members {
-				memberKey := poolMemberGraphKey(vs.Name, pool.Name, member)
-				observed.Graph.Members[memberKey] = model.ObservedResource{LogicalID: memberKey, ExternalID: member.ID, Address: member.ResourceIP, Ownership: pool.Ownership}
-			}
+			observed.Graph.Pools[vs.Name+"/"+pool.Name] = model.ObservedResource{LogicalID: vs.Name + "/" + pool.Name, ExternalID: resource.ID, Name: resource.Name, Ownership: pool.Ownership}
 			changed = changed || poolChanged
 			if d.monitors != nil {
 				monitor, monitorChanged, err := d.monitors.Ensure(ctx, lbID, vsID, resource.ID, pool.Monitor)
@@ -256,8 +251,7 @@ func (d *Deployer) EnsureStack(ctx context.Context, req StackEnsureRequest) (*St
 				return nil, err
 			}
 			for _, rule := range rules {
-				ruleKey := vs.Name + "/" + routingRuleKey(rule.Host, rule.Path, rule.MatchType, rule.PoolID)
-				observed.Graph.RoutingRules[ruleKey] = model.ObservedResource{LogicalID: ruleKey, ExternalID: rule.ID, Ownership: vs.Ownership}
+				observed.Graph.RoutingRules[routingRuleKey(rule.Host, rule.Path, rule.MatchType, rule.PoolID)] = model.ObservedResource{LogicalID: routingRuleKey(rule.Host, rule.Path, rule.MatchType, rule.PoolID), ExternalID: rule.ID, Ownership: vs.Ownership}
 			}
 			changed = changed || rulesChanged
 		}
@@ -294,102 +288,4 @@ func poolsForVirtualServer(stack *model.LoadBalancerStack, vs model.VirtualServe
 		}
 	}
 	return out
-}
-
-// GraphCleanupRequest scopes graph deletion to resources already recorded as
-// owned by this stack. Parent deletion is explicit so shared parents are never
-// removed merely because a child stack is being deleted.
-type GraphCleanupRequest struct {
-	Current         model.ObservedState
-	DeleteVIP       bool
-	DeleteLBService bool
-}
-
-// CleanupGraph deletes observed resources in reverse dependency order. It does
-// not perform name or prefix discovery: only IDs recorded in the observed graph
-// are eligible for deletion.
-func (d *Deployer) CleanupGraph(ctx context.Context, req GraphCleanupRequest) error {
-	current := req.Current
-	current.EnsureGraph()
-	lbID := strings.TrimSpace(current.LBServiceID)
-	if lbID == "" {
-		return nil
-	}
-	if len(current.Graph.RoutingRules) != 0 && d.routingRules == nil {
-		return fmt.Errorf("routing-rule cleanup requires a RoutingRuleManager")
-	}
-	if (len(current.Graph.Pools) != 0 || len(current.Graph.Members) != 0) && d.pools == nil {
-		return fmt.Errorf("pool cleanup requires a PoolManager")
-	}
-	if len(current.Graph.Monitors) != 0 && d.monitors == nil {
-		return fmt.Errorf("monitor cleanup requires a MonitorManager")
-	}
-
-	for key, rule := range current.Graph.RoutingRules {
-		vsID := graphVirtualServerID(current.Graph, graphVirtualServerName(key))
-		if err := d.routingRules.Cleanup(ctx, lbID, vsID, rule.ExternalID); err != nil {
-			return fmt.Errorf("deleting routing rule %s: %w", key, err)
-		}
-	}
-	for key, member := range current.Graph.Members {
-		vsName, poolName, ok := graphPoolParts(key)
-		if !ok {
-			return fmt.Errorf("invalid member graph key %q", key)
-		}
-		vsID, poolID := graphVirtualServerID(current.Graph, vsName), graphPoolID(current.Graph, vsName, poolName)
-		if err := d.pools.members.Cleanup(ctx, lbID, vsID, poolID, member.ExternalID); err != nil {
-			return fmt.Errorf("deleting backend member %s: %w", key, err)
-		}
-	}
-	for key, monitor := range current.Graph.Monitors {
-		vsName, poolName, ok := graphPoolParts(key)
-		if !ok {
-			return fmt.Errorf("invalid monitor graph key %q", key)
-		}
-		if err := d.monitors.Cleanup(ctx, lbID, graphVirtualServerID(current.Graph, vsName), graphPoolID(current.Graph, vsName, poolName), monitor.ExternalID); err != nil {
-			return fmt.Errorf("deleting monitor %s: %w", key, err)
-		}
-	}
-	for key, pool := range current.Graph.Pools {
-		vsName, _, ok := graphPoolParts(key)
-		if !ok {
-			return fmt.Errorf("invalid pool graph key %q", key)
-		}
-		if err := d.pools.Cleanup(ctx, lbID, graphVirtualServerID(current.Graph, vsName), pool.ExternalID); err != nil {
-			return fmt.Errorf("deleting pool %s: %w", key, err)
-		}
-	}
-	for key, vs := range current.Graph.VirtualServers {
-		if err := d.client.DeleteVirtualServer(ctx, lbID, vs.ExternalID); err != nil {
-			return fmt.Errorf("deleting virtual server %s: %w", key, err)
-		}
-	}
-	if req.DeleteVIP {
-		for _, vip := range current.Graph.VIPs {
-			if err := d.client.DeleteVIP(ctx, lbID, vip.ExternalID); err != nil {
-				return fmt.Errorf("deleting VIP %s: %w", vip.ExternalID, err)
-			}
-		}
-	}
-	if req.DeleteLBService {
-		if err := d.client.DeleteLBService(ctx, lbID); err != nil {
-			return fmt.Errorf("deleting LB service %s: %w", lbID, err)
-		}
-	}
-	return nil
-}
-
-func poolMemberGraphKey(vsName, poolName string, member PoolMemberResource) string {
-	return vsName + "/" + poolName + "/" + poolMemberKey(member.ResourceID, member.ResourceIP, member.BackendPortID, member.Port)
-}
-func graphVirtualServerName(key string) string { return strings.SplitN(key, "/", 2)[0] }
-func graphVirtualServerID(graph model.ObservedGraph, name string) string {
-	return graph.VirtualServers[name].ExternalID
-}
-func graphPoolID(graph model.ObservedGraph, vsName, poolName string) string {
-	return graph.Pools[vsName+"/"+poolName].ExternalID
-}
-func graphPoolParts(key string) (string, string, bool) {
-	parts := strings.SplitN(key, "/", 3)
-	return parts[0], parts[1], len(parts) >= 2 && parts[0] != "" && parts[1] != ""
 }
