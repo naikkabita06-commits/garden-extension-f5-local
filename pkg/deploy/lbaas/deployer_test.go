@@ -232,6 +232,28 @@ func TestCleanupStackDeletesOnlyRecordedGraphResources(t *testing.T) {
 	}
 }
 
+func TestDeleteObsoleteVirtualServersRemovesOnlyUndesiredListener(t *testing.T) {
+	stub := &stubClient{}
+	deployer := New(stub, "")
+	observed := model.ObservedState{Graph: model.NewObservedGraph()}
+	observed.Graph.VirtualServers["keep"] = model.ObservedResource{LogicalID: "keep", ExternalID: "vs-keep"}
+	observed.Graph.VirtualServers["remove"] = model.ObservedResource{LogicalID: "remove", ExternalID: "vs-remove"}
+
+	err := deployer.deleteObsoleteVirtualServers(context.Background(), "lb-1", &observed, &model.LoadBalancerStack{VirtualServers: []model.VirtualServer{{Name: "keep"}}})
+	if err != nil {
+		t.Fatalf("deleteObsoleteVirtualServers: %v", err)
+	}
+	if stub.deletedVS != 1 {
+		t.Fatalf("expected one obsolete listener deletion, got %d", stub.deletedVS)
+	}
+	if _, ok := observed.Graph.VirtualServers["remove"]; ok {
+		t.Fatalf("expected obsolete listener to be removed from graph: %#v", observed.Graph.VirtualServers)
+	}
+	if _, ok := observed.Graph.VirtualServers["keep"]; !ok {
+		t.Fatalf("expected desired listener to remain in graph: %#v", observed.Graph.VirtualServers)
+	}
+}
+
 func lbSpecValue(spec LBServiceSpec, key string) string {
 	switch key {
 	case "flavor_id":
