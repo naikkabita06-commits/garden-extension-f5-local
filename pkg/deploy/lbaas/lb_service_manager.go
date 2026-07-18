@@ -16,10 +16,20 @@ func NewLBServiceManager(client Client, vpcID string) *LBServiceManager {
 }
 
 func (m *LBServiceManager) Ensure(ctx context.Context, req EnsureRequest, currentID string) (string, bool, error) {
-	if strings.TrimSpace(currentID) != "" {
-		return strings.TrimSpace(currentID), false, nil
+	currentID = strings.TrimSpace(currentID)
+	items, err := m.client.ListLBServices(ctx)
+	if err != nil {
+		return "", false, err
 	}
-	foundID, err := m.findByName(ctx, req.LBName)
+	if currentID != "" {
+		for _, svc := range items {
+			if strings.TrimSpace(svc.ID) == currentID {
+				return currentID, false, nil
+			}
+		}
+		return currentID, false, fmt.Errorf("annotated LB service %s was not found in CMP inventory", currentID)
+	}
+	foundID, err := findUniqueLBServiceByName(items, req.LBName)
 	if err != nil {
 		return "", false, err
 	}
@@ -33,17 +43,26 @@ func (m *LBServiceManager) Ensure(ctx context.Context, req EnsureRequest, curren
 	return createdID, true, nil
 }
 
+func findUniqueLBServiceByName(items []LBService, name string) (string, error) {
+	var foundID string
+	for _, svc := range items {
+		if strings.TrimSpace(svc.Name) != name || strings.TrimSpace(svc.ID) == "" {
+			continue
+		}
+		if foundID != "" {
+			return "", fmt.Errorf("multiple LB services named %q found; refusing name-only adoption", name)
+		}
+		foundID = strings.TrimSpace(svc.ID)
+	}
+	return foundID, nil
+}
+
 func (m *LBServiceManager) findByName(ctx context.Context, name string) (string, error) {
 	items, err := m.client.ListLBServices(ctx)
 	if err != nil {
 		return "", err
 	}
-	for _, svc := range items {
-		if strings.TrimSpace(svc.Name) == name && strings.TrimSpace(svc.ID) != "" {
-			return strings.TrimSpace(svc.ID), nil
-		}
-	}
-	return "", nil
+	return findUniqueLBServiceByName(items, name)
 }
 
 func (m *LBServiceManager) create(ctx context.Context, req EnsureRequest) (string, error) {
