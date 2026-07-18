@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	f5client "github.com/gardener/gardener-extension-f5/pkg/f5"
+	"github.com/gardener/gardener-extension-f5/pkg/model"
 )
 
 type rawAdapterStub struct {
@@ -56,5 +57,69 @@ func TestRawAdapterSearchNetworkPortsByIPParsesCMPShapes(t *testing.T) {
 	}
 	if ports[1].ID != 5002 || ports[1].ResourceID != "compute-2" || ports[1].ResourceType != "compute" || ports[1].IP != "10.0.0.2" {
 		t.Fatalf("unexpected second port: %#v", ports[1])
+	}
+}
+
+type rawPoolAdapterStub struct {
+	createPoolQ   url.Values
+	memberQ       url.Values
+	defaultPool   string
+	deletedPool   string
+	deletedMember string
+}
+
+func (s *rawPoolAdapterStub) CreateLBVirtualServerPool(_ context.Context, _, _ string, q url.Values) (json.RawMessage, error) {
+	s.createPoolQ = q
+	return json.RawMessage(`{"id":"pool-1","pool_name":"pool-web","is_default":false}`), nil
+}
+func (s *rawPoolAdapterStub) GetLBVirtualServerPool(context.Context, string, string, string) (json.RawMessage, error) {
+	return json.RawMessage(`{"id":"pool-1","pool_name":"pool-web"}`), nil
+}
+func (s *rawPoolAdapterStub) DeleteLBVirtualServerPool(_ context.Context, _, _, poolID string) error {
+	s.deletedPool = poolID
+	return nil
+}
+func (s *rawPoolAdapterStub) SetDefaultLBVirtualServerPool(_ context.Context, _, _, poolID string) error {
+	s.defaultPool = poolID
+	return nil
+}
+func (s *rawPoolAdapterStub) CreateLBVirtualServerPoolMember(_ context.Context, _, _, _ string, q url.Values) (json.RawMessage, error) {
+	s.memberQ = q
+	return json.RawMessage(`{"id":"member-1","resource_ip":"10.0.0.1","backend_port_id":5001,"port":30080,"weight":50}`), nil
+}
+func (s *rawPoolAdapterStub) UpdateLBVirtualServerPoolMember(context.Context, string, string, string, string, url.Values) (json.RawMessage, error) {
+	return json.RawMessage(`{"id":"member-1"}`), nil
+}
+func (s *rawPoolAdapterStub) DeleteLBVirtualServerPoolMember(_ context.Context, _, _, _, memberID string) error {
+	s.deletedMember = memberID
+	return nil
+}
+
+func TestRawPoolAdapterEncodesSwaggerQueries(t *testing.T) {
+	raw := &rawPoolAdapterStub{}
+	adapter := NewPoolClientFromRaw(raw)
+	pool, err := adapter.CreatePool(context.Background(), "lb-1", "vs-1", PoolSpec{Name: "pool-web", Monitor: &model.Monitor{Name: "mon-web", Type: "http", Path: "/healthz", Interval: 15}, Members: []PoolMemberSpec{{ResourceID: "compute-1", ResourceType: "compute", ResourceIP: "10.0.0.1", BackendPortID: 5001, Port: 30080, Weight: 50}}})
+	if err != nil {
+		t.Fatalf("CreatePool failed: %v", err)
+	}
+	if pool.ID != "pool-1" || pool.Name != "pool-web" {
+		t.Fatalf("unexpected pool: %#v", pool)
+	}
+	if raw.createPoolQ.Get("pool_name") != "pool-web" || raw.createPoolQ.Get("monitor_name") != "mon-web" || raw.createPoolQ.Get("monitor_path") != "/healthz" || raw.createPoolQ.Get("interval") != "15" {
+		t.Fatalf("unexpected pool query: %v", raw.createPoolQ)
+	}
+	if len(raw.createPoolQ["nodes"]) != 1 {
+		t.Fatalf("expected node payload in pool query: %v", raw.createPoolQ)
+	}
+
+	member, err := adapter.CreatePoolMember(context.Background(), "lb-1", "vs-1", "pool-1", PoolMemberSpec{ResourceID: "compute-1", ResourceType: "compute", ResourceIP: "10.0.0.1", BackendPortID: 5001, Port: 30080, Weight: 50})
+	if err != nil {
+		t.Fatalf("CreatePoolMember failed: %v", err)
+	}
+	if member.ID != "member-1" || member.BackendPortID != 5001 {
+		t.Fatalf("unexpected member: %#v", member)
+	}
+	if raw.memberQ.Get("node") == "" {
+		t.Fatalf("expected node query payload, got %v", raw.memberQ)
 	}
 }

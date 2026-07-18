@@ -186,6 +186,152 @@ func (a rawAdapter) SearchNetworkPortsByIP(ctx context.Context, ip string) ([]Ne
 	return out, nil
 }
 
+type RawPoolClient interface {
+	CreateLBVirtualServerPool(ctx context.Context, lbServiceID, virtualServerID string, query url.Values) (json.RawMessage, error)
+	GetLBVirtualServerPool(ctx context.Context, lbServiceID, virtualServerID, poolID string) (json.RawMessage, error)
+	DeleteLBVirtualServerPool(ctx context.Context, lbServiceID, virtualServerID, poolID string) error
+	SetDefaultLBVirtualServerPool(ctx context.Context, lbServiceID, virtualServerID, poolID string) error
+	CreateLBVirtualServerPoolMember(ctx context.Context, lbServiceID, virtualServerID, poolID string, query url.Values) (json.RawMessage, error)
+	UpdateLBVirtualServerPoolMember(ctx context.Context, lbServiceID, virtualServerID, poolID, memberID string, query url.Values) (json.RawMessage, error)
+	DeleteLBVirtualServerPoolMember(ctx context.Context, lbServiceID, virtualServerID, poolID, memberID string) error
+}
+
+type rawPoolAdapter struct{ raw RawPoolClient }
+
+func NewPoolClientFromRaw(raw RawPoolClient) PoolClient { return rawPoolAdapter{raw: raw} }
+
+func (a rawPoolAdapter) CreatePool(ctx context.Context, lbServiceID, virtualServerID string, spec PoolSpec) (PoolResource, error) {
+	q := poolSpecQuery(spec)
+	raw, err := a.raw.CreateLBVirtualServerPool(ctx, lbServiceID, virtualServerID, q)
+	if err != nil {
+		return PoolResource{}, err
+	}
+	return parsePool(raw), nil
+}
+
+func (a rawPoolAdapter) GetPool(ctx context.Context, lbServiceID, virtualServerID, poolID string) (PoolResource, error) {
+	raw, err := a.raw.GetLBVirtualServerPool(ctx, lbServiceID, virtualServerID, poolID)
+	if err != nil {
+		return PoolResource{}, err
+	}
+	return parsePool(raw), nil
+}
+
+func (a rawPoolAdapter) DeletePool(ctx context.Context, lbServiceID, virtualServerID, poolID string) error {
+	return a.raw.DeleteLBVirtualServerPool(ctx, lbServiceID, virtualServerID, poolID)
+}
+
+func (a rawPoolAdapter) SetDefaultPool(ctx context.Context, lbServiceID, virtualServerID, poolID string) error {
+	return a.raw.SetDefaultLBVirtualServerPool(ctx, lbServiceID, virtualServerID, poolID)
+}
+
+func (a rawPoolAdapter) CreatePoolMember(ctx context.Context, lbServiceID, virtualServerID, poolID string, spec PoolMemberSpec) (PoolMemberResource, error) {
+	raw, err := a.raw.CreateLBVirtualServerPoolMember(ctx, lbServiceID, virtualServerID, poolID, poolMemberSpecQuery(spec))
+	if err != nil {
+		return PoolMemberResource{}, err
+	}
+	return parsePoolMember(raw), nil
+}
+
+func (a rawPoolAdapter) UpdatePoolMember(ctx context.Context, lbServiceID, virtualServerID, poolID, memberID string, spec PoolMemberSpec) (PoolMemberResource, error) {
+	raw, err := a.raw.UpdateLBVirtualServerPoolMember(ctx, lbServiceID, virtualServerID, poolID, memberID, poolMemberSpecQuery(spec))
+	if err != nil {
+		return PoolMemberResource{}, err
+	}
+	return parsePoolMember(raw), nil
+}
+
+func (a rawPoolAdapter) DeletePoolMember(ctx context.Context, lbServiceID, virtualServerID, poolID, memberID string) error {
+	return a.raw.DeleteLBVirtualServerPoolMember(ctx, lbServiceID, virtualServerID, poolID, memberID)
+}
+
+func poolSpecQuery(spec PoolSpec) url.Values {
+	q := url.Values{}
+	q.Set("pool_name", spec.Name)
+	if spec.Protocol != "" {
+		q.Set("pool_members_protocol", spec.Protocol)
+	}
+	if spec.RoutingAlgorithm != "" {
+		q.Set("routing_algorithm", spec.RoutingAlgorithm)
+	}
+	if spec.Monitor != nil {
+		if spec.Monitor.Name != "" {
+			q.Set("monitor_name", spec.Monitor.Name)
+		}
+		if spec.Monitor.Type != "" {
+			q.Set("monitor_protocol", spec.Monitor.Type)
+		}
+		if spec.Monitor.Path != "" {
+			q.Set("monitor_path", spec.Monitor.Path)
+		}
+		if spec.Monitor.Interval > 0 {
+			q.Set("interval", fmt.Sprintf("%d", spec.Monitor.Interval))
+		}
+	}
+	for _, member := range spec.Members {
+		b, _ := json.Marshal(poolMemberPayload(member))
+		q.Add("nodes", string(b))
+	}
+	return q
+}
+
+func poolMemberSpecQuery(spec PoolMemberSpec) url.Values {
+	q := url.Values{}
+	b, _ := json.Marshal(poolMemberPayload(spec))
+	q.Set("node", string(b))
+	return q
+}
+
+func poolMemberPayload(spec PoolMemberSpec) map[string]interface{} {
+	resourceType := strings.TrimSpace(spec.ResourceType)
+	if resourceType == "" {
+		resourceType = "compute"
+	}
+	return map[string]interface{}{
+		"resource_id":     spec.ResourceID,
+		"resource_type":   resourceType,
+		"resource_ip":     spec.ResourceIP,
+		"backend_port_id": spec.BackendPortID,
+		"port":            spec.Port,
+		"weight":          spec.Weight,
+	}
+}
+
+func parsePool(raw json.RawMessage) PoolResource {
+	var p struct {
+		ID        string            `json:"id"`
+		Name      string            `json:"pool_name"`
+		AltName   string            `json:"name"`
+		IsDefault bool              `json:"is_default"`
+		Members   []json.RawMessage `json:"members"`
+	}
+	if json.Unmarshal(raw, &p) != nil {
+		return PoolResource{}
+	}
+	name := firstNonEmpty(p.Name, p.AltName)
+	res := PoolResource{ID: strings.TrimSpace(p.ID), Name: name, IsDefault: p.IsDefault}
+	for _, member := range p.Members {
+		res.Members = append(res.Members, parsePoolMember(member))
+	}
+	return res
+}
+
+func parsePoolMember(raw json.RawMessage) PoolMemberResource {
+	var m struct {
+		ID            string `json:"id"`
+		ResourceID    string `json:"resource_id"`
+		ResourceType  string `json:"resource_type"`
+		ResourceIP    string `json:"resource_ip"`
+		BackendPortID int    `json:"backend_port_id"`
+		Port          int32  `json:"port"`
+		Weight        int    `json:"weight"`
+	}
+	if json.Unmarshal(raw, &m) != nil {
+		return PoolMemberResource{}
+	}
+	return PoolMemberResource{ID: strings.TrimSpace(m.ID), ResourceID: strings.TrimSpace(m.ResourceID), ResourceType: strings.TrimSpace(m.ResourceType), ResourceIP: strings.TrimSpace(m.ResourceIP), BackendPortID: m.BackendPortID, Port: m.Port, Weight: m.Weight}
+}
+
 func parseVIP(raw json.RawMessage) VIP {
 	var vip struct {
 		ID      string `json:"id"`
