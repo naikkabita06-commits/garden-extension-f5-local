@@ -33,6 +33,7 @@ type stubCMP struct {
 	deleteVSN int
 	deleteVN  int
 	deleteLBN int
+	searchN   int
 	lastVSQ   url.Values
 
 	// Optional canned responses for list calls.
@@ -77,6 +78,10 @@ func (s *stubCMP) ListLBVirtualServers(_ context.Context, _ string) ([]json.RawM
 func (s *stubCMP) DeleteLBVirtualServer(_ context.Context, _, _ string) error {
 	s.deleteVSN++
 	return nil
+}
+func (s *stubCMP) SearchNetworkPortsByIP(_ context.Context, ip string) ([]json.RawMessage, error) {
+	s.searchN++
+	return []json.RawMessage{json.RawMessage(`{"id":5001,"resource_id":"compute-` + ip + `","resource_type":"compute","fixed_ip":"` + ip + `"}`)}, nil
 }
 
 func newTestReconciler(t *testing.T, objs ...client.Object) (*serviceReconciler, client.Client, *stubCMP) {
@@ -160,8 +165,9 @@ func TestReconcile_AllocatesVIPAndProgramsCMPVirtualServer(t *testing.T) {
 	}
 	for _, raw := range nodeParams {
 		var n struct {
-			ComputeIP string `json:"compute_ip"`
-			Port      int32  `json:"port"`
+			ResourceIP   string `json:"resource_ip"`
+			ResourceType string `json:"resource_type"`
+			Port         int32  `json:"port"`
 		}
 		if err := json.Unmarshal([]byte(raw), &n); err != nil {
 			t.Fatalf("unmarshal node param %q: %v", raw, err)
@@ -169,8 +175,11 @@ func TestReconcile_AllocatesVIPAndProgramsCMPVirtualServer(t *testing.T) {
 		if n.Port != 30080 {
 			t.Fatalf("expected node port 30080, got %d", n.Port)
 		}
-		if n.ComputeIP != "172.18.0.10" && n.ComputeIP != "172.18.0.11" {
-			t.Fatalf("unexpected compute_ip %q", n.ComputeIP)
+		if n.ResourceType != "compute" {
+			t.Fatalf("expected resource_type=compute, got %q", n.ResourceType)
+		}
+		if n.ResourceIP != "172.18.0.10" && n.ResourceIP != "172.18.0.11" {
+			t.Fatalf("unexpected resource_ip %q", n.ResourceIP)
 		}
 	}
 

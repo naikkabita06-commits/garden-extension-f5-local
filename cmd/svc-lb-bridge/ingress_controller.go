@@ -6,15 +6,19 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"net/url"
-	"strconv"
 	"strings"
 	"time"
 
+	lbannotations "github.com/gardener/gardener-extension-f5/pkg/annotations"
+	lbbackend "github.com/gardener/gardener-extension-f5/pkg/backend"
+	lbaasdeploy "github.com/gardener/gardener-extension-f5/pkg/deploy/lbaas"
 	f5client "github.com/gardener/gardener-extension-f5/pkg/f5"
+	lbfinalizers "github.com/gardener/gardener-extension-f5/pkg/finalizers"
+	lbingress "github.com/gardener/gardener-extension-f5/pkg/ingress"
 	f5metrics "github.com/gardener/gardener-extension-f5/pkg/metrics"
+	"github.com/gardener/gardener-extension-f5/pkg/model"
+	lbstatus "github.com/gardener/gardener-extension-f5/pkg/status"
 
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -58,46 +62,8 @@ func newIngressReconciler(c client.Client, scheme *runtime.Scheme, cmp cmpLBaaS,
 }
 
 // parseIngressConfig reads per-Ingress LB configuration from annotations.
-// Same annotation keys as per-Service config, applied to the Ingress object.
 func parseIngressConfig(ing *networkingv1.Ingress) lbServiceConfig {
-	cfg := defaultLBServiceConfig()
-	if ing == nil || ing.Annotations == nil {
-		return cfg
-	}
-	if v := strings.TrimSpace(ing.Annotations[annRoutingAlgorithm]); v != "" {
-		cfg.RoutingAlgorithm = v
-	}
-	if v := strings.TrimSpace(ing.Annotations[annHealthInterval]); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			cfg.HealthInterval = int32(n)
-		}
-	}
-	if v := strings.TrimSpace(ing.Annotations[annHealthType]); v != "" {
-		lower := strings.ToLower(v)
-		switch lower {
-		case "tcp", "http":
-			cfg.HealthType = lower
-		}
-	}
-	if v := strings.TrimSpace(ing.Annotations[annHealthPath]); v != "" {
-		cfg.HealthPath = v
-		if cfg.HealthType == "tcp" {
-			cfg.HealthType = "http"
-		}
-	}
-	if v := strings.TrimSpace(ing.Annotations[annDrainingTimeout]); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
-			cfg.DrainingTimeout = int32(n)
-		}
-	}
-	if v := strings.TrimSpace(ing.Annotations[annSourceRanges]); v != "" {
-		for _, cidr := range strings.Split(v, ",") {
-			if c := strings.TrimSpace(cidr); c != "" {
-				cfg.SourceRanges = append(cfg.SourceRanges, c)
-			}
-		}
-	}
-	return cfg
+	return lbannotations.ParseObject(ing)
 }
 
 func (r *ingressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -127,9 +93,7 @@ func (r *ingressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			}
 			r.Recorder.Event(ing, corev1.EventTypeNormal, "DeletedLoadBalancer", "CMP LBaaS resources deleted successfully")
 
-			base := ing.DeepCopy()
-			controllerutil.RemoveFinalizer(ing, ingressFinalizerName)
-			if err := r.Patch(ctx, ing, client.MergeFrom(base)); err != nil {
+			if _, err := lbfinalizers.Remove(ctx, r.Client, ing, ingressFinalizerName); err != nil {
 				return ctrl.Result{}, err
 			}
 			f5metrics.ManagedServicesTotal.WithLabelValues("ingress-lb").Dec()
@@ -139,19 +103,20 @@ func (r *ingressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	// Add finalizer.
 	if !controllerutil.ContainsFinalizer(ing, ingressFinalizerName) {
-		base := ing.DeepCopy()
-		controllerutil.AddFinalizer(ing, ingressFinalizerName)
-		if err := r.Patch(ctx, ing, client.MergeFrom(base)); err != nil {
+		if _, err := lbfinalizers.Ensure(ctx, r.Client, ing, ingressFinalizerName); err != nil {
 			return ctrl.Result{}, err
 		}
 		f5metrics.ManagedServicesTotal.WithLabelValues("ingress-lb").Inc()
 	}
 
-	// Determine protocol: HTTPS if TLS is configured, HTTP otherwise.
-	protocol := "HTTP"
-	if len(ing.Spec.TLS) > 0 {
-		protocol = "HTTPS"
+	if err := lbingress.ValidateSupported(ing); err != nil {
+		log.Info("skipping unsupported Ingress", "reason", err)
+		r.Recorder.Eventf(ing, corev1.EventTypeWarning, "UnsupportedIngress", "Unsupported F5 Ingress configuration: %v", err)
+		return ctrl.Result{}, nil
 	}
+
+	// Determine protocol: HTTPS if TLS is configured, HTTP otherwise.
+	protocol := lbingress.ProtocolForIngress(ing)
 
 	// Resolve the backend NodePort from the first rule's service.
 	backendSvc, nodePort, err := r.resolveBackendServiceAndNodePort(ctx, ing)
@@ -167,9 +132,9 @@ func (r *ingressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// Collect backend nodes (only ready nodes with ready endpoints, weighted by pod count).
 	var backends []backendNode
 	if backendSvc != nil {
-		backends, err = listBackendNodes(ctx, r.Client, backendSvc)
+		backends, err = lbbackend.ListReadyNodeBackends(ctx, r.Client, backendSvc)
 	} else {
-		backends, err = listBackendNodes(ctx, r.Client, &corev1.Service{})
+		backends, err = lbbackend.ListReadyNodeBackends(ctx, r.Client, nil)
 	}
 	if err != nil {
 		return ctrl.Result{}, err
@@ -180,17 +145,23 @@ func (r *ingressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	// Determine frontend port.
-	frontendPort := int32(80)
-	if protocol == "HTTPS" {
-		frontendPort = 443
-	}
+	frontendPort := lbingress.FrontendPortForProtocol(protocol)
 
-	// Parse per-Ingress LB configuration from annotations.
+	// Parse per-Ingress LB configuration from annotations and build desired state.
 	ingressCfg := parseIngressConfig(ing)
+	stack, err := lbingress.BuildLoadBalancerStack(ing, ingressCfg, backends, lbingress.BuildOptions{
+		FrontendPort: frontendPort,
+		BackendPort:  nodePort,
+		Protocol:     protocol,
+	})
+	if err != nil {
+		r.Recorder.Eventf(ing, corev1.EventTypeWarning, "BuildLoadBalancerModelFailed", "Error building Ingress load-balancer model: %v", err)
+		return ctrl.Result{}, err
+	}
 
 	// Provision CMP resources.
 	cmpStart := time.Now()
-	ids, vip, err := r.ensureCMPResources(ctx, ing, frontendPort, nodePort, backends, protocol, ingressCfg)
+	ids, vip, err := r.ensureCMPResources(ctx, ing, stack)
 	f5metrics.CMPAPICallDuration.WithLabelValues("ingress-lb", "EnsureLB").Observe(time.Since(cmpStart).Seconds())
 	if err != nil {
 		f5metrics.CMPAPICallsTotal.WithLabelValues("ingress-lb", "EnsureLB", "error").Inc()
@@ -219,7 +190,7 @@ func (r *ingressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	// Update Ingress status with VIP.
-	if err := r.ensureIngressStatusVIP(ctx, ing, vip); err != nil {
+	if err := lbstatus.EnsureIngressVIP(ctx, r.Client, ing, vip); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -269,11 +240,6 @@ func (r *ingressReconciler) resolveBackendServiceAndNodePort(ctx context.Context
 	return nil, 0, nil
 }
 
-func (r *ingressReconciler) resolveBackendNodePort(ctx context.Context, ing *networkingv1.Ingress) (int32, error) {
-	_, np, err := r.resolveBackendServiceAndNodePort(ctx, ing)
-	return np, err
-}
-
 func (r *ingressReconciler) getServiceAndNodePort(ctx context.Context, namespace, name string, port networkingv1.ServiceBackendPort) (*corev1.Service, int32, error) {
 	svc := &corev1.Service{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, svc); err != nil {
@@ -297,211 +263,50 @@ func (r *ingressReconciler) getServiceAndNodePort(ctx context.Context, namespace
 	return svc, 0, nil
 }
 
-func (r *ingressReconciler) ensureCMPResources(ctx context.Context, ing *networkingv1.Ingress, frontendPort, nodePort int32, backends []backendNode, protocol string, cfg lbServiceConfig) (*f5client.CMPResourceIDs, string, error) {
-	ids := &f5client.CMPResourceIDs{}
-
-	// Step 1: Create or reuse LB Service.
-	existingLBID := ing.Annotations[annIngressLBServiceID]
-	if existingLBID != "" {
-		ids.LBServiceID = existingLBID
-	} else {
-		var lbName string
-		if g := strings.TrimSpace(ing.Annotations[annVIPGroup]); g != "" {
-			lbName = sanitizeKey(fmt.Sprintf("ing-group-%s-%s", ing.Namespace, g))
-		} else {
-			lbName = sanitizeKey(fmt.Sprintf("ing-%s-%s", ing.Namespace, ing.Name))
-		}
-
-		// Look up existing LBService by name (required for vip-group sharing).
-		if foundID, err := r.findLBServiceByName(ctx, lbName); err == nil && foundID != "" {
-			ids.LBServiceID = foundID
-		} else {
-			form := url.Values{}
-			form.Set("name", lbName)
-			form.Set("description", fmt.Sprintf("Ingress LB for %s/%s", ing.Namespace, ing.Name))
-			if r.vpcID != "" {
-				form.Set("vpc_id", r.vpcID)
-			}
-
-			raw, err := r.cmp.CreateLBService(ctx, form)
-			if err != nil {
-				return nil, "", fmt.Errorf("creating LB service via CMP: %w", err)
-			}
-			var created struct {
-				ID string `json:"id"`
-			}
-			if err := json.Unmarshal(raw, &created); err != nil || created.ID == "" {
-				return nil, "", fmt.Errorf("parsing LB Service create response: %s", string(raw))
-			}
-			ids.LBServiceID = created.ID
-		}
+func (r *ingressReconciler) ensureCMPResources(ctx context.Context, ing *networkingv1.Ingress, stack *model.LoadBalancerStack) (*f5client.CMPResourceIDs, string, error) {
+	current := model.ObservedState{}
+	if ing != nil && ing.Annotations != nil {
+		current.LBServiceID = strings.TrimSpace(ing.Annotations[annIngressLBServiceID])
+		current.VIPPortID = strings.TrimSpace(ing.Annotations[annIngressVIPPortID])
+		current.VirtualServerID = strings.TrimSpace(ing.Annotations[annIngressVSID])
+		current.VIPAddress = strings.TrimSpace(ing.Annotations[annIngressVIPAddress])
 	}
-
-	// Step 2: Create or reuse VIP.
-	existingVIPID := ing.Annotations[annIngressVIPPortID]
-	vip := ing.Annotations[annIngressVIPAddress]
-	if existingVIPID != "" {
-		ids.VIPPortID = existingVIPID
-	} else {
-		// For vip-group: try to find an existing VIP on the LBService first.
-		if vips, listErr := r.cmp.GetLBServiceVIPs(ctx, ids.LBServiceID); listErr == nil && len(vips) > 0 {
-			for _, v := range vips {
-				var vipInt struct {
-					ID      int    `json:"id"`
-					Address string `json:"address"`
-				}
-				if json.Unmarshal(v, &vipInt) == nil && vipInt.ID != 0 {
-					ids.VIPPortID = fmt.Sprintf("%d", vipInt.ID)
-					vip = vipInt.Address
-					break
-				}
-				var vipStr struct {
-					ID      string `json:"id"`
-					Address string `json:"address"`
-				}
-				if json.Unmarshal(v, &vipStr) == nil && strings.TrimSpace(vipStr.ID) != "" {
-					ids.VIPPortID = strings.TrimSpace(vipStr.ID)
-					vip = vipStr.Address
-					break
-				}
-			}
-		}
+	if stack == nil || len(stack.VirtualServers) == 0 || len(stack.Ports) == 0 {
+		return nil, current.VIPAddress, fmt.Errorf("ingress load-balancer stack is empty")
 	}
-	// If still no VIP, create one.
-	if ids.VIPPortID == "" {
-		raw, err := r.cmp.CreateLBServiceVIP(ctx, ids.LBServiceID)
-		if err != nil {
-			return ids, "", fmt.Errorf("creating VIP via CMP on LB %s: %w", ids.LBServiceID, err)
-		}
-		var created struct {
-			ID      int    `json:"id"`
-			Address string `json:"address"`
-		}
-		if err := json.Unmarshal(raw, &created); err == nil && created.ID != 0 {
-			ids.VIPPortID = fmt.Sprintf("%d", created.ID)
-			vip = created.Address
-		} else {
-			var createdStr struct {
-				ID      string `json:"id"`
-				Address string `json:"address"`
-			}
-			if json.Unmarshal(raw, &createdStr) == nil && createdStr.ID != "" {
-				ids.VIPPortID = createdStr.ID
-				vip = createdStr.Address
-			} else {
-				return ids, "", fmt.Errorf("parsing VIP create response: %s", string(raw))
-			}
-		}
-		// If address not in create response, fetch VIPs.
-		if vip == "" {
-			vips, err := r.cmp.GetLBServiceVIPs(ctx, ids.LBServiceID)
-			if err == nil {
-				for _, v := range vips {
-					var vipInfo struct {
-						Address string `json:"address"`
-					}
-					if json.Unmarshal(v, &vipInfo) == nil && vipInfo.Address != "" {
-						vip = vipInfo.Address
-						break
-					}
-				}
-			}
-		}
+	vs := stack.VirtualServers[0]
+	result, err := lbaasdeploy.NewFromRaw(r.cmp, r.vpcID).Ensure(ctx, lbaasdeploy.EnsureRequest{
+		LBName:        stack.LBService.Name,
+		LBDescription: stack.LBService.Description,
+		VirtualServer: vs,
+		Backends:      stack.Ports[0].Backends,
+		Current:       current,
+	})
+	if err != nil {
+		return nil, current.VIPAddress, err
 	}
-
-	// Step 3: Create or reuse Virtual Server.
-	existingVSID := ing.Annotations[annIngressVSID]
-	if existingVSID != "" {
-		ids.VirtualServerID = existingVSID
-	} else {
-		nodes := make([]map[string]interface{}, 0, len(backends))
-		for i, bn := range backends {
-			nodes = append(nodes, map[string]interface{}{
-				"compute_id":      fmt.Sprintf("node-%d", i),
-				"compute_ip":      bn.IP,
-				"backend_port_id": i + 1,
-				"port":            nodePort,
-				"weight":          bn.Weight,
-			})
-		}
-
-		vsName := sanitizeKey(fmt.Sprintf("ing-vs-%s-%s", ing.Namespace, ing.Name))
-		query := url.Values{}
-		query.Set("name", vsName)
-		query.Set("vip_port_id", ids.VIPPortID)
-		query.Set("protocol", protocol)
-		query.Set("port", fmt.Sprintf("%d", frontendPort))
-		query.Set("routing_algorithm", cfg.RoutingAlgorithm)
-		query.Set("interval", fmt.Sprintf("%d", cfg.HealthInterval))
-		if cfg.HealthType != "" && cfg.HealthType != "tcp" {
-			query.Set("monitor_type", cfg.HealthType)
-		}
-		if cfg.HealthPath != "" {
-			query.Set("monitor_path", cfg.HealthPath)
-		}
-		if cfg.PersistenceType != "" {
-			query.Set("persistence_type", cfg.PersistenceType)
-		}
-		if cfg.DrainingTimeout > 0 {
-			query.Set("connection_draining_timeout", fmt.Sprintf("%d", cfg.DrainingTimeout))
-		}
-		if r.vpcID != "" {
-			query.Set("vpc_id", r.vpcID)
-		}
-		if len(cfg.SourceRanges) > 0 {
-			query.Set("allowed_cidrs", strings.Join(cfg.SourceRanges, ","))
-		}
-		for _, n := range nodes {
-			nodeJSON, _ := json.Marshal(n)
-			query.Add("nodes", string(nodeJSON))
-		}
-
-		raw, err := r.cmp.CreateLBVirtualServer(ctx, ids.LBServiceID, query)
-		if err != nil {
-			return ids, vip, fmt.Errorf("creating virtual server via CMP: %w", err)
-		}
-		var created struct {
-			ID   string `json:"id"`
-			Name string `json:"name"`
-		}
-		if json.Unmarshal(raw, &created) == nil {
-			if created.ID != "" {
-				ids.VirtualServerID = created.ID
-			} else if created.Name != "" {
-				ids.VirtualServerID = created.Name
-			}
-		}
+	ids := &f5client.CMPResourceIDs{
+		LBServiceID:       result.Observed.LBServiceID,
+		VIPPortID:         result.Observed.VIPPortID,
+		VirtualServerID:   result.Observed.VirtualServerID,
+		VirtualServerName: result.Observed.VirtualServerName,
 	}
-
-	return ids, vip, nil
+	return ids, result.Observed.VIPAddress, nil
 }
 
 func (r *ingressReconciler) cleanupCMPResources(ctx context.Context, ing *networkingv1.Ingress) error {
-	vsID := ing.Annotations[annIngressVSID]
-	lbID := ing.Annotations[annIngressLBServiceID]
-	vipID := ing.Annotations[annIngressVIPPortID]
-
-	if vsID != "" && lbID != "" {
-		if err := r.cmp.DeleteLBVirtualServer(ctx, lbID, vsID); err != nil && !f5client.IsNotFound(err) {
-			return fmt.Errorf("deleting virtual server %s: %w", vsID, err)
-		}
+	observed := model.ObservedState{
+		LBServiceID:     strings.TrimSpace(ing.Annotations[annIngressLBServiceID]),
+		VIPPortID:       strings.TrimSpace(ing.Annotations[annIngressVIPPortID]),
+		VirtualServerID: strings.TrimSpace(ing.Annotations[annIngressVSID]),
 	}
-
-	// If this LBService is shared (vip-group), skip VIP+LBService deletion
-	// when other Ingresses still reference the same LBService.
-	shared := r.isLBServiceShared(ctx, ing, lbID)
-
-	if !shared && vipID != "" && lbID != "" {
-		if err := r.cmp.DeleteLBServiceVIP(ctx, lbID, vipID); err != nil && !f5client.IsNotFound(err) {
-			return fmt.Errorf("deleting VIP %s: %w", vipID, err)
-		}
-	}
-	if !shared && lbID != "" {
-		if err := r.cmp.DeleteLBService(ctx, lbID); err != nil && !f5client.IsNotFound(err) {
-			return fmt.Errorf("deleting LB service %s: %w", lbID, err)
-		}
-	}
-	return nil
+	shared := r.isLBServiceShared(ctx, ing, observed.LBServiceID)
+	_, err := lbaasdeploy.NewFromRaw(r.cmp, r.vpcID).Cleanup(ctx, lbaasdeploy.CleanupRequest{
+		Current:         observed,
+		DeleteVIP:       !shared,
+		DeleteLBService: !shared,
+	})
+	return err
 }
 
 // isLBServiceShared checks whether any other Ingress still references the
@@ -523,47 +328,6 @@ func (r *ingressReconciler) isLBServiceShared(ctx context.Context, self *network
 		}
 	}
 	return false
-}
-
-// findLBServiceByName searches CMP for an LBService with the given name.
-func (r *ingressReconciler) findLBServiceByName(ctx context.Context, name string) (string, error) {
-	items, err := r.cmp.ListLBServices(ctx, nil)
-	if err != nil {
-		return "", err
-	}
-	for _, raw := range items {
-		var svc struct {
-			ID   string `json:"id"`
-			Name string `json:"name"`
-		}
-		if json.Unmarshal(raw, &svc) != nil {
-			continue
-		}
-		if strings.TrimSpace(svc.Name) == name && strings.TrimSpace(svc.ID) != "" {
-			return strings.TrimSpace(svc.ID), nil
-		}
-	}
-	return "", nil
-}
-
-func (r *ingressReconciler) ensureIngressStatusVIP(ctx context.Context, ing *networkingv1.Ingress, vip string) error {
-	if vip == "" {
-		return nil
-	}
-	currentIP := ""
-	if len(ing.Status.LoadBalancer.Ingress) > 0 {
-		currentIP = strings.TrimSpace(ing.Status.LoadBalancer.Ingress[0].IP)
-	}
-	if currentIP == vip {
-		return nil
-	}
-
-	base := ing.DeepCopy()
-	ing.Status.LoadBalancer.Ingress = []networkingv1.IngressLoadBalancerIngress{{IP: vip}}
-	if err := r.Status().Patch(ctx, ing, client.MergeFrom(base)); err != nil {
-		return fmt.Errorf("updating Ingress status with VIP %s: %w", vip, err)
-	}
-	return nil
 }
 
 // listManagedIngressRequests returns reconcile requests for all Ingresses
