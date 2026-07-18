@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -52,6 +53,9 @@ const (
 	annVirtualServerID = "f5.extensions.gardener.cloud/virtual-server-id"
 	annVIPAddress      = "f5.extensions.gardener.cloud/vip-address"
 	annBackendHash     = "f5.extensions.gardener.cloud/backend-hash"
+	// annObservedPorts persists independent virtual-server state per Service port.
+	// The legacy scalar annotations above mirror the first listener for compatibility.
+	annObservedPorts = "f5.extensions.gardener.cloud/observed-ports"
 
 	// User-facing input annotations for per-Service LB configuration.
 	// These override global defaults from F5LoadBalancerConfig CRD.
@@ -294,13 +298,28 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		f5metrics.ManagedServicesTotal.WithLabelValues("svc-lb-bridge").Inc()
 	}
 
-	// Ensure CMP resources for each port. The LBService and VIP are shared across
-	// all ports (idempotent find-or-create); each port gets its own VirtualServer.
+	// Ensure CMP resources for every Service port. The LBService and VIP are shared
+	// across all listeners, while each listener keeps an independent provider ID and
+	// backend hash. This prevents a second port from adopting or replacing the first
+	// port's virtual server.
+	portObserved := readServicePortObserved(svc.Annotations)
+	desiredPortKeys := make(map[string]struct{}, len(stack.Ports))
+	shared := model.ObservedState{
+		LBServiceID: strings.TrimSpace(svc.Annotations[annLBServiceID]),
+		VIPPortID:   strings.TrimSpace(svc.Annotations[annVIPPortID]),
+		VIPAddress:  strings.TrimSpace(svc.Annotations[annVIPAddress]),
+	}
 	var lastIDs *f5client.CMPResourceIDs
-	var vip, lastBackendHash string
+	var vip string
 	cmpStart := time.Now()
 	for _, p := range stack.Ports {
-		ids, portVIP, backendHash, err := r.ensureCMPResources(ctx, svc, p.FrontendPort, p.NodePort, backends, p.Protocol, stack.Config)
+		key := servicePortKey(p)
+		desiredPortKeys[key] = struct{}{}
+		previous := portObserved[key]
+		current := shared
+		current.VirtualServerID = previous.VirtualServerID
+		current.VirtualServerName = previous.VirtualServerName
+		ids, portVIP, backendHash, err := r.ensureCMPResourcesWithCurrent(ctx, svc, p.FrontendPort, p.NodePort, backends, p.Protocol, stack.Config, current, previous.BackendHash)
 		if err != nil {
 			f5metrics.CMPAPICallDuration.WithLabelValues("svc-lb-bridge", "EnsureLB").Observe(time.Since(cmpStart).Seconds())
 			f5metrics.CMPAPICallsTotal.WithLabelValues("svc-lb-bridge", "EnsureLB", "error").Inc()
@@ -314,10 +333,24 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			return ctrl.Result{}, err
 		}
 		lastIDs = ids
-		lastBackendHash = backendHash
+		portObserved[key] = servicePortObserved{VirtualServerID: ids.VirtualServerID, VirtualServerName: ids.VirtualServerName, BackendHash: backendHash}
+		shared.LBServiceID, shared.VIPPortID, shared.VIPAddress = ids.LBServiceID, ids.VIPPortID, portVIP
 		if portVIP != "" {
 			vip = portVIP
 		}
+	}
+	// Delete listeners for ports that have been removed. Parent LB/VIP resources
+	// remain in place, so an individual Service-port change cannot disrupt siblings.
+	for key, previous := range portObserved {
+		if _, wanted := desiredPortKeys[key]; wanted {
+			continue
+		}
+		if previous.VirtualServerID != "" {
+			if _, err := lbaasdeploy.NewFromRaw(r.cmp, r.vpcID).Cleanup(ctx, lbaasdeploy.CleanupRequest{Current: model.ObservedState{LBServiceID: shared.LBServiceID, VirtualServerID: previous.VirtualServerID}}); err != nil {
+				return ctrl.Result{}, fmt.Errorf("cleaning removed Service port %s: %w", key, err)
+			}
+		}
+		delete(portObserved, key)
 	}
 	f5metrics.CMPAPICallDuration.WithLabelValues("svc-lb-bridge", "EnsureLB").Observe(time.Since(cmpStart).Seconds())
 	f5metrics.CMPAPICallsTotal.WithLabelValues("svc-lb-bridge", "EnsureLB", "success").Inc()
@@ -332,12 +365,14 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 	svc.Annotations[annLBServiceID] = lastIDs.LBServiceID
 	svc.Annotations[annVIPPortID] = lastIDs.VIPPortID
+	// Preserve legacy values for existing consumers while persisting every listener.
 	svc.Annotations[annVirtualServerID] = lastIDs.VirtualServerID
 	if vip != "" {
 		svc.Annotations[annVIPAddress] = vip
 	}
-	if lastBackendHash != "" {
-		svc.Annotations[annBackendHash] = lastBackendHash
+	svc.Annotations[annBackendHash] = portObserved[servicePortKey(stack.Ports[0])].BackendHash
+	if err := writeServicePortObserved(svc.Annotations, portObserved); err != nil {
+		return ctrl.Result{}, err
 	}
 	if err := r.Patch(ctx, svc, client.MergeFrom(base)); err != nil {
 		return ctrl.Result{}, err
@@ -362,16 +397,7 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	return ctrl.Result{}, nil
 }
 
-func (r *serviceReconciler) ensureCMPResources(ctx context.Context, svc *corev1.Service, frontendPort, nodePort int32, backends []backendNode, protocol string, cfg lbServiceConfig) (*f5client.CMPResourceIDs, string, string, error) {
-	current := model.ObservedState{}
-	currentHash := ""
-	if svc != nil && svc.Annotations != nil {
-		current.LBServiceID = strings.TrimSpace(svc.Annotations[annLBServiceID])
-		current.VIPPortID = strings.TrimSpace(svc.Annotations[annVIPPortID])
-		current.VirtualServerID = strings.TrimSpace(svc.Annotations[annVirtualServerID])
-		current.VIPAddress = strings.TrimSpace(svc.Annotations[annVIPAddress])
-		currentHash = strings.TrimSpace(svc.Annotations[annBackendHash])
-	}
+func (r *serviceReconciler) ensureCMPResourcesWithCurrent(ctx context.Context, svc *corev1.Service, frontendPort, nodePort int32, backends []backendNode, protocol string, cfg lbServiceConfig, current model.ObservedState, currentHash string) (*f5client.CMPResourceIDs, string, string, error) {
 
 	members := make([]model.BackendMember, 0, len(backends))
 	for _, backend := range backends {
@@ -408,6 +434,36 @@ func (r *serviceReconciler) ensureCMPResources(ctx context.Context, svc *corev1.
 		VirtualServerName: result.Observed.VirtualServerName,
 	}
 	return ids, result.Observed.VIPAddress, result.BackendHash, nil
+}
+
+type servicePortObserved struct {
+	VirtualServerID   string `json:"virtualServerID"`
+	VirtualServerName string `json:"virtualServerName,omitempty"`
+	BackendHash       string `json:"backendHash"`
+}
+
+func servicePortKey(port model.ServicePort) string {
+	return fmt.Sprintf("%s/%d/%s", strings.TrimSpace(port.Name), port.FrontendPort, strings.ToLower(strings.TrimSpace(port.Protocol)))
+}
+
+func readServicePortObserved(annotations map[string]string) map[string]servicePortObserved {
+	observed := map[string]servicePortObserved{}
+	if annotations == nil || strings.TrimSpace(annotations[annObservedPorts]) == "" {
+		return observed
+	}
+	if err := json.Unmarshal([]byte(annotations[annObservedPorts]), &observed); err != nil {
+		return map[string]servicePortObserved{}
+	}
+	return observed
+}
+
+func writeServicePortObserved(annotations map[string]string, observed map[string]servicePortObserved) error {
+	b, err := json.Marshal(observed)
+	if err != nil {
+		return fmt.Errorf("marshalling per-port observed state: %w", err)
+	}
+	annotations[annObservedPorts] = string(b)
+	return nil
 }
 
 func desiredLBServiceName(svc *corev1.Service) string {

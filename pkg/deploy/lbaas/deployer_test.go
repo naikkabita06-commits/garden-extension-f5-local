@@ -102,7 +102,7 @@ func TestEnsureCreatesLBVIPAndVirtualServer(t *testing.T) {
 func TestEnsureSkipsVirtualServerWhenBackendHashMatches(t *testing.T) {
 	backends := []model.BackendMember{{IP: "10.0.0.1", Port: 30080, Weight: 50}}
 	hash := DesiredBackendHash(80, 30080, backends)
-	stub := &stubClient{}
+	stub := &stubClient{lbServices: []LBService{{ID: "lb-1", Name: "lb"}}, vips: []VIP{{ID: "7", Address: "10.0.0.7"}}}
 	res, err := New(stub, "").Ensure(context.Background(), EnsureRequest{
 		VirtualServer: model.VirtualServer{Name: "vs", FrontendPort: 80, BackendNodePort: 30080, Protocol: "HTTP"},
 		Backends:      backends,
@@ -118,7 +118,7 @@ func TestEnsureSkipsVirtualServerWhenBackendHashMatches(t *testing.T) {
 }
 
 func TestEnsurePreservesExistingVirtualServerWhenHashIsNotManaged(t *testing.T) {
-	stub := &stubClient{}
+	stub := &stubClient{lbServices: []LBService{{ID: "lb-1", Name: "lb"}}, vips: []VIP{{ID: "7", Address: "10.0.0.7"}}}
 	res, err := New(stub, "").Ensure(context.Background(), EnsureRequest{
 		VirtualServer: model.VirtualServer{Name: "vs", FrontendPort: 80, BackendNodePort: 30080, Protocol: "HTTP"},
 		Backends:      []model.BackendMember{{IP: "10.0.0.1", Port: 30080, Weight: 50}},
@@ -133,7 +133,7 @@ func TestEnsurePreservesExistingVirtualServerWhenHashIsNotManaged(t *testing.T) 
 }
 
 func TestEnsureRecreatesExistingVirtualServerWhenHashIsManagedButMissing(t *testing.T) {
-	stub := &stubClient{}
+	stub := &stubClient{lbServices: []LBService{{ID: "lb-1", Name: "lb"}}, vips: []VIP{{ID: "7", Address: "10.0.0.7"}}}
 	res, err := New(stub, "").Ensure(context.Background(), EnsureRequest{
 		VirtualServer:           model.VirtualServer{Name: "vs", FrontendPort: 80, BackendNodePort: 30080, Protocol: "HTTP"},
 		Backends:                []model.BackendMember{{IP: "10.0.0.1", Port: 30080, Weight: 50}},

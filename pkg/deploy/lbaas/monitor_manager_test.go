@@ -59,3 +59,36 @@ func TestMonitorManagerCleanupIgnoresMissingIDs(t *testing.T) {
 		t.Fatalf("expected no delete, got %q", client.deleted)
 	}
 }
+
+func TestMonitorManagerEnsureNoopsWhenUnchanged(t *testing.T) {
+	client := &stubMonitorClient{monitors: []MonitorResource{{ID: "mon-1", Name: "web", Protocol: "HTTP", Path: "/healthz", Interval: 15}}}
+	res, changed, err := NewMonitorManager(client).Ensure(context.Background(), "lb-1", "vs-1", "pool-1", &model.Monitor{Name: "web", Type: "http", Path: "/healthz", Interval: 15})
+	if err != nil {
+		t.Fatalf("Ensure failed: %v", err)
+	}
+	if changed || res.ID != "mon-1" || len(client.updated) != 0 || len(client.created) != 0 {
+		t.Fatalf("expected no-op, changed=%t res=%#v created=%#v updated=%#v", changed, res, client.created, client.updated)
+	}
+}
+
+func TestMonitorManagerEnsureDeletesWhenDesiredNil(t *testing.T) {
+	client := &stubMonitorClient{monitors: []MonitorResource{{ID: "mon-1", Name: "web"}}}
+	_, changed, err := NewMonitorManager(client).Ensure(context.Background(), "lb-1", "vs-1", "pool-1", nil)
+	if err != nil {
+		t.Fatalf("Ensure failed: %v", err)
+	}
+	if !changed || client.deleted != "mon-1" {
+		t.Fatalf("expected monitor delete, changed=%t deleted=%q", changed, client.deleted)
+	}
+}
+
+func TestMonitorManagerEnsureDeletesDuplicateMonitor(t *testing.T) {
+	client := &stubMonitorClient{monitors: []MonitorResource{{ID: "mon-1", Name: "web", Protocol: "http", Path: "/healthz", Interval: 15}, {ID: "mon-dup", Name: "web", Protocol: "http", Path: "/healthz", Interval: 15}}}
+	res, changed, err := NewMonitorManager(client).Ensure(context.Background(), "lb-1", "vs-1", "pool-1", &model.Monitor{Name: "web", Type: "http", Path: "/healthz", Interval: 15})
+	if err != nil {
+		t.Fatalf("Ensure failed: %v", err)
+	}
+	if !changed || res.ID != "mon-1" || client.deleted != "mon-dup" {
+		t.Fatalf("expected duplicate delete, changed=%t res=%#v deleted=%q", changed, res, client.deleted)
+	}
+}
