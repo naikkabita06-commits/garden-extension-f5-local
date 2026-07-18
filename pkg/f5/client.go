@@ -138,6 +138,7 @@ type Client interface {
 	SearchNetworkPortsByIP(ctx context.Context, ip string) ([]json.RawMessage, error)
 
 	// CMP LBaaS Virtual Server Pools/Members (v2.1)
+	ListLBVirtualServerPools(ctx context.Context, lbServiceID, vsID string) ([]json.RawMessage, error)
 	CreateLBVirtualServerPool(ctx context.Context, lbServiceID, vsID string, query url.Values) (json.RawMessage, error)
 	GetLBVirtualServerPool(ctx context.Context, lbServiceID, vsID, poolID string) (json.RawMessage, error)
 	DeleteLBVirtualServerPool(ctx context.Context, lbServiceID, vsID, poolID string) error
@@ -1093,6 +1094,18 @@ func (c *client) DeleteLBVirtualServer(ctx context.Context, lbServiceID, vsID st
 		return nil
 	}
 	return err
+}
+
+func (c *client) ListLBVirtualServerPools(ctx context.Context, lbServiceID, vsID string) ([]json.RawMessage, error) {
+	path, err := c.virtualServerPoolPath(lbServiceID, vsID, "")
+	if err != nil {
+		return nil, err
+	}
+	var out []json.RawMessage
+	if err := c.doRequest(ctx, http.MethodGet, c.lbPath(path), nil, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (c *client) CreateLBVirtualServerPool(ctx context.Context, lbServiceID, vsID string, query url.Values) (json.RawMessage, error) {

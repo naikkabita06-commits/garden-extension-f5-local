@@ -12,6 +12,7 @@ import (
 // pool/member reconciliation. It mirrors the swagger resource hierarchy under
 // /load-balancers/{lb_service_id}/virtual-servers/{virtual_server_id}/pools.
 type PoolClient interface {
+	ListPools(ctx context.Context, lbServiceID, virtualServerID string) ([]PoolResource, error)
 	CreatePool(ctx context.Context, lbServiceID, virtualServerID string, spec PoolSpec) (PoolResource, error)
 	GetPool(ctx context.Context, lbServiceID, virtualServerID, poolID string) (PoolResource, error)
 	DeletePool(ctx context.Context, lbServiceID, virtualServerID, poolID string) error
@@ -74,22 +75,41 @@ func (m *PoolManager) Ensure(ctx context.Context, lbServiceID, virtualServerID s
 	if strings.TrimSpace(desired.Name) == "" {
 		return PoolResource{}, false, fmt.Errorf("pool name must not be empty")
 	}
-	created, err := m.client.CreatePool(ctx, lbServiceID, virtualServerID, PoolSpec{Name: desired.Name, Monitor: desired.Monitor, Members: members})
+	existing, err := m.client.ListPools(ctx, lbServiceID, virtualServerID)
 	if err != nil {
-		return PoolResource{}, false, fmt.Errorf("creating pool %s on virtual server %s: %w", desired.Name, virtualServerID, err)
+		return PoolResource{}, false, fmt.Errorf("listing pools on virtual server %s: %w", virtualServerID, err)
 	}
-	convergedMembers, _, err := m.members.Ensure(ctx, lbServiceID, virtualServerID, created.ID, created.Members, members)
-	if err != nil {
-		return created, true, err
-	}
-	created.Members = convergedMembers
-	if setDefault {
-		if err := m.client.SetDefaultPool(ctx, lbServiceID, virtualServerID, created.ID); err != nil {
-			return created, true, fmt.Errorf("setting pool %s as default on virtual server %s: %w", created.ID, virtualServerID, err)
+	var pool PoolResource
+	for _, candidate := range existing {
+		if strings.EqualFold(strings.TrimSpace(candidate.Name), strings.TrimSpace(desired.Name)) {
+			if strings.TrimSpace(pool.ID) != "" {
+				return PoolResource{}, false, fmt.Errorf("ambiguous CMP pools named %q on virtual server %s", desired.Name, virtualServerID)
+			}
+			pool = candidate
 		}
-		created.IsDefault = true
 	}
-	return created, true, nil
+	changed := false
+	if strings.TrimSpace(pool.ID) == "" {
+		pool, err = m.client.CreatePool(ctx, lbServiceID, virtualServerID, PoolSpec{Name: desired.Name, Monitor: desired.Monitor, Members: members})
+		if err != nil {
+			return PoolResource{}, false, fmt.Errorf("creating pool %s on virtual server %s: %w", desired.Name, virtualServerID, err)
+		}
+		changed = true
+	}
+	convergedMembers, membersChanged, err := m.members.Ensure(ctx, lbServiceID, virtualServerID, pool.ID, pool.Members, members)
+	if err != nil {
+		return pool, changed, err
+	}
+	pool.Members = convergedMembers
+	changed = changed || membersChanged
+	if setDefault && !pool.IsDefault {
+		if err := m.client.SetDefaultPool(ctx, lbServiceID, virtualServerID, pool.ID); err != nil {
+			return pool, changed, fmt.Errorf("setting pool %s as default on virtual server %s: %w", pool.ID, virtualServerID, err)
+		}
+		pool.IsDefault = true
+		changed = true
+	}
+	return pool, changed, nil
 }
 
 func (m *PoolManager) Cleanup(ctx context.Context, lbServiceID, virtualServerID, poolID string) error {

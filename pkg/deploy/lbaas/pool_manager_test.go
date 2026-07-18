@@ -8,6 +8,7 @@ import (
 )
 
 type stubPoolClient struct {
+	pools            []PoolResource
 	createdPools     []PoolSpec
 	createdMembers   []PoolMemberSpec
 	updatedMembers   []PoolMemberSpec
@@ -16,9 +17,14 @@ type stubPoolClient struct {
 	deletedPoolID    string
 }
 
+func (s *stubPoolClient) ListPools(context.Context, string, string) ([]PoolResource, error) {
+	return append([]PoolResource(nil), s.pools...), nil
+}
 func (s *stubPoolClient) CreatePool(_ context.Context, _, _ string, spec PoolSpec) (PoolResource, error) {
 	s.createdPools = append(s.createdPools, spec)
-	return PoolResource{ID: "pool-1", Name: spec.Name}, nil
+	pool := PoolResource{ID: "pool-1", Name: spec.Name}
+	s.pools = append(s.pools, pool)
+	return pool, nil
 }
 func (s *stubPoolClient) GetPool(context.Context, string, string, string) (PoolResource, error) {
 	return PoolResource{}, nil
@@ -71,5 +77,24 @@ func TestPoolManagerCleanupIgnoresMissingIDs(t *testing.T) {
 	}
 	if client.deletedPoolID != "" {
 		t.Fatalf("expected no delete, got %q", client.deletedPoolID)
+	}
+}
+
+func TestPoolManagerEnsureReusesUniqueObservedPool(t *testing.T) {
+	client := &stubPoolClient{pools: []PoolResource{{ID: "pool-1", Name: "pool-web", Members: []PoolMemberResource{{ID: "member-1", ResourceID: "compute-1", ResourceType: "compute", ResourceIP: "10.0.0.1", BackendPortID: 5001, Port: 30080, Weight: 50}}}}}
+	res, changed, err := NewPoolManager(client).Ensure(context.Background(), "lb-1", "vs-1", model.Pool{Name: "pool-web"}, []PoolMemberSpec{{ResourceID: "compute-1", ResourceType: "compute", ResourceIP: "10.0.0.1", BackendPortID: 5001, Port: 30080, Weight: 50}}, false)
+	if err != nil {
+		t.Fatalf("Ensure failed: %v", err)
+	}
+	if changed || res.ID != "pool-1" || len(client.createdPools) != 0 {
+		t.Fatalf("expected existing pool reused without mutation, changed=%t result=%#v creates=%#v", changed, res, client.createdPools)
+	}
+}
+
+func TestPoolManagerEnsureRejectsAmbiguousObservedPool(t *testing.T) {
+	client := &stubPoolClient{pools: []PoolResource{{ID: "pool-1", Name: "pool-web"}, {ID: "pool-2", Name: "pool-web"}}}
+	_, _, err := NewPoolManager(client).Ensure(context.Background(), "lb-1", "vs-1", model.Pool{Name: "pool-web"}, nil, false)
+	if err == nil {
+		t.Fatal("expected ambiguous pools to fail")
 	}
 }
