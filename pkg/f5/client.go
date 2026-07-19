@@ -1464,21 +1464,19 @@ func (c *client) DeleteLBVirtualServerPoolMonitor(ctx context.Context, lbID, vsI
 	return err
 }
 func (c *client) ListLBVirtualServerRoutingRules(ctx context.Context, lbID, vsID string) ([]json.RawMessage, error) {
-	path, err := c.virtualServerPoolPath(lbID, vsID, "")
+	path, err := c.virtualServerRoutingRulePath(lbID, vsID)
 	if err != nil {
 		return nil, err
 	}
-	path = strings.TrimSuffix(path, "/pools") + "/routing-rules"
 	var out []json.RawMessage
 	err = c.doRequest(ctx, http.MethodGet, c.lbPath(path), nil, &out)
 	return out, err
 }
 func (c *client) CreateLBVirtualServerRoutingRule(ctx context.Context, lbID, vsID string, q url.Values) (json.RawMessage, error) {
-	path, err := c.virtualServerPoolPath(lbID, vsID, "")
+	path, err := c.virtualServerRoutingRulePath(lbID, vsID)
 	if err != nil {
 		return nil, err
 	}
-	path = strings.TrimSuffix(path, "/pools") + "/routing-rules"
 	if x := q.Encode(); x != "" {
 		path += "?" + x
 	}
@@ -1487,16 +1485,29 @@ func (c *client) CreateLBVirtualServerRoutingRule(ctx context.Context, lbID, vsI
 	return out, err
 }
 func (c *client) DeleteLBVirtualServerRoutingRule(ctx context.Context, lbID, vsID, ruleID string) error {
-	path, err := c.virtualServerPoolPath(lbID, vsID, "")
+	path, err := c.virtualServerRoutingRulePath(lbID, vsID)
 	if err != nil {
 		return err
 	}
 	if strings.TrimSpace(ruleID) == "" {
 		return fmt.Errorf("routing rule id must not be empty")
 	}
-	err = c.doRequest(ctx, http.MethodDelete, c.lbPath(strings.TrimSuffix(path, "/pools")+"/routing-rules/"+strings.TrimSpace(ruleID)), nil, nil)
+	err = c.doRequest(ctx, http.MethodDelete, c.lbPath(path+"/"+strings.TrimSpace(ruleID)), nil, nil)
 	if IsNotFound(err) {
 		return nil
 	}
 	return err
+}
+
+// virtualServerRoutingRulePath follows the distinct Swagger hierarchy for
+// routing rules, which is scoped below lb_service rather than load-balancers/{id}.
+func (c *client) virtualServerRoutingRulePath(lbServiceID, vsID string) (string, error) {
+	lbServiceID, vsID = strings.TrimSpace(lbServiceID), strings.TrimSpace(vsID)
+	if lbServiceID == "" {
+		return "", fmt.Errorf("lb service id must not be empty")
+	}
+	if vsID == "" {
+		return "", fmt.Errorf("virtual server id must not be empty")
+	}
+	return "/lb_service/" + lbServiceID + "/virtual-servers/" + vsID + "/routing-rules", nil
 }
