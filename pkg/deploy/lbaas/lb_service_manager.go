@@ -27,7 +27,9 @@ func (m *LBServiceManager) Ensure(ctx context.Context, req EnsureRequest, curren
 				return currentID, false, nil
 			}
 		}
-		return currentID, false, fmt.Errorf("annotated LB service %s was not found in CMP inventory", currentID)
+		// The graph is an observation, not a source of truth. A provider-side
+		// deletion must converge back to the desired named LBService.
+		currentID = ""
 	}
 	foundID, err := findUniqueLBServiceByName(items, req.LBName)
 	if err != nil {

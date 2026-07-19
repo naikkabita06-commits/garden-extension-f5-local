@@ -27,7 +27,9 @@ func (m *VIPManager) Ensure(ctx context.Context, lbServiceID, currentID, current
 				return currentID, address, address != currentAddress, nil
 			}
 		}
-		return currentID, currentAddress, false, fmt.Errorf("annotated VIP %s was not found on LB service %s", currentID, lbServiceID)
+		// A stale provider ID is drift, not a terminal annotation error. Retain
+		// the address only when it can safely identify the desired VIP below.
+		currentID = ""
 	}
 	if currentAddress != "" {
 		for _, vip := range vips {
@@ -35,7 +37,9 @@ func (m *VIPManager) Ensure(ctx context.Context, lbServiceID, currentID, current
 				return strings.TrimSpace(vip.ID), currentAddress, true, nil
 			}
 		}
-		return "", currentAddress, false, fmt.Errorf("annotated VIP address %s was not found on LB service %s", currentAddress, lbServiceID)
+		// The recorded address disappeared along with the provider VIP. Clear it
+		// and allocate a replacement only when no ambiguous VIP already exists.
+		currentAddress = ""
 	}
 	if len(vips) > 0 {
 		return "", "", false, fmt.Errorf("cannot adopt VIP for LB service %s without a stable VIP id/address; found %d existing VIP(s)", lbServiceID, len(vips))
