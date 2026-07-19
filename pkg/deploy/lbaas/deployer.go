@@ -164,6 +164,9 @@ func (d *Deployer) EnsureStack(ctx context.Context, req StackEnsureRequest) (*St
 	if len(req.Stack.RoutingRules) != 0 && d.routingRules == nil {
 		return nil, fmt.Errorf("routing-rule reconciliation requires a RoutingRuleManager")
 	}
+	if len(req.Stack.Certificates) != 0 {
+		return nil, fmt.Errorf("certificate reconciliation requires a CertificateManager")
+	}
 
 	observed := req.Current
 	observed.EnsureGraph()
