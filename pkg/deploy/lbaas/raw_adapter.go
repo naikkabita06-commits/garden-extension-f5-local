@@ -36,6 +36,12 @@ func NewFromRaw(raw RawClient, vpcID string) *Deployer {
 	if pools, ok := raw.(RawPoolClient); ok {
 		d.pools = NewPoolManager(NewPoolClientFromRaw(pools))
 	}
+	if monitors, ok := raw.(RawMonitorClient); ok {
+		d.monitors = NewMonitorManager(rawMonitorAdapter{raw: monitors})
+	}
+	if rules, ok := raw.(RawRoutingRuleClient); ok {
+		d.routingRules = NewRoutingRuleManager(rawRoutingRuleAdapter{raw: rules})
+	}
 	return d
 }
 
@@ -446,4 +452,113 @@ func inferResourceType(deviceOwner string) string {
 		return "baremetal"
 	}
 	return "compute"
+}
+
+// RawMonitorClient exposes the CMP pool-monitor endpoints. It is optional for
+// backwards-compatible clients, but NewFromRaw wires it whenever available.
+type RawMonitorClient interface {
+	ListLBVirtualServerPoolMonitors(context.Context, string, string, string) ([]json.RawMessage, error)
+	CreateLBVirtualServerPoolMonitor(context.Context, string, string, string, url.Values) (json.RawMessage, error)
+	UpdateLBVirtualServerPoolMonitor(context.Context, string, string, string, string, url.Values) (json.RawMessage, error)
+	DeleteLBVirtualServerPoolMonitor(context.Context, string, string, string, string) error
+}
+type rawMonitorAdapter struct{ raw RawMonitorClient }
+
+func (a rawMonitorAdapter) ListMonitors(ctx context.Context, lb, vs, pool string) ([]MonitorResource, error) {
+	items, err := a.raw.ListLBVirtualServerPoolMonitors(ctx, lb, vs, pool)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]MonitorResource, 0, len(items))
+	for _, item := range items {
+		if m := parseMonitor(item); m.ID != "" {
+			out = append(out, m)
+		}
+	}
+	return out, nil
+}
+func (a rawMonitorAdapter) CreateMonitor(ctx context.Context, lb, vs, pool string, spec MonitorSpec) (MonitorResource, error) {
+	raw, err := a.raw.CreateLBVirtualServerPoolMonitor(ctx, lb, vs, pool, monitorSpecQuery(spec))
+	if err != nil {
+		return MonitorResource{}, err
+	}
+	return parseMonitor(raw), nil
+}
+func (a rawMonitorAdapter) UpdateMonitor(ctx context.Context, lb, vs, pool, id string, spec MonitorSpec) (MonitorResource, error) {
+	raw, err := a.raw.UpdateLBVirtualServerPoolMonitor(ctx, lb, vs, pool, id, monitorSpecQuery(spec))
+	if err != nil {
+		return MonitorResource{}, err
+	}
+	return parseMonitor(raw), nil
+}
+func (a rawMonitorAdapter) DeleteMonitor(ctx context.Context, lb, vs, pool, id string) error {
+	return a.raw.DeleteLBVirtualServerPoolMonitor(ctx, lb, vs, pool, id)
+}
+func monitorSpecQuery(s MonitorSpec) url.Values {
+	q := url.Values{}
+	q.Set("name", s.Name)
+	q.Set("monitor_protocol", s.Protocol)
+	q.Set("path", s.Path)
+	if s.Interval > 0 {
+		q.Set("interval", fmt.Sprintf("%d", s.Interval))
+	}
+	return q
+}
+func parseMonitor(raw json.RawMessage) MonitorResource {
+	var m struct {
+		ID       string `json:"id"`
+		Name     string `json:"monitor_name"`
+		AltName  string `json:"name"`
+		Protocol string `json:"monitor_protocol"`
+		Path     string `json:"monitor_path"`
+		Interval int32  `json:"interval"`
+	}
+	if json.Unmarshal(raw, &m) != nil {
+		return MonitorResource{}
+	}
+	return MonitorResource{ID: strings.TrimSpace(m.ID), Name: firstNonEmpty(m.Name, m.AltName), Protocol: m.Protocol, Path: m.Path, Interval: m.Interval}
+}
+
+// RawRoutingRuleClient exposes CMP virtual-server routing-rule endpoints.
+type RawRoutingRuleClient interface {
+	ListLBVirtualServerRoutingRules(context.Context, string, string) ([]json.RawMessage, error)
+	CreateLBVirtualServerRoutingRule(context.Context, string, string, url.Values) (json.RawMessage, error)
+	DeleteLBVirtualServerRoutingRule(context.Context, string, string, string) error
+}
+type rawRoutingRuleAdapter struct{ raw RawRoutingRuleClient }
+
+func (a rawRoutingRuleAdapter) ListRoutingRules(ctx context.Context, lb, vs string) ([]RoutingRuleResource, error) {
+	items, err := a.raw.ListLBVirtualServerRoutingRules(ctx, lb, vs)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]RoutingRuleResource, 0, len(items))
+	for _, item := range items {
+		if r := parseRoutingRule(item); r.ID != "" {
+			out = append(out, r)
+		}
+	}
+	return out, nil
+}
+func (a rawRoutingRuleAdapter) CreateRoutingRule(ctx context.Context, lb, vs string, s RoutingRuleSpec) (RoutingRuleResource, error) {
+	q := url.Values{}
+	q.Set("host", s.Host)
+	q.Set("path", s.Path)
+	q.Set("match_type", s.MatchType)
+	q.Set("virtual_server_pool_id", s.PoolID)
+	raw, err := a.raw.CreateLBVirtualServerRoutingRule(ctx, lb, vs, q)
+	if err != nil {
+		return RoutingRuleResource{}, err
+	}
+	return parseRoutingRule(raw), nil
+}
+func (a rawRoutingRuleAdapter) DeleteRoutingRule(ctx context.Context, lb, vs, id string) error {
+	return a.raw.DeleteLBVirtualServerRoutingRule(ctx, lb, vs, id)
+}
+func parseRoutingRule(raw json.RawMessage) RoutingRuleResource {
+	var r RoutingRuleResource
+	if json.Unmarshal(raw, &r) != nil {
+		return RoutingRuleResource{}
+	}
+	return r
 }
