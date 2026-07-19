@@ -244,9 +244,12 @@ func TestDeleteObsoleteVirtualServersRemovesOnlyUndesiredListener(t *testing.T) 
 	observed.Graph.VirtualServers["keep"] = model.ObservedResource{LogicalID: "keep", ExternalID: "vs-keep"}
 	observed.Graph.VirtualServers["remove"] = model.ObservedResource{LogicalID: "remove", ExternalID: "vs-remove"}
 
-	err := deployer.deleteObsoleteVirtualServers(context.Background(), "lb-1", &observed, &model.LoadBalancerStack{VirtualServers: []model.VirtualServer{{Name: "keep"}}})
+	changed, err := deployer.deleteObsoleteVirtualServers(context.Background(), "lb-1", &observed, &model.LoadBalancerStack{VirtualServers: []model.VirtualServer{{Name: "keep"}}})
 	if err != nil {
 		t.Fatalf("deleteObsoleteVirtualServers: %v", err)
+	}
+	if !changed {
+		t.Fatal("expected obsolete virtual-server cleanup to report a change")
 	}
 	if stub.deletedVS != 1 {
 		t.Fatalf("expected one obsolete listener deletion, got %d", stub.deletedVS)

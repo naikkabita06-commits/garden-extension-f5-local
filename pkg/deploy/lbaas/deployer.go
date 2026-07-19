@@ -277,9 +277,11 @@ func (d *Deployer) EnsureStack(ctx context.Context, req StackEnsureRequest) (*St
 		return nil, err
 	}
 	changed = changed || poolsDeleted
-	if err := d.deleteObsoleteVirtualServers(ctx, lbID, &observed, req.Stack); err != nil {
+	virtualServersDeleted, err := d.deleteObsoleteVirtualServers(ctx, lbID, &observed, req.Stack)
+	if err != nil {
 		return nil, err
 	}
+	changed = changed || virtualServersDeleted
 	return &StackEnsureResult{Observed: observed, Changed: changed}, nil
 }
 
@@ -361,7 +363,8 @@ func dropMigratedLegacyAliases(observed *model.ObservedState) {
 // for this stack but are absent from the desired stack. Its child resources are
 // deleted first, avoiding orphaned pools and routing rules when a Service port
 // is removed.
-func (d *Deployer) deleteObsoleteVirtualServers(ctx context.Context, lbID string, observed *model.ObservedState, stack *model.LoadBalancerStack) error {
+func (d *Deployer) deleteObsoleteVirtualServers(ctx context.Context, lbID string, observed *model.ObservedState, stack *model.LoadBalancerStack) (bool, error) {
+	changed := false
 	desired := map[string]struct{}{}
 	for _, vs := range stack.VirtualServers {
 		desired[vs.Name] = struct{}{}
@@ -373,50 +376,55 @@ func (d *Deployer) deleteObsoleteVirtualServers(ctx context.Context, lbID string
 		for key, rule := range observed.Graph.RoutingRules {
 			if graphVirtualServerName(key) == name {
 				if d.routingRules == nil {
-					return fmt.Errorf("routing-rule cleanup requires a RoutingRuleManager")
+					return changed, fmt.Errorf("routing-rule cleanup requires a RoutingRuleManager")
 				}
 				if err := d.routingRules.Cleanup(ctx, lbID, resource.ExternalID, rule.ExternalID); err != nil {
-					return err
+					return changed, err
 				}
 				delete(observed.Graph.RoutingRules, key)
+				changed = true
 			}
 		}
 		for key, pool := range observed.Graph.Pools {
 			if graphVirtualServerName(key) == name {
 				if d.pools == nil {
-					return fmt.Errorf("pool cleanup requires a PoolManager")
+					return changed, fmt.Errorf("pool cleanup requires a PoolManager")
 				}
 				for memberKey, member := range observed.Graph.Members {
 					if graphPoolKey(memberKey) == key {
 						if err := d.pools.members.client.DeletePoolMember(ctx, lbID, resource.ExternalID, pool.ExternalID, member.ExternalID); err != nil {
-							return err
+							return changed, err
 						}
 						delete(observed.Graph.Members, memberKey)
+						changed = true
 					}
 				}
 				for monitorKey, monitor := range observed.Graph.Monitors {
 					if monitorKey == key {
 						if d.monitors == nil {
-							return fmt.Errorf("monitor cleanup requires a MonitorManager")
+							return changed, fmt.Errorf("monitor cleanup requires a MonitorManager")
 						}
 						if err := d.monitors.Cleanup(ctx, lbID, resource.ExternalID, pool.ExternalID, monitor.ExternalID); err != nil {
-							return err
+							return changed, err
 						}
 						delete(observed.Graph.Monitors, monitorKey)
+						changed = true
 					}
 				}
 				if err := d.pools.Cleanup(ctx, lbID, resource.ExternalID, pool.ExternalID); err != nil {
-					return err
+					return changed, err
 				}
 				delete(observed.Graph.Pools, key)
+				changed = true
 			}
 		}
 		if err := d.client.DeleteVirtualServer(ctx, lbID, resource.ExternalID); err != nil {
-			return err
+			return changed, err
 		}
 		delete(observed.Graph.VirtualServers, name)
+		changed = true
 	}
-	return nil
+	return changed, nil
 }
 
 func graphVirtualServerName(key string) string {
