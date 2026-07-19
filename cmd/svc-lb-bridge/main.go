@@ -542,7 +542,22 @@ func (r *serviceReconciler) isLBServiceShared(ctx context.Context, self *corev1.
 		if s.Name == self.Name && s.Namespace == self.Namespace {
 			continue
 		}
-		if s.Annotations[annLBServiceID] == lbID && controllerutil.ContainsFinalizer(&s, finalizerName) {
+		if !controllerutil.ContainsFinalizer(&s, finalizerName) {
+			continue
+		}
+		// Only a graph owned by this Service can retain a shared parent. A
+		// copied scalar annotation is not sufficient authority to block cleanup.
+		if graph, ok := readObservedGraph(s.Annotations); ok {
+			for _, parent := range graph.LBServices {
+				if parent.ExternalID == lbID && parent.Ownership.SourceKind == "Service" && parent.Ownership.SourceNamespace == s.Namespace && parent.Ownership.SourceName == s.Name && (parent.Ownership.SourceUID == "" || parent.Ownership.SourceUID == string(s.UID)) {
+					return true
+				}
+			}
+			continue
+		}
+		// Legacy objects have no graph ownership metadata; retain the existing
+		// scalar compatibility behavior until their next successful reconcile.
+		if s.Annotations[annLBServiceID] == lbID {
 			return true
 		}
 	}
