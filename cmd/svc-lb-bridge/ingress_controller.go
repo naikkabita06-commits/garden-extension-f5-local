@@ -85,6 +85,30 @@ func (r *ingressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// Handle deletion.
 	if !ing.DeletionTimestamp.IsZero() {
 		if controllerutil.ContainsFinalizer(ing, ingressFinalizerName) {
+			// A group member leaving must first converge the graph built from the
+			// remaining members. Deleting the departing member's stored graph
+			// directly would remove routes and pools still needed by the group.
+			remaining, err := r.remainingGroupMembers(ctx, ing)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			if len(remaining) > 0 {
+				stack, err := lbingress.BuildGroupLoadBalancerStack(remaining, parseIngressConfig(remaining[0]), lbingress.GroupStackBuildOptions{BackendResolver: r.resolveGroupBackend(ctx)})
+				if err != nil {
+					return ctrl.Result{}, fmt.Errorf("building remaining ingress group: %w", err)
+				}
+				ids, vip, graph, err := r.ensureCMPResources(ctx, ing, stack)
+				if err != nil {
+					return ctrl.Result{}, fmt.Errorf("reconciling remaining ingress group: %w", err)
+				}
+				if err := r.persistGroupObserved(ctx, remaining, ids, vip, graph); err != nil {
+					return ctrl.Result{}, err
+				}
+				if _, err := lbfinalizers.Remove(ctx, r.Client, ing, ingressFinalizerName); err != nil {
+					return ctrl.Result{}, err
+				}
+				return ctrl.Result{}, nil
+			}
 			log.Info("cleaning up CMP LBaaS resources for Ingress")
 			r.Recorder.Eventf(ing, corev1.EventTypeNormal, "DeletingLoadBalancer", "Deleting CMP LBaaS resources for Ingress (LB=%s)", ing.Annotations[annIngressLBServiceID])
 			if err := r.cleanupCMPResources(ctx, ing); err != nil {
@@ -109,50 +133,25 @@ func (r *ingressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		f5metrics.ManagedServicesTotal.WithLabelValues("ingress-lb").Inc()
 	}
 
-	if err := lbingress.ValidateSupported(ing); err != nil {
-		log.Info("skipping unsupported Ingress", "reason", err)
-		r.Recorder.Eventf(ing, corev1.EventTypeWarning, "UnsupportedIngress", "Unsupported F5 Ingress configuration: %v", err)
-		return ctrl.Result{}, nil
+	// Reconcile the entire IngressGroup, not the single event object. Persisting
+	// the resulting graph on every member makes any member a safe restart point.
+	all := &networkingv1.IngressList{}
+	if err := r.List(ctx, all, client.InNamespace(ing.Namespace)); err != nil {
+		return ctrl.Result{}, err
 	}
-
-	// Determine protocol: HTTPS if TLS is configured, HTTP otherwise.
-	protocol := lbingress.ProtocolForIngress(ing)
-
-	// Resolve the backend NodePort from the first rule's service.
-	backendSvc, nodePort, err := r.resolveBackendServiceAndNodePort(ctx, ing)
-	if err != nil {
-		log.Error(err, "cannot resolve backend NodePort")
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
-	}
-	if nodePort == 0 {
-		log.Info("skipping: no backend service with NodePort found")
-		return ctrl.Result{}, nil
-	}
-
-	// Collect backend nodes (only ready nodes with ready endpoints, weighted by pod count).
-	var backends []backendNode
-	if backendSvc != nil {
-		backends, err = lbbackend.ListReadyNodeBackends(ctx, r.Client, backendSvc)
-	} else {
-		backends, err = lbbackend.ListReadyNodeBackends(ctx, r.Client, nil)
-	}
+	members, _, err := lbingress.ResolveGroup(ing, all.Items)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if len(backends) == 0 {
-		log.Info("skipping: no ready nodes with endpoints found")
-		return ctrl.Result{}, nil
+	groupMembers := make([]*networkingv1.Ingress, 0, len(members))
+	for _, member := range members {
+		if r.isOwnedIngress(member) && member.DeletionTimestamp.IsZero() {
+			groupMembers = append(groupMembers, member)
+		}
 	}
-
-	// Determine frontend port.
-	frontendPort := lbingress.FrontendPortForProtocol(protocol)
-
-	// Parse per-Ingress LB configuration from annotations and build desired state.
 	ingressCfg := parseIngressConfig(ing)
-	stack, err := lbingress.BuildLoadBalancerStack(ing, ingressCfg, backends, lbingress.BuildOptions{
-		FrontendPort: frontendPort,
-		BackendPort:  nodePort,
-		Protocol:     protocol,
+	stack, err := lbingress.BuildGroupLoadBalancerStack(groupMembers, ingressCfg, lbingress.GroupStackBuildOptions{
+		BackendResolver: r.resolveGroupBackend(ctx),
 	})
 	if err != nil {
 		r.Recorder.Eventf(ing, corev1.EventTypeWarning, "BuildLoadBalancerModelFailed", "Error building Ingress load-balancer model: %v", err)
@@ -176,30 +175,35 @@ func (r *ingressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 	f5metrics.CMPAPICallsTotal.WithLabelValues("ingress-lb", "EnsureLB", "success").Inc()
 
-	// Store CMP resource IDs in annotations.
-	base := ing.DeepCopy()
-	if ing.Annotations == nil {
-		ing.Annotations = map[string]string{}
-	}
-	ing.Annotations[annIngressLBServiceID] = ids.LBServiceID
-	ing.Annotations[annIngressVIPPortID] = ids.VIPPortID
-	ing.Annotations[annIngressVSID] = ids.VirtualServerID
-	ing.Annotations[annIngressVIPAddress] = vip
-	if err := writeObservedGraph(ing.Annotations, graph); err != nil {
-		return ctrl.Result{}, err
-	}
-	if err := r.Patch(ctx, ing, client.MergeFrom(base)); err != nil {
+	if err := r.persistGroupObserved(ctx, groupMembers, ids, vip, graph); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// Update Ingress status with VIP.
-	if err := lbstatus.EnsureIngressVIP(ctx, r.Client, ing, vip); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	log.Info("Ingress reconciled", "vip", vip, "protocol", protocol)
-	r.Recorder.Eventf(ing, corev1.EventTypeNormal, "EnsuredLoadBalancer", "Ingress reconciled via CMP LBaaS (VIP=%s, protocol=%s, backends=%d)", vip, protocol, len(backends))
+	log.Info("Ingress group reconciled", "vip", vip, "members", len(groupMembers))
+	r.Recorder.Eventf(ing, corev1.EventTypeNormal, "EnsuredLoadBalancer", "Ingress group reconciled via CMP LBaaS (VIP=%s, members=%d)", vip, len(groupMembers))
 	return ctrl.Result{}, nil
+}
+
+// remainingGroupMembers returns live F5 Ingresses sharing the departing
+// object's group. It intentionally ignores foreign Ingress classes: they are
+// not safe ownership references for an F5-managed frontend.
+func (r *ingressReconciler) remainingGroupMembers(ctx context.Context, departing *networkingv1.Ingress) ([]*networkingv1.Ingress, error) {
+	items := &networkingv1.IngressList{}
+	if err := r.List(ctx, items, client.InNamespace(departing.Namespace)); err != nil {
+		return nil, err
+	}
+	group := lbingress.GroupName(departing)
+	members := make([]*networkingv1.Ingress, 0)
+	for i := range items.Items {
+		candidate := &items.Items[i]
+		if candidate.Name == departing.Name || !candidate.DeletionTimestamp.IsZero() || !r.isOwnedIngress(candidate) {
+			continue
+		}
+		if group == "" || lbingress.GroupName(candidate) == group {
+			members = append(members, candidate)
+		}
+	}
+	return members, nil
 }
 
 // isOwnedIngress checks if this Ingress should be handled by the F5 controller.
@@ -262,6 +266,55 @@ func (r *ingressReconciler) getServiceAndNodePort(ctx context.Context, namespace
 	return svc, 0, fmt.Errorf("service %s/%s has no port matching ingress backend port name=%q number=%d", namespace, name, port.Name, port.Number)
 }
 
+// resolveGroupBackend supplies the model builder with a backend set per
+// ServicePort. ListReadyNodeBackends applies EndpointSlice readiness and
+// traffic-policy filtering, so pools contain only eligible nodes.
+func (r *ingressReconciler) resolveGroupBackend(ctx context.Context) func(string, networkingv1.IngressServiceBackend) (lbingress.BackendSet, error) {
+	return func(namespace string, backend networkingv1.IngressServiceBackend) (lbingress.BackendSet, error) {
+		svc, nodePort, err := r.getServiceAndNodePort(ctx, namespace, backend.Name, backend.Port)
+		if err != nil {
+			return lbingress.BackendSet{}, err
+		}
+		if svc == nil {
+			return lbingress.BackendSet{}, fmt.Errorf("backend service %s/%s was not found", namespace, backend.Name)
+		}
+		if nodePort == 0 {
+			return lbingress.BackendSet{}, fmt.Errorf("BackendNodePortRequired: backend service %s/%s", namespace, backend.Name)
+		}
+		nodes, err := lbbackend.ListReadyNodeBackends(ctx, r.Client, svc)
+		if err != nil {
+			return lbingress.BackendSet{}, err
+		}
+		return lbingress.BackendSet{NodePort: nodePort, Nodes: nodes}, nil
+	}
+}
+
+// persistGroupObserved mirrors provider identifiers and status to every live
+// group member. This allows reconciliation to resume from any member after a
+// controller restart and ensures users see one consistent group frontend.
+func (r *ingressReconciler) persistGroupObserved(ctx context.Context, members []*networkingv1.Ingress, ids *f5client.CMPResourceIDs, vip string, graph model.ObservedGraph) error {
+	for _, member := range members {
+		base := member.DeepCopy()
+		if member.Annotations == nil {
+			member.Annotations = map[string]string{}
+		}
+		member.Annotations[annIngressLBServiceID] = ids.LBServiceID
+		member.Annotations[annIngressVIPPortID] = ids.VIPPortID
+		member.Annotations[annIngressVSID] = ids.VirtualServerID
+		member.Annotations[annIngressVIPAddress] = vip
+		if err := writeObservedGraph(member.Annotations, graph); err != nil {
+			return err
+		}
+		if err := r.Patch(ctx, member, client.MergeFrom(base)); err != nil {
+			return err
+		}
+		if err := lbstatus.EnsureIngressVIP(ctx, r.Client, member, vip); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (r *ingressReconciler) ensureCMPResources(ctx context.Context, ing *networkingv1.Ingress, stack *model.LoadBalancerStack) (*f5client.CMPResourceIDs, string, model.ObservedGraph, error) {
 	current := model.ObservedState{}
 	if ing != nil && ing.Annotations != nil {
@@ -270,7 +323,7 @@ func (r *ingressReconciler) ensureCMPResources(ctx context.Context, ing *network
 		current.VirtualServerID = strings.TrimSpace(ing.Annotations[annIngressVSID])
 		current.VIPAddress = strings.TrimSpace(ing.Annotations[annIngressVIPAddress])
 	}
-	if stack == nil || len(stack.VirtualServers) == 0 || len(stack.Ports) == 0 {
+	if stack == nil || len(stack.VirtualServers) == 0 {
 		return nil, current.VIPAddress, current.Graph, fmt.Errorf("ingress load-balancer stack is empty")
 	}
 	if graph, ok := readObservedGraph(ing.Annotations); ok {
@@ -320,7 +373,11 @@ func (r *ingressReconciler) isLBServiceShared(ctx context.Context, self *network
 		}
 		if graph, ok := readObservedGraph(ing.Annotations); ok {
 			for _, parent := range graph.LBServices {
-				if parent.ExternalID == lbID && parent.Ownership.SourceKind == "Ingress" && parent.Ownership.SourceNamespace == ing.Namespace && parent.Ownership.SourceName == ing.Name && (parent.Ownership.SourceUID == "" || parent.Ownership.SourceUID == string(ing.UID)) {
+				// Group graphs are intentionally owned by the synthetic
+				// IngressGroup, so every live member with the same group graph is
+				// a reference. Legacy per-Ingress graphs retain their stricter
+				// source-object ownership check.
+				if parent.ExternalID == lbID && ((parent.Ownership.SourceKind == "IngressGroup" && parent.Ownership.SharedGroup == lbingress.GroupName(self)) || (parent.Ownership.SourceKind == "Ingress" && parent.Ownership.SourceNamespace == ing.Namespace && parent.Ownership.SourceName == ing.Name && (parent.Ownership.SourceUID == "" || parent.Ownership.SourceUID == string(ing.UID)))) {
 					return true
 				}
 			}
