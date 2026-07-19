@@ -125,10 +125,10 @@ func (m *VirtualServerManager) create(ctx context.Context, lbServiceID, vipPortI
 	if strings.TrimSpace(created.ID) != "" {
 		return strings.TrimSpace(created.ID), nil
 	}
-	if strings.TrimSpace(created.Name) != "" {
-		return strings.TrimSpace(created.Name), nil
-	}
-	return vs.Name, nil
+	// A successful asynchronous response without a provider ID cannot be
+	// represented as an observed resource. Do not fabricate an ID from a name;
+	// callers must requeue and rediscover through a documented provider ID.
+	return "", fmt.Errorf("CMP created virtual server %q without a provider id", vs.Name)
 }
 
 func (m *VirtualServerManager) poolMemberSpecs(ctx context.Context, backends []model.BackendMember) ([]PoolMemberSpec, error) {

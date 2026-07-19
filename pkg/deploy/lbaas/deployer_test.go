@@ -18,6 +18,7 @@ type stubClient struct {
 	createdLB          int
 	createdVIP         int
 	createdVS          int
+	createdVSResult    *VirtualServer
 	deletedVS          int
 	deletedVIP         int
 	deletedLB          int
@@ -54,6 +55,9 @@ func (s *stubClient) ListVirtualServers(context.Context, string) ([]VirtualServe
 func (s *stubClient) CreateVirtualServer(_ context.Context, _ string, spec VirtualServerSpec) (VirtualServer, error) {
 	s.createdVS++
 	s.lastVSSpec = spec
+	if s.createdVSResult != nil {
+		return *s.createdVSResult, nil
+	}
 	return VirtualServer{ID: "vs-1", Name: spec.Name}, nil
 }
 func (s *stubClient) DeleteVirtualServer(context.Context, string, string) error {
@@ -292,5 +296,20 @@ func TestEnsureRejectsAmbiguousBackendNetworkPortIdentity(t *testing.T) {
 	_, err := New(stub, "").Ensure(context.Background(), EnsureRequest{VirtualServer: model.VirtualServer{Name: "vs", FrontendPort: 80, BackendNodePort: 30080}, Backends: []model.BackendMember{{IP: "10.0.0.1", Port: 30080}}})
 	if err == nil || !strings.Contains(err.Error(), "ambiguous CMP network ports") {
 		t.Fatalf("expected ambiguous identity error, got %v", err)
+	}
+}
+
+func TestEnsureRejectsVirtualServerCreateWithoutProviderID(t *testing.T) {
+	stub := &stubClient{createdVSResult: &VirtualServer{Name: "vs"}}
+	_, err := New(stub, "").Ensure(context.Background(), EnsureRequest{VirtualServer: model.VirtualServer{Name: "vs", FrontendPort: 80, BackendNodePort: 30080}, Backends: []model.BackendMember{{IP: "10.0.0.1", Port: 30080}}})
+	if err == nil || !strings.Contains(err.Error(), "without a provider id") {
+		t.Fatalf("expected missing provider ID error, got %v", err)
+	}
+}
+
+func TestEnsureStackRejectsCertificatesUntilCertificateManagerExists(t *testing.T) {
+	_, err := New(&stubClient{}, "").EnsureStack(context.Background(), StackEnsureRequest{Stack: &model.LoadBalancerStack{VirtualServers: []model.VirtualServer{{Name: "vs"}}, Certificates: []model.Certificate{{Name: "tls"}}}})
+	if err == nil || !strings.Contains(err.Error(), "CertificateManager") {
+		t.Fatalf("expected certificate manager error, got %v", err)
 	}
 }

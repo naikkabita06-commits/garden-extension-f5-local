@@ -94,6 +94,9 @@ func (m *PoolManager) Ensure(ctx context.Context, lbServiceID, virtualServerID s
 		if err != nil {
 			return PoolResource{}, false, fmt.Errorf("creating pool %s on virtual server %s: %w", desired.Name, virtualServerID, err)
 		}
+		if strings.TrimSpace(pool.ID) == "" {
+			return PoolResource{}, false, fmt.Errorf("CMP created pool %q without a provider id", desired.Name)
+		}
 		changed = true
 	}
 	convergedMembers, membersChanged, err := m.members.Ensure(ctx, lbServiceID, virtualServerID, pool.ID, pool.Members, members)

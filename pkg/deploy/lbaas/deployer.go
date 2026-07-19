@@ -148,9 +148,9 @@ func NewWithResourceManagers(client Client, vpcID string, pools PoolClient, moni
 }
 
 // EnsureStack reconciles LB service, VIP, virtual servers, pools, monitors,
-// members, and routing rules in dependency order. Certificate references are
-// preserved in the desired model; TLS termination remains compatible with the
-// existing CMP virtual-server path until CertificateManager is introduced.
+// members, and routing rules in dependency order. A stack that carries TLS
+// certificates must not be reported as successfully provisioned until a
+// CertificateManager can upload and bind them through the Swagger endpoint.
 func (d *Deployer) EnsureStack(ctx context.Context, req StackEnsureRequest) (*StackEnsureResult, error) {
 	if req.Stack == nil {
 		return nil, fmt.Errorf("load-balancer stack must not be nil")
