@@ -59,6 +59,10 @@ const (
 	// annObservedGraph persists the complete provider graph. Scalar annotations
 	// remain migration compatibility mirrors for older consumers.
 	annObservedGraph = "f5.extensions.gardener.cloud/observed-graph"
+	// annObservedGeneration records the Service generation for which the
+	// complete provider graph has converged. It is intentionally separate from
+	// legacy scalar IDs so status consumers can distinguish stale success.
+	annObservedGeneration = "f5.extensions.gardener.cloud/observed-generation"
 
 	// User-facing input annotations for per-Service LB configuration.
 	// These override global defaults from F5LoadBalancerConfig CRD.
@@ -289,7 +293,15 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 	stack, err := lbservice.BuildLoadBalancerStack(svc, lbCfg, backends)
 	if err != nil {
-		log.Info("skipping: cannot build desired load-balancer stack", "reason", err.Error())
+		// Validation failures are actionable configuration errors, not a silent
+		// no-op. Keep the object unmanaged until it is corrected, but surface a
+		// stable reason in the Kubernetes event stream.
+		reason := "InvalidLoadBalancerService"
+		if strings.Contains(err.Error(), "BackendNodePortRequired") {
+			reason = "BackendNodePortRequired"
+		}
+		r.Recorder.Eventf(svc, corev1.EventTypeWarning, reason, "%v", err)
+		log.Info("cannot build desired load-balancer stack", "reason", reason, "error", err)
 		return ctrl.Result{}, nil
 	}
 
@@ -366,6 +378,7 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err := writeObservedGraph(svc.Annotations, shared.Graph); err != nil {
 		return ctrl.Result{}, err
 	}
+	svc.Annotations[annObservedGeneration] = fmt.Sprintf("%d", svc.Generation)
 	if err := r.Patch(ctx, svc, client.MergeFrom(base)); err != nil {
 		return ctrl.Result{}, err
 	}

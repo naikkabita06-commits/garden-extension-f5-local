@@ -234,6 +234,9 @@ func TestReconcile_AllocatesVIPAndProgramsCMPVirtualServer(t *testing.T) {
 	if strings.TrimSpace(gotSvc.Annotations[annBackendHash]) == "" {
 		t.Fatalf("expected backend-hash annotation to be set")
 	}
+	if gotSvc.Annotations[annObservedGeneration] != "0" {
+		t.Fatalf("expected observed generation annotation, got %q", gotSvc.Annotations[annObservedGeneration])
+	}
 	if len(gotSvc.Status.LoadBalancer.Ingress) != 1 || gotSvc.Status.LoadBalancer.Ingress[0].IP != "10.0.0.10" {
 		t.Fatalf("expected service status vip, got %#v", gotSvc.Status.LoadBalancer.Ingress)
 	}
