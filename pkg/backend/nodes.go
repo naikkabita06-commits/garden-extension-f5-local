@@ -121,3 +121,75 @@ func nodesWithReadyEndpoints(ctx context.Context, c client.Client, svc *corev1.S
 	}
 	return nodes
 }
+
+// ListReadyNodeBackendsForPort returns ready backend nodes that have ready
+// EndpointSlice endpoints for one Service port. It is the port-aware variant
+// used by multi-port Service reconciliation; unrelated endpoint ports cannot
+// accidentally populate another listener's pool.
+func ListReadyNodeBackendsForPort(ctx context.Context, c client.Client, svc *corev1.Service, servicePort corev1.ServicePort) ([]Node, error) {
+	targetNodes := nodesWithReadyEndpointsForPort(ctx, c, svc, servicePort)
+	if svc != nil && svc.Spec.ExternalTrafficPolicy == corev1.ServiceExternalTrafficPolicyTypeLocal && len(targetNodes) == 0 {
+		return nil, nil
+	}
+	if len(targetNodes) == 0 {
+		// Cluster policy retains the established ready-node fallback when a
+		// cluster does not publish EndpointSlices.
+		return ListReadyNodeBackends(ctx, c, svc)
+	}
+	nl := &corev1.NodeList{}
+	if err := c.List(ctx, nl); err != nil {
+		return nil, err
+	}
+	out := make([]Node, 0, len(targetNodes))
+	for i := range nl.Items {
+		n := &nl.Items[i]
+		if !IsNodeReady(n) {
+			continue
+		}
+		count, ok := targetNodes[n.Name]
+		if !ok {
+			continue
+		}
+		if ip := InternalIP(n); ip != "" {
+			out = append(out, Node{IP: ip, Weight: count * 50})
+		}
+	}
+	return out, nil
+}
+
+func nodesWithReadyEndpointsForPort(ctx context.Context, c client.Client, svc *corev1.Service, servicePort corev1.ServicePort) map[string]int {
+	if svc == nil {
+		return nil
+	}
+	epsList := &discoveryv1.EndpointSliceList{}
+	sel := labels.SelectorFromSet(labels.Set{discoveryv1.LabelServiceName: svc.Name})
+	if err := c.List(ctx, epsList, &client.ListOptions{Namespace: svc.Namespace, LabelSelector: sel}); err != nil {
+		return nil
+	}
+	nodes := map[string]int{}
+	for i := range epsList.Items {
+		slice := &epsList.Items[i]
+		portMatches := false
+		for _, p := range slice.Ports {
+			if servicePort.Name != "" && p.Name != nil && *p.Name == servicePort.Name {
+				portMatches = true
+			}
+			if servicePort.Name == "" && p.Port != nil && *p.Port == servicePort.Port {
+				portMatches = true
+			}
+		}
+		if !portMatches {
+			continue
+		}
+		for j := range slice.Endpoints {
+			ep := &slice.Endpoints[j]
+			if ep.Conditions.Ready != nil && !*ep.Conditions.Ready {
+				continue
+			}
+			if ep.NodeName != nil && *ep.NodeName != "" {
+				nodes[*ep.NodeName]++
+			}
+		}
+	}
+	return nodes
+}

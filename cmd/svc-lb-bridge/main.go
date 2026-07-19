@@ -283,15 +283,15 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	// Build a typed desired-state snapshot before mutating CMP resources.
 	lbCfg := parseLBServiceConfig(svc)
-	backends, err := lbbackend.ListReadyNodeBackends(ctx, r.Client, svc)
-	if err != nil {
-		return ctrl.Result{}, err
+	portBackends := make(map[int32][]backendNode, len(svc.Spec.Ports))
+	for _, port := range svc.Spec.Ports {
+		backends, err := lbbackend.ListReadyNodeBackendsForPort(ctx, r.Client, svc, port)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		portBackends[port.Port] = backends
 	}
-	if len(backends) == 0 {
-		log.Info("skipping: no ready nodes with endpoints found")
-		return ctrl.Result{}, nil
-	}
-	stack, err := lbservice.BuildLoadBalancerStack(svc, lbCfg, backends)
+	stack, err := lbservice.BuildLoadBalancerStackWithPortBackends(svc, lbCfg, func(port corev1.ServicePort) []backendNode { return portBackends[port.Port] })
 	if err != nil {
 		// Validation failures are actionable configuration errors, not a silent
 		// no-op. Keep the object unmanaged until it is corrected, but surface a
@@ -382,8 +382,8 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err := r.Patch(ctx, svc, client.MergeFrom(base)); err != nil {
 		return ctrl.Result{}, err
 	}
-	log.Info("CMP LBaaS resources ensured", "lbServiceID", lastIDs.LBServiceID, "vipPortID", lastIDs.VIPPortID, "vsID", lastIDs.VirtualServerID, "vip", vip, "ports", len(stack.Ports), "backends", len(backends))
-	r.Recorder.Eventf(svc, corev1.EventTypeNormal, "EnsuredLoadBalancer", "CMP LBaaS resources ensured (LB=%s, VIP=%s, ports=%d, backends=%d)", lastIDs.LBServiceID, vip, len(stack.Ports), len(backends))
+	log.Info("CMP LBaaS resources ensured", "lbServiceID", lastIDs.LBServiceID, "vipPortID", lastIDs.VIPPortID, "vsID", lastIDs.VirtualServerID, "vip", vip, "ports", len(stack.Ports), "backends", len(portBackends))
+	r.Recorder.Eventf(svc, corev1.EventTypeNormal, "EnsuredLoadBalancer", "CMP LBaaS resources ensured (LB=%s, VIP=%s, ports=%d, backends=%d)", lastIDs.LBServiceID, vip, len(stack.Ports), len(portBackends))
 
 	// Auto-generate NetworkPolicy allowing ingress to backing pods.
 	if err := lbnetworkpolicy.Ensure(ctx, r.Client, svc); err != nil {

@@ -59,3 +59,23 @@ func TestListReadyNodeBackendsHonorsLocalTrafficPolicyWithoutEndpointSlices(t *t
 		t.Fatalf("expected no backends without local ready endpoints, got %#v", backends)
 	}
 }
+
+func TestListReadyNodeBackendsForPortFiltersEndpointSlicePorts(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "web"}, Spec: corev1.ServiceSpec{Ports: []corev1.ServicePort{{Name: "http", Port: 80}, {Name: "metrics", Port: 9090}}}}
+	n1, n2 := readyNode("n1", "10.0.0.1"), readyNode("n2", "10.0.0.2")
+	name := "metrics"
+	port := int32(9090)
+	slice := &discoveryv1.EndpointSlice{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "web-metrics", Labels: map[string]string{discoveryv1.LabelServiceName: "web"}}, Ports: []discoveryv1.EndpointPort{{Name: &name, Port: &port}}, Endpoints: []discoveryv1.Endpoint{{NodeName: ptr.To("n2"), Conditions: discoveryv1.EndpointConditions{Ready: ptr.To(true)}}}}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(svc, n1, n2, slice).Build()
+	backends, err := ListReadyNodeBackendsForPort(context.Background(), c, svc, svc.Spec.Ports[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(backends) != 1 || backends[0].IP != "10.0.0.2" {
+		t.Fatalf("unexpected port-aware backends: %#v", backends)
+	}
+}

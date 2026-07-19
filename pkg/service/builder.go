@@ -15,6 +15,12 @@ import (
 // into a typed desired-state stack. The builder does not call CMP or mutate
 // Kubernetes objects.
 func BuildLoadBalancerStack(svc *corev1.Service, cfg lbannotations.LBConfig, nodes []backend.Node) (*model.LoadBalancerStack, error) {
+	return BuildLoadBalancerStackWithPortBackends(svc, cfg, func(corev1.ServicePort) []backend.Node { return nodes })
+}
+
+// BuildLoadBalancerStackWithPortBackends builds independent member sets for
+// every Service port.
+func BuildLoadBalancerStackWithPortBackends(svc *corev1.Service, cfg lbannotations.LBConfig, backendsForPort func(corev1.ServicePort) []backend.Node) (*model.LoadBalancerStack, error) {
 	if svc == nil {
 		return nil, fmt.Errorf("service must not be nil")
 	}
@@ -63,7 +69,7 @@ func BuildLoadBalancerStack(svc *corev1.Service, cfg lbannotations.LBConfig, nod
 			Ownership:        model.OwnershipFor(owner, "", "virtual-server", ""),
 		}
 		pool := model.Pool{Name: PoolName(svc, p.Port), Monitor: vs.Monitor, Ownership: model.OwnershipFor(owner, "", "pool", VIPGroup(svc))}
-		for _, n := range nodes {
+		for _, n := range backendsForPort(p) {
 			member := model.BackendMember{IP: n.IP, Port: p.NodePort, Weight: n.Weight}
 			sp.Backends = append(sp.Backends, member)
 			pool.Members = append(pool.Members, member)
