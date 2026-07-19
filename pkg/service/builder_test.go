@@ -1,6 +1,7 @@
 package service
 
 import (
+	"strings"
 	"testing"
 
 	lbannotations "github.com/gardener/gardener-extension-f5/pkg/annotations"
@@ -68,5 +69,13 @@ func TestBuildLoadBalancerStackHonorsProtocolOverride(t *testing.T) {
 	}
 	if got := stack.Ports[0].Protocol; got != "TCP" {
 		t.Fatalf("expected override protocol TCP, got %q", got)
+	}
+}
+
+func TestBuildLoadBalancerStackRequiresNodePort(t *testing.T) {
+	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "web"}, Spec: corev1.ServiceSpec{Ports: []corev1.ServicePort{{Name: "web", Port: 80}}}}
+	_, err := BuildLoadBalancerStack(svc, lbannotations.LBConfig{}, nil)
+	if err == nil || !strings.Contains(err.Error(), "BackendNodePortRequired") {
+		t.Fatalf("expected BackendNodePortRequired, got %v", err)
 	}
 }

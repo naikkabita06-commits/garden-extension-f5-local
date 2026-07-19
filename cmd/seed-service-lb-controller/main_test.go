@@ -64,6 +64,31 @@ func (s *stubCMP) DeleteLBVirtualServer(_ context.Context, _, _ string) error {
 	s.deleteVSN++
 	return nil
 }
+func (s *stubCMP) ListLBVirtualServerPools(context.Context, string, string) ([]json.RawMessage, error) {
+	return nil, nil
+}
+func (s *stubCMP) CreateLBVirtualServerPool(_ context.Context, _, _ string, q url.Values) (json.RawMessage, error) {
+	return json.RawMessage(`{"id":"pool-001","pool_name":"` + q.Get("pool_name") + `","members":[]}`), nil
+}
+func (s *stubCMP) GetLBVirtualServerPool(context.Context, string, string, string) (json.RawMessage, error) {
+	return json.RawMessage(`{"id":"pool-001"}`), nil
+}
+func (s *stubCMP) DeleteLBVirtualServerPool(context.Context, string, string, string) error {
+	return nil
+}
+func (s *stubCMP) SetDefaultLBVirtualServerPool(context.Context, string, string, string) error {
+	return nil
+}
+func (s *stubCMP) CreateLBVirtualServerPoolMember(context.Context, string, string, string, url.Values) (json.RawMessage, error) {
+	return json.RawMessage(`{"id":"member-001"}`), nil
+}
+func (s *stubCMP) UpdateLBVirtualServerPoolMember(context.Context, string, string, string, string, url.Values) (json.RawMessage, error) {
+	return json.RawMessage(`{"id":"member-001"}`), nil
+}
+func (s *stubCMP) DeleteLBVirtualServerPoolMember(context.Context, string, string, string, string) error {
+	return nil
+}
+
 func (s *stubCMP) SearchNetworkPortsByIP(_ context.Context, ip string) ([]json.RawMessage, error) {
 	return []json.RawMessage{json.RawMessage(`{"id":5001,"resource_id":"compute-` + ip + `","resource_type":"compute","fixed_ip":"` + ip + `"}`)}, nil
 }

@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -48,6 +49,7 @@ const (
 	annVIPPortID       = "f5.extensions.gardener.cloud/vip-port-id"
 	annVirtualServerID = "f5.extensions.gardener.cloud/virtual-server-id"
 	annVIPAddress      = "f5.extensions.gardener.cloud/vip-address"
+	annObservedGraph   = "f5.extensions.gardener.cloud/observed-graph"
 
 	// User-facing input annotations for per-Service LB configuration.
 	annProtocol         = lbannotations.Protocol
@@ -301,7 +303,7 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// Provision via CMP LBaaS: LBService → VIP → VirtualServer
 	protocol := stack.Ports[0].Protocol
 	cmpStart := time.Now()
-	ids, vip, err := r.ensureCMPResources(ctx, svc, frontendPort, nodePort, nodeIPs, protocol, stack.Config)
+	ids, vip, graph, err := r.ensureCMPResources(ctx, svc, frontendPort, nodePort, nodeIPs, protocol, stack.Config)
 	f5metrics.CMPAPICallDuration.WithLabelValues("seed-service-lb-controller", "EnsureLB").Observe(time.Since(cmpStart).Seconds())
 	if err != nil {
 		f5metrics.CMPAPICallsTotal.WithLabelValues("seed-service-lb-controller", "EnsureLB", "error").Inc()
@@ -327,6 +329,11 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if vip != "" {
 		svc.Annotations[annVIPAddress] = vip
 	}
+	if raw, err := json.Marshal(graph); err != nil {
+		return ctrl.Result{}, err
+	} else {
+		svc.Annotations[annObservedGraph] = string(raw)
+	}
 	if err := r.Patch(ctx, svc, client.MergeFrom(base)); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -347,13 +354,16 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	return ctrl.Result{}, nil
 }
 
-func (r *serviceReconciler) ensureCMPResources(ctx context.Context, svc *corev1.Service, frontendPort, nodePort int32, nodeIPs []string, protocol string, cfg lbServiceConfig) (*f5client.CMPResourceIDs, string, error) {
+func (r *serviceReconciler) ensureCMPResources(ctx context.Context, svc *corev1.Service, frontendPort, nodePort int32, nodeIPs []string, protocol string, cfg lbServiceConfig) (*f5client.CMPResourceIDs, string, model.ObservedGraph, error) {
 	current := model.ObservedState{}
 	if svc != nil && svc.Annotations != nil {
 		current.LBServiceID = strings.TrimSpace(svc.Annotations[annLBServiceID])
 		current.VIPPortID = strings.TrimSpace(svc.Annotations[annVIPPortID])
 		current.VirtualServerID = strings.TrimSpace(svc.Annotations[annVirtualServerID])
 		current.VIPAddress = strings.TrimSpace(svc.Annotations[annVIPAddress])
+		if raw := strings.TrimSpace(svc.Annotations[annObservedGraph]); raw != "" {
+			_ = json.Unmarshal([]byte(raw), &current.Graph)
+		}
 	}
 
 	members := make([]model.BackendMember, 0, len(nodeIPs))
@@ -372,26 +382,16 @@ func (r *serviceReconciler) ensureCMPResources(ctx context.Context, svc *corev1.
 		SourceRanges:     append([]string(nil), cfg.SourceRanges...),
 		Monitor:          &model.Monitor{Type: cfg.HealthType, Path: cfg.HealthPath, Interval: cfg.HealthInterval},
 	}
-	result, err := lbaasdeploy.NewFromRaw(r.cmp, r.vpcID).Ensure(ctx, lbaasdeploy.EnsureRequest{
-		LBName:        sanitizeKey(fmt.Sprintf("seed-%s-%s", svc.Namespace, svc.Name)),
-		LBDescription: fmt.Sprintf("Seed LB for %s/%s", svc.Namespace, svc.Name),
-		FlavorID:      r.flavorID,
-		NetworkID:     r.networkID,
-		VPCID:         r.vpcID,
-		VPCName:       r.vpcName,
-		VirtualServer: vs,
-		Backends:      members,
-		Current:       current,
-	})
+	pool := model.Pool{Name: sanitizeKey(fmt.Sprintf("seed-pool-%s-%s-%d", svc.Namespace, svc.Name, frontendPort)), Members: members, Monitor: vs.Monitor}
+	vs.DefaultPoolName = pool.Name
+	desired := &model.LoadBalancerStack{LBService: model.LBService{Name: sanitizeKey(fmt.Sprintf("seed-%s-%s", svc.Namespace, svc.Name)), Description: fmt.Sprintf("Seed LB for %s/%s", svc.Namespace, svc.Name), FlavorID: r.flavorID, NetworkID: r.networkID, VPCID: r.vpcID, VPCName: r.vpcName}, VIP: model.VIP{Name: "seed-vip"}, VirtualServers: []model.VirtualServer{vs}, Pools: []model.Pool{pool}}
+	result, err := lbaasdeploy.NewFromRaw(r.cmp, r.vpcID).EnsureStack(ctx, lbaasdeploy.StackEnsureRequest{Stack: desired, Current: current})
 	if err != nil {
-		return nil, current.VIPAddress, err
+		return nil, current.VIPAddress, current.Graph, err
 	}
-	return &f5client.CMPResourceIDs{
-		LBServiceID:       result.Observed.LBServiceID,
-		VIPPortID:         result.Observed.VIPPortID,
-		VirtualServerID:   result.Observed.VirtualServerID,
-		VirtualServerName: result.Observed.VirtualServerName,
-	}, result.Observed.VIPAddress, nil
+	observedVS := result.Observed.Graph.VirtualServers[vs.Name]
+	return &f5client.CMPResourceIDs{LBServiceID: result.Observed.LBServiceID, VIPPortID: result.Observed.VIPPortID, VirtualServerID: observedVS.ExternalID, VirtualServerName: observedVS.Name}, result.Observed.VIPAddress, result.Observed.Graph, nil
+
 }
 
 func (r *serviceReconciler) cleanupCMPResources(ctx context.Context, svc *corev1.Service) error {
@@ -400,16 +400,11 @@ func (r *serviceReconciler) cleanupCMPResources(ctx context.Context, svc *corev1
 		VIPPortID:       strings.TrimSpace(svc.Annotations[annVIPPortID]),
 		VirtualServerID: strings.TrimSpace(svc.Annotations[annVirtualServerID]),
 	}
-	log := ctrl.Log.WithName("seed-service-lb").WithValues(
-		"service", fmt.Sprintf("%s/%s", svc.Namespace, svc.Name),
-		"lbServiceID", observed.LBServiceID, "vipPortID", observed.VIPPortID, "virtualServerID", observed.VirtualServerID,
-	)
-	log.Info("cleaning CMP LBaaS resources")
-	_, err := lbaasdeploy.NewFromRaw(r.cmp, r.vpcID).Cleanup(ctx, lbaasdeploy.CleanupRequest{
-		Current:         observed,
-		DeleteVIP:       true,
-		DeleteLBService: true,
-	})
+	if raw := strings.TrimSpace(svc.Annotations[annObservedGraph]); raw != "" {
+		_ = json.Unmarshal([]byte(raw), &observed.Graph)
+	}
+	observed.EnsureGraph()
+	_, err := lbaasdeploy.NewFromRaw(r.cmp, r.vpcID).CleanupStack(ctx, lbaasdeploy.CleanupRequest{Current: observed, DeleteVIP: true, DeleteLBService: true})
 	return err
 }
 
