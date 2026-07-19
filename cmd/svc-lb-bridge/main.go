@@ -59,6 +59,10 @@ const (
 	// annObservedGraph persists the complete provider graph. Scalar annotations
 	// remain migration compatibility mirrors for older consumers.
 	annObservedGraph = "f5.extensions.gardener.cloud/observed-graph"
+	// annObservedGeneration records the Service generation for which the
+	// complete provider graph has converged. It is intentionally separate from
+	// legacy scalar IDs so status consumers can distinguish stale success.
+	annObservedGeneration = "f5.extensions.gardener.cloud/observed-generation"
 
 	// User-facing input annotations for per-Service LB configuration.
 	// These override global defaults from F5LoadBalancerConfig CRD.
@@ -279,17 +283,25 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	// Build a typed desired-state snapshot before mutating CMP resources.
 	lbCfg := parseLBServiceConfig(svc)
-	backends, err := lbbackend.ListReadyNodeBackends(ctx, r.Client, svc)
-	if err != nil {
-		return ctrl.Result{}, err
+	portBackends := make(map[int32][]backendNode, len(svc.Spec.Ports))
+	for _, port := range svc.Spec.Ports {
+		backends, err := lbbackend.ListReadyNodeBackendsForPort(ctx, r.Client, svc, port)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		portBackends[port.Port] = backends
 	}
-	if len(backends) == 0 {
-		log.Info("skipping: no ready nodes with endpoints found")
-		return ctrl.Result{}, nil
-	}
-	stack, err := lbservice.BuildLoadBalancerStack(svc, lbCfg, backends)
+	stack, err := lbservice.BuildLoadBalancerStackWithPortBackends(svc, lbCfg, func(port corev1.ServicePort) []backendNode { return portBackends[port.Port] })
 	if err != nil {
-		log.Info("skipping: cannot build desired load-balancer stack", "reason", err.Error())
+		// Validation failures are actionable configuration errors, not a silent
+		// no-op. Keep the object unmanaged until it is corrected, but surface a
+		// stable reason in the Kubernetes event stream.
+		reason := "InvalidLoadBalancerService"
+		if strings.Contains(err.Error(), "BackendNodePortRequired") {
+			reason = "BackendNodePortRequired"
+		}
+		r.Recorder.Eventf(svc, corev1.EventTypeWarning, reason, "%v", err)
+		log.Info("cannot build desired load-balancer stack", "reason", reason, "error", err)
 		return ctrl.Result{}, nil
 	}
 
@@ -301,12 +313,9 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		f5metrics.ManagedServicesTotal.WithLabelValues("svc-lb-bridge").Inc()
 	}
 
-	// Ensure CMP resources for every Service port. The LBService and VIP are shared
-	// across all listeners, while each listener keeps an independent provider ID and
-	// backend hash. This prevents a second port from adopting or replacing the first
-	// port's virtual server.
-	portObserved := readServicePortObserved(svc.Annotations)
-	desiredPortKeys := make(map[string]struct{}, len(stack.Ports))
+	// Reconcile the complete Service graph in one operation. This replaces the
+	// legacy per-listener entry point: pools and members are now converged under
+	// their own listener without recreating sibling listeners.
 	shared := model.ObservedState{
 		LBServiceID: strings.TrimSpace(svc.Annotations[annLBServiceID]),
 		VIPPortID:   strings.TrimSpace(svc.Annotations[annVIPPortID]),
@@ -315,49 +324,41 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if graph, ok := readObservedGraph(svc.Annotations); ok {
 		shared.Graph = graph
 	}
-	var lastIDs *f5client.CMPResourceIDs
-	var vip string
+	if shared.LBServiceID == "" && lbservice.VIPGroup(svc) != "" {
+		if parent, ok := r.sharedParentObservedState(ctx, svc); ok {
+			shared.LBServiceID, shared.VIPPortID, shared.VIPAddress = parent.LBServiceID, parent.VIPPortID, parent.VIPAddress
+			shared.Graph = parent.Graph
+		}
+	}
 	cmpStart := time.Now()
-	for _, p := range stack.Ports {
-		key := servicePortKey(p)
-		desiredPortKeys[key] = struct{}{}
-		previous := portObserved[key]
-		current := shared
-		current.VirtualServerID = previous.VirtualServerID
-		current.VirtualServerName = previous.VirtualServerName
-		ids, observed, backendHash, err := r.ensureCMPResourcesWithCurrent(ctx, svc, p.FrontendPort, p.NodePort, backends, p.Protocol, stack.Config, current, previous.BackendHash)
-		if err != nil {
-			f5metrics.CMPAPICallDuration.WithLabelValues("svc-lb-bridge", "EnsureLB").Observe(time.Since(cmpStart).Seconds())
-			f5metrics.CMPAPICallsTotal.WithLabelValues("svc-lb-bridge", "EnsureLB", "error").Inc()
-			f5metrics.ReconcileErrorsTotal.WithLabelValues("svc-lb-bridge").Inc()
-			if rle, ok := f5client.IsRateLimited(err); ok {
-				r.Recorder.Eventf(svc, corev1.EventTypeWarning, "RateLimited", "CMP API rate limited; retrying after %s", rle.RetryAfter)
-				log.Info("CMP rate limited; requeuing after Retry-After", "retryAfter", rle.RetryAfter)
-				return ctrl.Result{RequeueAfter: rle.RetryAfter}, nil
-			}
-			r.Recorder.Eventf(svc, corev1.EventTypeWarning, "SyncLoadBalancerFailed", "Error ensuring CMP LBaaS resources for port %d: %v", p.FrontendPort, err)
-			return ctrl.Result{}, err
+	stackResult, err := lbaasdeploy.NewFromRaw(r.cmp, r.vpcID).EnsureStack(ctx, lbaasdeploy.StackEnsureRequest{Stack: stack, Current: shared})
+	if err != nil {
+		f5metrics.CMPAPICallDuration.WithLabelValues("svc-lb-bridge", "EnsureLB").Observe(time.Since(cmpStart).Seconds())
+		f5metrics.CMPAPICallsTotal.WithLabelValues("svc-lb-bridge", "EnsureLB", "error").Inc()
+		f5metrics.ReconcileErrorsTotal.WithLabelValues("svc-lb-bridge").Inc()
+		if rle, ok := f5client.IsRateLimited(err); ok {
+			r.Recorder.Eventf(svc, corev1.EventTypeWarning, "RateLimited", "CMP API rate limited; retrying after %s", rle.RetryAfter)
+			return ctrl.Result{RequeueAfter: rle.RetryAfter}, nil
 		}
-		lastIDs = ids
-		portObserved[key] = servicePortObserved{VirtualServerID: ids.VirtualServerID, VirtualServerName: ids.VirtualServerName, BackendHash: backendHash}
-		shared = observed
-		if observed.VIPAddress != "" {
-			vip = observed.VIPAddress
+		r.Recorder.Eventf(svc, corev1.EventTypeWarning, "SyncLoadBalancerFailed", "Error ensuring CMP LBaaS resource graph: %v", err)
+		return ctrl.Result{}, err
+	}
+	shared = stackResult.Observed
+	vip := shared.VIPAddress
+	portObserved := make(map[string]servicePortObserved, len(stack.Ports))
+	for _, port := range stack.Ports {
+		vs := shared.Graph.VirtualServers[desiredVirtualServerName(svc, port.FrontendPort)]
+		portObserved[servicePortKey(port)] = servicePortObserved{
+			VirtualServerID: vs.ExternalID, VirtualServerName: vs.Name,
+			BackendHash: lbaasdeploy.DesiredBackendHash(port.FrontendPort, port.NodePort, port.Backends),
 		}
 	}
-	// Delete listeners for ports that have been removed. Parent LB/VIP resources
-	// remain in place, so an individual Service-port change cannot disrupt siblings.
-	for key, previous := range portObserved {
-		if _, wanted := desiredPortKeys[key]; wanted {
-			continue
-		}
-		if previous.VirtualServerID != "" {
-			if _, err := lbaasdeploy.NewFromRaw(r.cmp, r.vpcID).Cleanup(ctx, lbaasdeploy.CleanupRequest{Current: model.ObservedState{LBServiceID: shared.LBServiceID, VirtualServerID: previous.VirtualServerID}}); err != nil {
-				return ctrl.Result{}, fmt.Errorf("cleaning removed Service port %s: %w", key, err)
-			}
-		}
-		delete(portObserved, key)
+	lastIDs := &f5client.CMPResourceIDs{LBServiceID: shared.LBServiceID, VIPPortID: shared.VIPPortID, VirtualServerID: shared.VirtualServerID, VirtualServerName: shared.VirtualServerName}
+	if len(stack.Ports) > 0 && lastIDs.VirtualServerID == "" {
+		last := portObserved[servicePortKey(stack.Ports[len(stack.Ports)-1])]
+		lastIDs.VirtualServerID, lastIDs.VirtualServerName = last.VirtualServerID, last.VirtualServerName
 	}
+	f5metrics.CMPAPICallDuration.WithLabelValues("svc-lb-bridge", "EnsureLB").Observe(time.Since(cmpStart).Seconds())
 	f5metrics.CMPAPICallDuration.WithLabelValues("svc-lb-bridge", "EnsureLB").Observe(time.Since(cmpStart).Seconds())
 	f5metrics.CMPAPICallsTotal.WithLabelValues("svc-lb-bridge", "EnsureLB", "success").Inc()
 	if vip != "" {
@@ -383,11 +384,12 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err := writeObservedGraph(svc.Annotations, shared.Graph); err != nil {
 		return ctrl.Result{}, err
 	}
+	svc.Annotations[annObservedGeneration] = fmt.Sprintf("%d", svc.Generation)
 	if err := r.Patch(ctx, svc, client.MergeFrom(base)); err != nil {
 		return ctrl.Result{}, err
 	}
-	log.Info("CMP LBaaS resources ensured", "lbServiceID", lastIDs.LBServiceID, "vipPortID", lastIDs.VIPPortID, "vsID", lastIDs.VirtualServerID, "vip", vip, "ports", len(stack.Ports), "backends", len(backends))
-	r.Recorder.Eventf(svc, corev1.EventTypeNormal, "EnsuredLoadBalancer", "CMP LBaaS resources ensured (LB=%s, VIP=%s, ports=%d, backends=%d)", lastIDs.LBServiceID, vip, len(stack.Ports), len(backends))
+	log.Info("CMP LBaaS resources ensured", "lbServiceID", lastIDs.LBServiceID, "vipPortID", lastIDs.VIPPortID, "vsID", lastIDs.VirtualServerID, "vip", vip, "ports", len(stack.Ports), "backends", len(portBackends))
+	r.Recorder.Eventf(svc, corev1.EventTypeNormal, "EnsuredLoadBalancer", "CMP LBaaS resources ensured (LB=%s, VIP=%s, ports=%d, backends=%d)", lastIDs.LBServiceID, vip, len(stack.Ports), len(portBackends))
 
 	// Auto-generate NetworkPolicy allowing ingress to backing pods.
 	if err := lbnetworkpolicy.Ensure(ctx, r.Client, svc); err != nil {
@@ -526,74 +528,59 @@ func listManagedServiceRequests(ctx context.Context, c client.Client) []reconcil
 }
 
 func (r *serviceReconciler) cleanupCMPResources(ctx context.Context, svc *corev1.Service) error {
-	lbID := svc.Annotations[annLBServiceID]
-	vipID := svc.Annotations[annVIPPortID]
-	vsID := svc.Annotations[annVirtualServerID]
-
-	// Best-effort lookup by deterministic name if IDs are missing.
-	if strings.TrimSpace(lbID) == "" {
-		if found, err := lbaasdeploy.NewFromRaw(r.cmp, r.vpcID).FindLBServiceIDByName(ctx, desiredLBServiceName(svc)); err == nil {
-			lbID = found
-		}
+	observed := model.ObservedState{
+		LBServiceID:     strings.TrimSpace(svc.Annotations[annLBServiceID]),
+		VIPPortID:       strings.TrimSpace(svc.Annotations[annVIPPortID]),
+		VirtualServerID: strings.TrimSpace(svc.Annotations[annVirtualServerID]),
+		VIPAddress:      strings.TrimSpace(svc.Annotations[annVIPAddress]),
 	}
+	if graph, ok := readObservedGraph(svc.Annotations); ok {
+		observed.Graph = graph
+	}
+	// A missing graph is a legacy object. EnsureGraph permits deletion of only
+	// its recorded scalar resources; it never falls back to names or all VIPs.
+	observed.EnsureGraph()
+	shared := r.isLBServiceShared(ctx, svc, observed.LBServiceID)
+	_, err := lbaasdeploy.NewFromRaw(r.cmp, r.vpcID).CleanupStack(ctx, lbaasdeploy.CleanupRequest{
+		Current: observed, DeleteVIP: !shared, DeleteLBService: !shared,
+	})
+	return err
+}
 
-	log := ctrl.Log.WithName("svc-lb-bridge").WithValues(
-		"service", fmt.Sprintf("%s/%s", svc.Namespace, svc.Name),
-		"lbServiceID", lbID, "vipPortID", vipID, "virtualServerID", vsID,
-	)
-
-	if lbID != "" {
-		// Delete VS: use ID if present; otherwise delete any VS matching our naming convention.
-		if vsID != "" {
-			log.Info("deleting CMP Virtual Server")
-			_, err := lbaasdeploy.NewFromRaw(r.cmp, r.vpcID).Cleanup(ctx, lbaasdeploy.CleanupRequest{
-				Current: model.ObservedState{
-					LBServiceID:     strings.TrimSpace(lbID),
-					VirtualServerID: strings.TrimSpace(vsID),
-				},
-			})
-			if err != nil {
-				return err
+// sharedParentObservedState reuses only a proven shared LB/VIP parent from a
+// sibling Service graph. Child graph entries are intentionally excluded: each
+// Service owns its own listeners, pools, members, and rules.
+func (r *serviceReconciler) sharedParentObservedState(ctx context.Context, self *corev1.Service) (model.ObservedState, bool) {
+	services := &corev1.ServiceList{}
+	if err := r.List(ctx, services, client.InNamespace(self.Namespace)); err != nil {
+		return model.ObservedState{}, false
+	}
+	group := lbservice.VIPGroup(self)
+	for i := range services.Items {
+		candidate := &services.Items[i]
+		if candidate.Name == self.Name || lbservice.VIPGroup(candidate) != group {
+			continue
+		}
+		graph, ok := readObservedGraph(candidate.Annotations)
+		if !ok {
+			continue
+		}
+		for _, parent := range graph.LBServices {
+			if parent.ExternalID == "" || parent.Ownership.SharedGroup != group {
+				continue
 			}
-		}
-
-		// If this LBService is shared (vip-group), only delete VIP+LBService when no other
-		// Services still reference the same LBService ID. This prevents destroying resources
-		// that are still in use by other group members.
-		shared := r.isLBServiceShared(ctx, svc, lbID)
-		if shared {
-			log.Info("LBService is shared with other Services; skipping VIP and LBService deletion")
-		}
-
-		if !shared {
-			// Delete VIP: use ID if present; otherwise delete all VIPs on this LB (dedicated LB per Service).
-			if vipID != "" {
-				log.Info("deleting CMP VIP")
-				_, err := lbaasdeploy.NewFromRaw(r.cmp, r.vpcID).Cleanup(ctx, lbaasdeploy.CleanupRequest{
-					Current: model.ObservedState{
-						LBServiceID: strings.TrimSpace(lbID),
-						VIPPortID:   strings.TrimSpace(vipID),
-					},
-					DeleteVIP: true,
-				})
-				if err != nil {
-					return err
+			state := model.ObservedState{Graph: model.NewObservedGraph(), LBServiceID: parent.ExternalID}
+			state.Graph.LBServices[parent.LogicalID] = parent
+			for key, vip := range graph.VIPs {
+				if vip.Ownership.SharedGroup == group && vip.ExternalID != "" {
+					state.VIPPortID, state.VIPAddress = vip.ExternalID, vip.Address
+					state.Graph.VIPs[key] = vip
+					return state, true
 				}
 			}
 		}
-		if !shared && lbID != "" {
-			log.Info("deleting CMP LB Service")
-			_, err := lbaasdeploy.NewFromRaw(r.cmp, r.vpcID).Cleanup(ctx, lbaasdeploy.CleanupRequest{
-				Current:         model.ObservedState{LBServiceID: strings.TrimSpace(lbID)},
-				DeleteLBService: true,
-			})
-			if err != nil {
-				return err
-			}
-		}
 	}
-
-	return nil
+	return model.ObservedState{}, false
 }
 
 // isLBServiceShared checks whether any other Service with a finalizer still references
@@ -610,7 +597,22 @@ func (r *serviceReconciler) isLBServiceShared(ctx context.Context, self *corev1.
 		if s.Name == self.Name && s.Namespace == self.Namespace {
 			continue
 		}
-		if s.Annotations[annLBServiceID] == lbID && controllerutil.ContainsFinalizer(&s, finalizerName) {
+		if !controllerutil.ContainsFinalizer(&s, finalizerName) {
+			continue
+		}
+		// Only a graph owned by this Service can retain a shared parent. A
+		// copied scalar annotation is not sufficient authority to block cleanup.
+		if graph, ok := readObservedGraph(s.Annotations); ok {
+			for _, parent := range graph.LBServices {
+				if parent.ExternalID == lbID && parent.Ownership.SourceKind == "Service" && parent.Ownership.SourceNamespace == s.Namespace && parent.Ownership.SourceName == s.Name && (parent.Ownership.SourceUID == "" || parent.Ownership.SourceUID == string(s.UID)) {
+					return true
+				}
+			}
+			continue
+		}
+		// Legacy objects have no graph ownership metadata; retain the existing
+		// scalar compatibility behavior until their next successful reconcile.
+		if s.Annotations[annLBServiceID] == lbID {
 			return true
 		}
 	}

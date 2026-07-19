@@ -1408,3 +1408,106 @@ func (c *client) doRequestWithBody(ctx context.Context, method, path string, bod
 
 	return resp.Header.Clone(), nil
 }
+
+// ListLBVirtualServerPoolMonitors lists monitors attached to a pool.
+func (c *client) ListLBVirtualServerPoolMonitors(ctx context.Context, lbID, vsID, poolID string) ([]json.RawMessage, error) {
+	path, err := c.virtualServerPoolPath(lbID, vsID, poolID)
+	if err != nil {
+		return nil, err
+	}
+	var out []json.RawMessage
+	err = c.doRequest(ctx, http.MethodGet, c.lbPath(path+"/monitors"), nil, &out)
+	return out, err
+}
+func (c *client) CreateLBVirtualServerPoolMonitor(ctx context.Context, lbID, vsID, poolID string, q url.Values) (json.RawMessage, error) {
+	path, err := c.virtualServerPoolPath(lbID, vsID, poolID)
+	if err != nil {
+		return nil, err
+	}
+	if x := q.Encode(); x != "" {
+		path += "/monitors?" + x
+	} else {
+		path += "/monitors"
+	}
+	var out json.RawMessage
+	err = c.doRequest(ctx, http.MethodPost, c.lbPath(path), nil, &out)
+	return out, err
+}
+func (c *client) UpdateLBVirtualServerPoolMonitor(ctx context.Context, lbID, vsID, poolID, monitorID string, q url.Values) (json.RawMessage, error) {
+	path, err := c.virtualServerPoolPath(lbID, vsID, poolID)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(monitorID) == "" {
+		return nil, fmt.Errorf("monitor id must not be empty")
+	}
+	path += "/monitors/" + strings.TrimSpace(monitorID)
+	if x := q.Encode(); x != "" {
+		path += "?" + x
+	}
+	var out json.RawMessage
+	err = c.doRequest(ctx, http.MethodPatch, c.lbPath(path), nil, &out)
+	return out, err
+}
+func (c *client) DeleteLBVirtualServerPoolMonitor(ctx context.Context, lbID, vsID, poolID, monitorID string) error {
+	path, err := c.virtualServerPoolPath(lbID, vsID, poolID)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(monitorID) == "" {
+		return fmt.Errorf("monitor id must not be empty")
+	}
+	err = c.doRequest(ctx, http.MethodDelete, c.lbPath(path+"/monitors/"+strings.TrimSpace(monitorID)), nil, nil)
+	if IsNotFound(err) {
+		return nil
+	}
+	return err
+}
+func (c *client) ListLBVirtualServerRoutingRules(ctx context.Context, lbID, vsID string) ([]json.RawMessage, error) {
+	path, err := c.virtualServerRoutingRulePath(lbID, vsID)
+	if err != nil {
+		return nil, err
+	}
+	var out []json.RawMessage
+	err = c.doRequest(ctx, http.MethodGet, c.lbPath(path), nil, &out)
+	return out, err
+}
+func (c *client) CreateLBVirtualServerRoutingRule(ctx context.Context, lbID, vsID string, q url.Values) (json.RawMessage, error) {
+	path, err := c.virtualServerRoutingRulePath(lbID, vsID)
+	if err != nil {
+		return nil, err
+	}
+	if x := q.Encode(); x != "" {
+		path += "?" + x
+	}
+	var out json.RawMessage
+	err = c.doRequest(ctx, http.MethodPost, c.lbPath(path), nil, &out)
+	return out, err
+}
+func (c *client) DeleteLBVirtualServerRoutingRule(ctx context.Context, lbID, vsID, ruleID string) error {
+	path, err := c.virtualServerRoutingRulePath(lbID, vsID)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(ruleID) == "" {
+		return fmt.Errorf("routing rule id must not be empty")
+	}
+	err = c.doRequest(ctx, http.MethodDelete, c.lbPath(path+"/"+strings.TrimSpace(ruleID)), nil, nil)
+	if IsNotFound(err) {
+		return nil
+	}
+	return err
+}
+
+// virtualServerRoutingRulePath follows the distinct Swagger hierarchy for
+// routing rules, which is scoped below lb_service rather than load-balancers/{id}.
+func (c *client) virtualServerRoutingRulePath(lbServiceID, vsID string) (string, error) {
+	lbServiceID, vsID = strings.TrimSpace(lbServiceID), strings.TrimSpace(vsID)
+	if lbServiceID == "" {
+		return "", fmt.Errorf("lb service id must not be empty")
+	}
+	if vsID == "" {
+		return "", fmt.Errorf("virtual server id must not be empty")
+	}
+	return "/lb_service/" + lbServiceID + "/virtual-servers/" + vsID + "/routing-rules", nil
+}

@@ -667,3 +667,24 @@ func TestUpdateLoadBalancer_UsesPrefixHeadersAndFormEncoding(t *testing.T) {
 		t.Fatalf("expected response to contain updated, got %s", string(resp))
 	}
 }
+
+func TestRoutingRulesUseLBServiceSwaggerHierarchy(t *testing.T) {
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte("[]"))
+	}))
+	defer srv.Close()
+	c, err := NewClientWithCeAuth(logr.Discard(), srv.URL, "tenant", "proj", "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.(*client).ListLBVirtualServerRoutingRules(context.Background(), "lb-1", "vs-1"); err != nil {
+		t.Fatal(err)
+	}
+	want := "/api/v2.1/load-balancers/domain/tenant/project/proj/load-balancers/lb_service/lb-1/virtual-servers/vs-1/routing-rules"
+	if gotPath != want {
+		t.Fatalf("routing-rule path=%q, want %q", gotPath, want)
+	}
+}

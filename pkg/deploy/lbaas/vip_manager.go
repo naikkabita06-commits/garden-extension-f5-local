@@ -31,16 +31,9 @@ func (m *VIPManager) Ensure(ctx context.Context, lbServiceID, currentID, current
 		// the address only when it can safely identify the desired VIP below.
 		currentID = ""
 	}
-	if currentAddress != "" {
-		for _, vip := range vips {
-			if strings.TrimSpace(vip.Address) == currentAddress && strings.TrimSpace(vip.ID) != "" {
-				return strings.TrimSpace(vip.ID), currentAddress, true, nil
-			}
-		}
-		// The recorded address disappeared along with the provider VIP. Clear it
-		// and allocate a replacement only when no ambiguous VIP already exists.
-		currentAddress = ""
-	}
+	// An address is not ownership metadata. Never adopt an existing VIP based
+	// on a stale scalar address; it may belong to another shared stack.
+	currentAddress = ""
 	if len(vips) > 0 {
 		return "", "", false, fmt.Errorf("cannot adopt VIP for LB service %s without a stable VIP id/address; found %d existing VIP(s)", lbServiceID, len(vips))
 	}

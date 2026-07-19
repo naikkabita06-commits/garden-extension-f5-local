@@ -1,6 +1,7 @@
 package service
 
 import (
+	"strings"
 	"testing"
 
 	lbannotations "github.com/gardener/gardener-extension-f5/pkg/annotations"
@@ -35,6 +36,9 @@ func TestBuildLoadBalancerStackBuildsPortsAndBackends(t *testing.T) {
 	if stack.LBService.Name != "app-ns-web" || stack.VIP.Name != "app-vip-ns-web" {
 		t.Fatalf("expected deterministic parent resources, got LB=%#v VIP=%#v", stack.LBService, stack.VIP)
 	}
+	if stack.Pools[0].Monitor == nil || stack.Pools[0].Monitor.Name == "" {
+		t.Fatal("expected deterministic pool monitor name")
+	}
 	if stack.VirtualServers[0].Name != "app-vs-ns-web-80" || stack.Pools[0].Name != "app-pool-ns-web-80" || stack.VirtualServers[0].DefaultPoolName != stack.Pools[0].Name {
 		t.Fatalf("expected deterministic listener and pool graph, got VS=%#v pool=%#v", stack.VirtualServers[0], stack.Pools[0])
 	}
@@ -68,5 +72,13 @@ func TestBuildLoadBalancerStackHonorsProtocolOverride(t *testing.T) {
 	}
 	if got := stack.Ports[0].Protocol; got != "TCP" {
 		t.Fatalf("expected override protocol TCP, got %q", got)
+	}
+}
+
+func TestBuildLoadBalancerStackRequiresNodePort(t *testing.T) {
+	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "web"}, Spec: corev1.ServiceSpec{Ports: []corev1.ServicePort{{Name: "web", Port: 80}}}}
+	_, err := BuildLoadBalancerStack(svc, lbannotations.LBConfig{}, nil)
+	if err == nil || !strings.Contains(err.Error(), "BackendNodePortRequired") {
+		t.Fatalf("expected BackendNodePortRequired, got %v", err)
 	}
 }

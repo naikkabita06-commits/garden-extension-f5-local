@@ -138,3 +138,13 @@ func TestRawPoolAdapterListsPools(t *testing.T) {
 		t.Fatalf("unexpected pools: %#v", pools)
 	}
 }
+
+func TestMonitorSpecQueryUsesMonitorEndpointParameterNames(t *testing.T) {
+	q := monitorSpecQuery(MonitorSpec{Name: "mon-web", Protocol: "HTTP", Path: "/healthz", Interval: 15})
+	if q.Get("name") != "mon-web" || q.Get("monitor_protocol") != "HTTP" || q.Get("path") != "/healthz" || q.Get("interval") != "15" {
+		t.Fatalf("unexpected monitor endpoint query: %v", q)
+	}
+	if q.Get("monitor_name") != "" || q.Get("monitor_path") != "" {
+		t.Fatalf("legacy pool query names must not be used: %v", q)
+	}
+}

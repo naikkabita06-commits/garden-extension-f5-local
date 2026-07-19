@@ -51,3 +51,11 @@ func TestVIPManagerCreatesWhenNoObservedVIPExists(t *testing.T) {
 		t.Fatalf("unexpected create result id=%q address=%q changed=%t created=%d", id, address, changed, stub.createdVIP)
 	}
 }
+
+func TestVIPManagerDoesNotAdoptSameAddressVIP(t *testing.T) {
+	stub := &stubClient{vips: []VIP{{ID: "vip-other", Address: "10.0.0.7"}}}
+	_, _, _, err := NewVIPManager(stub).Ensure(context.Background(), "lb-1", "vip-stale", "10.0.0.7")
+	if err == nil || !strings.Contains(err.Error(), "cannot adopt VIP") {
+		t.Fatalf("expected ownership-safe VIP error, got %v", err)
+	}
+}

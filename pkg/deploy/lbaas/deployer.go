@@ -148,9 +148,9 @@ func NewWithResourceManagers(client Client, vpcID string, pools PoolClient, moni
 }
 
 // EnsureStack reconciles LB service, VIP, virtual servers, pools, monitors,
-// members, and routing rules in dependency order. Certificates require a CMP
-// certificate API and are deliberately rejected until a CertificateManager is
-// supplied instead of silently provisioning an incomplete HTTPS stack.
+// members, and routing rules in dependency order. A stack that carries TLS
+// certificates must not be reported as successfully provisioned until a
+// CertificateManager can upload and bind them through the Swagger endpoint.
 func (d *Deployer) EnsureStack(ctx context.Context, req StackEnsureRequest) (*StackEnsureResult, error) {
 	if req.Stack == nil {
 		return nil, fmt.Errorf("load-balancer stack must not be nil")
@@ -166,11 +166,6 @@ func (d *Deployer) EnsureStack(ctx context.Context, req StackEnsureRequest) (*St
 	}
 	if len(req.Stack.RoutingRules) != 0 && d.routingRules == nil {
 		return nil, fmt.Errorf("routing-rule reconciliation requires a RoutingRuleManager")
-	}
-	for _, pool := range req.Stack.Pools {
-		if pool.Monitor != nil && d.monitors == nil {
-			return nil, fmt.Errorf("monitor reconciliation requires a MonitorManager")
-		}
 	}
 
 	observed := req.Current
@@ -225,6 +220,15 @@ func (d *Deployer) EnsureStack(ctx context.Context, req StackEnsureRequest) (*St
 			}
 			poolIDs[pool.Name] = resource.ID
 			observed.Graph.Pools[vs.Name+"/"+pool.Name] = model.ObservedResource{LogicalID: vs.Name + "/" + pool.Name, ExternalID: resource.ID, Name: resource.Name, Ownership: pool.Ownership}
+			// Member reconciliation returns the complete desired/observed set for
+			// this pool. Prune prior graph entries before recording it so endpoint
+			// churn cannot grow the persisted annotation indefinitely.
+			poolGraphKey := vs.Name + "/" + pool.Name
+			for key := range observed.Graph.Members {
+				if graphPoolKey(key) == poolGraphKey {
+					delete(observed.Graph.Members, key)
+				}
+			}
 			for _, member := range resource.Members {
 				key := vs.Name + "/" + pool.Name + "/" + poolMemberKey(member.ResourceID, member.ResourceIP, member.BackendPortID, member.Port)
 				observed.Graph.Members[key] = model.ObservedResource{
@@ -264,10 +268,32 @@ func (d *Deployer) EnsureStack(ctx context.Context, req StackEnsureRequest) (*St
 			changed = changed || rulesChanged
 		}
 	}
+	// Scalars are compatibility-only aliases. Once the corresponding desired
+	// resource has been observed under its logical graph key, drop the alias so
+	// it cannot later be mistaken for an obsolete listener during cleanup.
+	dropMigratedLegacyAliases(&observed)
 	if err := d.deleteObsoleteVirtualServers(ctx, lbID, &observed, req.Stack); err != nil {
 		return nil, err
 	}
 	return &StackEnsureResult{Observed: observed, Changed: changed}, nil
+}
+
+func dropMigratedLegacyAliases(observed *model.ObservedState) {
+	drop := func(resources map[string]model.ObservedResource, legacy string) {
+		legacyResource, ok := resources[legacy]
+		if !ok || legacyResource.ExternalID == "" {
+			return
+		}
+		for key, resource := range resources {
+			if key != legacy && resource.ExternalID == legacyResource.ExternalID {
+				delete(resources, legacy)
+				return
+			}
+		}
+	}
+	drop(observed.Graph.LBServices, "legacy/lb-service")
+	drop(observed.Graph.VIPs, "legacy/vip")
+	drop(observed.Graph.VirtualServers, "legacy/virtual-server")
 }
 
 // deleteObsoleteVirtualServers removes listeners that were previously recorded
@@ -284,7 +310,7 @@ func (d *Deployer) deleteObsoleteVirtualServers(ctx context.Context, lbID string
 			continue
 		}
 		for key, rule := range observed.Graph.RoutingRules {
-			if strings.HasPrefix(key, name+"/") {
+			if graphVirtualServerName(key) == name {
 				if d.routingRules == nil {
 					return fmt.Errorf("routing-rule cleanup requires a RoutingRuleManager")
 				}
@@ -295,12 +321,12 @@ func (d *Deployer) deleteObsoleteVirtualServers(ctx context.Context, lbID string
 			}
 		}
 		for key, pool := range observed.Graph.Pools {
-			if strings.HasPrefix(key, name+"/") {
+			if graphVirtualServerName(key) == name {
 				if d.pools == nil {
 					return fmt.Errorf("pool cleanup requires a PoolManager")
 				}
 				for memberKey, member := range observed.Graph.Members {
-					if strings.HasPrefix(memberKey, key+"/") {
+					if graphPoolKey(memberKey) == key {
 						if err := d.pools.members.client.DeletePoolMember(ctx, lbID, resource.ExternalID, pool.ExternalID, member.ExternalID); err != nil {
 							return err
 						}
@@ -330,6 +356,19 @@ func (d *Deployer) deleteObsoleteVirtualServers(ctx context.Context, lbID string
 		delete(observed.Graph.VirtualServers, name)
 	}
 	return nil
+}
+
+func graphVirtualServerName(key string) string {
+	name, _, _ := strings.Cut(key, "/")
+	return name
+}
+
+func graphPoolKey(key string) string {
+	parts := strings.SplitN(key, "/", 3)
+	if len(parts) < 2 {
+		return ""
+	}
+	return parts[0] + "/" + parts[1]
 }
 
 func stackBackends(stack *model.LoadBalancerStack, vs model.VirtualServer) []model.BackendMember {
