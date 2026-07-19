@@ -270,23 +270,16 @@ func (r *ingressReconciler) ensureCMPResources(ctx context.Context, ing *network
 	if stack == nil || len(stack.VirtualServers) == 0 || len(stack.Ports) == 0 {
 		return nil, current.VIPAddress, fmt.Errorf("ingress load-balancer stack is empty")
 	}
-	vs := stack.VirtualServers[0]
-	result, err := lbaasdeploy.NewFromRaw(r.cmp, r.vpcID).Ensure(ctx, lbaasdeploy.EnsureRequest{
-		LBName:        stack.LBService.Name,
-		LBDescription: stack.LBService.Description,
-		VirtualServer: vs,
-		Backends:      stack.Ports[0].Backends,
-		Current:       current,
-	})
+	if graph, ok := readObservedGraph(ing.Annotations); ok {
+		current.Graph = graph
+	}
+	result, err := lbaasdeploy.NewFromRaw(r.cmp, r.vpcID).EnsureStack(ctx, lbaasdeploy.StackEnsureRequest{Stack: stack, Current: current})
 	if err != nil {
 		return nil, current.VIPAddress, err
 	}
-	ids := &f5client.CMPResourceIDs{
-		LBServiceID:       result.Observed.LBServiceID,
-		VIPPortID:         result.Observed.VIPPortID,
-		VirtualServerID:   result.Observed.VirtualServerID,
-		VirtualServerName: result.Observed.VirtualServerName,
-	}
+	observed := result.Observed
+	vs := observed.Graph.VirtualServers[stack.VirtualServers[0].Name]
+	ids := &f5client.CMPResourceIDs{LBServiceID: observed.LBServiceID, VIPPortID: observed.VIPPortID, VirtualServerID: vs.ExternalID, VirtualServerName: vs.Name}
 	return ids, result.Observed.VIPAddress, nil
 }
 
@@ -296,12 +289,12 @@ func (r *ingressReconciler) cleanupCMPResources(ctx context.Context, ing *networ
 		VIPPortID:       strings.TrimSpace(ing.Annotations[annIngressVIPPortID]),
 		VirtualServerID: strings.TrimSpace(ing.Annotations[annIngressVSID]),
 	}
+	if graph, ok := readObservedGraph(ing.Annotations); ok {
+		observed.Graph = graph
+	}
+	observed.EnsureGraph()
 	shared := r.isLBServiceShared(ctx, ing, observed.LBServiceID)
-	_, err := lbaasdeploy.NewFromRaw(r.cmp, r.vpcID).Cleanup(ctx, lbaasdeploy.CleanupRequest{
-		Current:         observed,
-		DeleteVIP:       !shared,
-		DeleteLBService: !shared,
-	})
+	_, err := lbaasdeploy.NewFromRaw(r.cmp, r.vpcID).CleanupStack(ctx, lbaasdeploy.CleanupRequest{Current: observed, DeleteVIP: !shared, DeleteLBService: !shared})
 	return err
 }
 
