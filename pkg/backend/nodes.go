@@ -22,6 +22,10 @@ type Node struct {
 // existing controller behavior for environments that do not publish slices.
 func ListReadyNodeBackends(ctx context.Context, c client.Client, svc *corev1.Service) ([]Node, error) {
 	targetNodes := nodesWithReadyEndpoints(ctx, c, svc)
+	// Local external traffic policy means the provider must target only nodes
+	// that have ready local endpoints. Falling back to every ready node would
+	// produce black-holed connections and defeats Kubernetes' policy contract.
+	localOnly := svc != nil && svc.Spec.ExternalTrafficPolicy == corev1.ServiceExternalTrafficPolicyTypeLocal
 
 	nl := &corev1.NodeList{}
 	if err := c.List(ctx, nl); err != nil {
@@ -41,6 +45,8 @@ func ListReadyNodeBackends(ctx context.Context, c client.Client, svc *corev1.Ser
 				continue
 			}
 			epCount = count
+		} else if localOnly {
+			continue
 		}
 		if ip := InternalIP(n); ip != "" {
 			weight := 50

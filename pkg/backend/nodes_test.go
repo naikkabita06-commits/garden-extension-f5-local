@@ -43,3 +43,19 @@ func readyNode(name, ip string) *corev1.Node {
 		},
 	}
 }
+
+func TestListReadyNodeBackendsHonorsLocalTrafficPolicyWithoutEndpointSlices(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme: %v", err)
+	}
+	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "web"}, Spec: corev1.ServiceSpec{ExternalTrafficPolicy: corev1.ServiceExternalTrafficPolicyTypeLocal}}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(svc, readyNode("n1", "10.0.0.1")).Build()
+	backends, err := ListReadyNodeBackends(context.Background(), c, svc)
+	if err != nil {
+		t.Fatalf("ListReadyNodeBackends: %v", err)
+	}
+	if len(backends) != 0 {
+		t.Fatalf("expected no backends without local ready endpoints, got %#v", backends)
+	}
+}
