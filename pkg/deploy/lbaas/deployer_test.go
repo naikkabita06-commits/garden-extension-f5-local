@@ -306,3 +306,10 @@ func TestEnsureRejectsVirtualServerCreateWithoutProviderID(t *testing.T) {
 		t.Fatalf("expected missing provider ID error, got %v", err)
 	}
 }
+
+func TestEnsureStackRejectsCertificatesUntilCertificateManagerExists(t *testing.T) {
+	_, err := New(&stubClient{}, "").EnsureStack(context.Background(), StackEnsureRequest{Stack: &model.LoadBalancerStack{VirtualServers: []model.VirtualServer{{Name: "vs"}}, Certificates: []model.Certificate{{Name: "tls"}}}})
+	if err == nil || !strings.Contains(err.Error(), "CertificateManager") {
+		t.Fatalf("expected certificate manager error, got %v", err)
+	}
+}
