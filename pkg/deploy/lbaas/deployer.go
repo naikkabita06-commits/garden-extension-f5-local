@@ -217,6 +217,15 @@ func (d *Deployer) EnsureStack(ctx context.Context, req StackEnsureRequest) (*St
 			}
 			poolIDs[pool.Name] = resource.ID
 			observed.Graph.Pools[vs.Name+"/"+pool.Name] = model.ObservedResource{LogicalID: vs.Name + "/" + pool.Name, ExternalID: resource.ID, Name: resource.Name, Ownership: pool.Ownership}
+			// Member reconciliation returns the complete desired/observed set for
+			// this pool. Prune prior graph entries before recording it so endpoint
+			// churn cannot grow the persisted annotation indefinitely.
+			poolGraphKey := vs.Name + "/" + pool.Name
+			for key := range observed.Graph.Members {
+				if graphPoolKey(key) == poolGraphKey {
+					delete(observed.Graph.Members, key)
+				}
+			}
 			for _, member := range resource.Members {
 				key := vs.Name + "/" + pool.Name + "/" + poolMemberKey(member.ResourceID, member.ResourceIP, member.BackendPortID, member.Port)
 				observed.Graph.Members[key] = model.ObservedResource{

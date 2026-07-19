@@ -324,6 +324,14 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if graph, ok := readObservedGraph(svc.Annotations); ok {
 		shared.Graph = graph
 	}
+	if shared.LBServiceID == "" && lbservice.VIPGroup(svc) != "" {
+		if parent, ok := r.sharedParentObservedState(ctx, svc); ok {
+			shared.LBServiceID, shared.VIPPortID, shared.VIPAddress = parent.LBServiceID, parent.VIPPortID, parent.VIPAddress
+			shared.Graph = parent.Graph
+		}
+		r.Recorder.Eventf(svc, corev1.EventTypeWarning, "SyncLoadBalancerFailed", "Error ensuring CMP LBaaS resource graph: %v", err)
+		return ctrl.Result{}, err
+	}
 	cmpStart := time.Now()
 	stackResult, err := lbaasdeploy.NewFromRaw(r.cmp, r.vpcID).EnsureStack(ctx, lbaasdeploy.StackEnsureRequest{Stack: stack, Current: shared})
 	if err != nil {
@@ -352,6 +360,7 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		last := portObserved[servicePortKey(stack.Ports[len(stack.Ports)-1])]
 		lastIDs.VirtualServerID, lastIDs.VirtualServerName = last.VirtualServerID, last.VirtualServerName
 	}
+	f5metrics.CMPAPICallDuration.WithLabelValues("svc-lb-bridge", "EnsureLB").Observe(time.Since(cmpStart).Seconds())
 	f5metrics.CMPAPICallDuration.WithLabelValues("svc-lb-bridge", "EnsureLB").Observe(time.Since(cmpStart).Seconds())
 	f5metrics.CMPAPICallDuration.WithLabelValues("svc-lb-bridge", "EnsureLB").Observe(time.Since(cmpStart).Seconds())
 	f5metrics.CMPAPICallsTotal.WithLabelValues("svc-lb-bridge", "EnsureLB", "success").Inc()
@@ -539,6 +548,42 @@ func (r *serviceReconciler) cleanupCMPResources(ctx context.Context, svc *corev1
 		Current: observed, DeleteVIP: !shared, DeleteLBService: !shared,
 	})
 	return err
+}
+
+// sharedParentObservedState reuses only a proven shared LB/VIP parent from a
+// sibling Service graph. Child graph entries are intentionally excluded: each
+// Service owns its own listeners, pools, members, and rules.
+func (r *serviceReconciler) sharedParentObservedState(ctx context.Context, self *corev1.Service) (model.ObservedState, bool) {
+	services := &corev1.ServiceList{}
+	if err := r.List(ctx, services, client.InNamespace(self.Namespace)); err != nil {
+		return model.ObservedState{}, false
+	}
+	group := lbservice.VIPGroup(self)
+	for i := range services.Items {
+		candidate := &services.Items[i]
+		if candidate.Name == self.Name || lbservice.VIPGroup(candidate) != group {
+			continue
+		}
+		graph, ok := readObservedGraph(candidate.Annotations)
+		if !ok {
+			continue
+		}
+		for _, parent := range graph.LBServices {
+			if parent.ExternalID == "" || parent.Ownership.SharedGroup != group {
+				continue
+			}
+			state := model.ObservedState{Graph: model.NewObservedGraph(), LBServiceID: parent.ExternalID}
+			state.Graph.LBServices[parent.LogicalID] = parent
+			for key, vip := range graph.VIPs {
+				if vip.Ownership.SharedGroup == group && vip.ExternalID != "" {
+					state.VIPPortID, state.VIPAddress = vip.ExternalID, vip.Address
+					state.Graph.VIPs[key] = vip
+					return state, true
+				}
+			}
+		}
+	}
+	return model.ObservedState{}, false
 }
 
 // isLBServiceShared checks whether any other Service with a finalizer still references
