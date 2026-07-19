@@ -289,7 +289,15 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 	stack, err := lbservice.BuildLoadBalancerStack(svc, lbCfg, backends)
 	if err != nil {
-		log.Info("skipping: cannot build desired load-balancer stack", "reason", err.Error())
+		// Validation failures are actionable configuration errors, not a silent
+		// no-op. Keep the object unmanaged until it is corrected, but surface a
+		// stable reason in the Kubernetes event stream.
+		reason := "InvalidLoadBalancerService"
+		if strings.Contains(err.Error(), "BackendNodePortRequired") {
+			reason = "BackendNodePortRequired"
+		}
+		r.Recorder.Eventf(svc, corev1.EventTypeWarning, reason, "%v", err)
+		log.Info("cannot build desired load-balancer stack", "reason", reason, "error", err)
 		return ctrl.Result{}, nil
 	}
 

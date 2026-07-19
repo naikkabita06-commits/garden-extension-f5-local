@@ -39,8 +39,11 @@ func BuildLoadBalancerStack(svc *corev1.Service, cfg lbannotations.LBConfig, nod
 	}
 
 	for _, p := range svc.Spec.Ports {
-		if p.Port == 0 || p.NodePort == 0 {
-			continue
+		if p.Port == 0 {
+			return nil, fmt.Errorf("InvalidServicePort: service port %q has no frontend port", p.Name)
+		}
+		if p.NodePort == 0 {
+			return nil, fmt.Errorf("BackendNodePortRequired: service port %q (%d) requires a NodePort backend", p.Name, p.Port)
 		}
 		proto := MapK8sProtocolToCMP(p.Protocol, p.Port)
 		if cfg.ProtocolOverride != "" {
@@ -69,9 +72,6 @@ func BuildLoadBalancerStack(svc *corev1.Service, cfg lbannotations.LBConfig, nod
 		stack.VirtualServers = append(stack.VirtualServers, vs)
 		stack.Pools = append(stack.Pools, pool)
 		stack.Ports = append(stack.Ports, sp)
-	}
-	if len(stack.Ports) == 0 {
-		return nil, fmt.Errorf("service has no usable LoadBalancer NodePorts")
 	}
 	return stack, nil
 }
