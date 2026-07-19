@@ -56,6 +56,9 @@ func (m *BackendMemberManager) Ensure(ctx context.Context, lbServiceID, virtualS
 		if err != nil {
 			return out, changed, fmt.Errorf("creating backend member %s:%d in pool %s: %w", spec.ResourceIP, spec.Port, poolID, err)
 		}
+		if strings.TrimSpace(created.ID) == "" {
+			return out, changed, fmt.Errorf("CMP created backend member %s:%d without a provider id", spec.ResourceIP, spec.Port)
+		}
 		out = append(out, created)
 		changed = true
 	}
