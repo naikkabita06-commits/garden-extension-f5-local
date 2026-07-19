@@ -269,6 +269,28 @@ func ingressGroupMembers(items []networkingv1.Ingress, namespace, group, exclude
 	return members
 }
 
+// remainingGroupMembers returns live F5 Ingresses sharing the departing
+// object's group. It intentionally ignores foreign Ingress classes: they are
+// not safe ownership references for an F5-managed frontend.
+func (r *ingressReconciler) remainingGroupMembers(ctx context.Context, departing *networkingv1.Ingress) ([]*networkingv1.Ingress, error) {
+	items := &networkingv1.IngressList{}
+	if err := r.List(ctx, items, client.InNamespace(departing.Namespace)); err != nil {
+		return nil, err
+	}
+	group := lbingress.GroupName(departing)
+	members := make([]*networkingv1.Ingress, 0)
+	for i := range items.Items {
+		candidate := &items.Items[i]
+		if candidate.Name == departing.Name || !candidate.DeletionTimestamp.IsZero() || !r.isOwnedIngress(candidate) {
+			continue
+		}
+		if group == "" || lbingress.GroupName(candidate) == group {
+			members = append(members, candidate)
+		}
+	}
+	return members, nil
+}
+
 // isOwnedIngress checks if this Ingress should be handled by the F5 controller.
 func (r *ingressReconciler) isOwnedIngress(ing *networkingv1.Ingress) bool {
 	// Check spec.ingressClassName.
