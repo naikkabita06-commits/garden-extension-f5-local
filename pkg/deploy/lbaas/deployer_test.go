@@ -122,6 +122,24 @@ func TestEnsureSkipsVirtualServerWhenBackendHashMatches(t *testing.T) {
 	}
 }
 
+func TestDesiredBackendHashIncludesBackendPort(t *testing.T) {
+	first := DesiredBackendHash(80, 30080, []model.BackendMember{{IP: "10.0.0.1", Port: 30080, Weight: 10}})
+	second := DesiredBackendHash(80, 30080, []model.BackendMember{{IP: "10.0.0.1", Port: 30081, Weight: 10}})
+	if first == second {
+		t.Fatal("backend hash must change when the CMP member port changes")
+	}
+}
+
+func TestDesiredVirtualServerHashIncludesReplacementFields(t *testing.T) {
+	backends := []model.BackendMember{{IP: "10.0.0.1", Port: 30080, Weight: 10}}
+	base := model.VirtualServer{Name: "vs", FrontendPort: 80, BackendNodePort: 30080, Protocol: "HTTP", RoutingAlgorithm: "round_robin"}
+	changed := base
+	changed.PersistenceType = "source_ip"
+	if DesiredVirtualServerHash(base, backends) == DesiredVirtualServerHash(changed, backends) {
+		t.Fatal("virtual-server hash must change when a replacement field changes")
+	}
+}
+
 func TestEnsurePreservesExistingVirtualServerWhenHashIsNotManaged(t *testing.T) {
 	stub := &stubClient{lbServices: []LBService{{ID: "lb-1", Name: "lb"}}, vips: []VIP{{ID: "7", Address: "10.0.0.7"}}, vsList: []VirtualServer{{ID: "vs-1", Name: "vs"}}}
 	res, err := New(stub, "").Ensure(context.Background(), EnsureRequest{
@@ -234,6 +252,20 @@ func TestCleanupStackDeletesOnlyRecordedGraphResources(t *testing.T) {
 	}
 	if !result.DeletedVirtualServer || !result.DeletedVIP || !result.DeletedLBService {
 		t.Fatalf("unexpected cleanup result: %#v", result)
+	}
+}
+
+func TestCleanupStackRejectsAmbiguousLBServiceGraph(t *testing.T) {
+	stub := &stubClient{}
+	state := model.ObservedState{Graph: model.NewObservedGraph()}
+	state.Graph.LBServices["one"] = model.ObservedResource{LogicalID: "one", ExternalID: "lb-1"}
+	state.Graph.LBServices["two"] = model.ObservedResource{LogicalID: "two", ExternalID: "lb-2"}
+	_, err := New(stub, "").CleanupStack(context.Background(), CleanupRequest{Current: state, DeleteLBService: true})
+	if err == nil || !strings.Contains(err.Error(), "multiple LB service IDs") {
+		t.Fatalf("expected ambiguous parent cleanup error, got %v", err)
+	}
+	if stub.deletedLB != 0 {
+		t.Fatalf("ambiguous graph must not delete a parent, got %d deletes", stub.deletedLB)
 	}
 }
 

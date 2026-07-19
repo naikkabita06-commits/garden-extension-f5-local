@@ -30,3 +30,10 @@ func TestEnsureIngressVIP(t *testing.T) {
 		t.Fatalf("unexpected status: %#v", got.Status.LoadBalancer.Ingress)
 	}
 }
+
+func TestEnsureIngressVIPRejectsPendingProviderValue(t *testing.T) {
+	ing := &networkingv1.Ingress{ObjectMeta: metav1.ObjectMeta{Name: "web", Namespace: "default"}}
+	if err := EnsureIngressVIP(context.Background(), nil, ing, "pending"); err == nil {
+		t.Fatal("expected non-IP provider value to be rejected")
+	}
+}

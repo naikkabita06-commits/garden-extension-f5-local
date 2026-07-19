@@ -62,7 +62,17 @@ func (m *MonitorManager) Ensure(ctx context.Context, lbServiceID, virtualServerI
 	var kept MonitorResource
 	changed := false
 	for _, monitor := range monitors {
-		if strings.TrimSpace(monitor.Name) != strings.TrimSpace(spec.Name) || strings.TrimSpace(monitor.ID) == "" {
+		if strings.TrimSpace(monitor.ID) == "" {
+			continue
+		}
+		// A pool has exactly one desired monitor. Because the pool itself is
+		// graph-owned, every other monitor is stale state from an earlier
+		// desired configuration and must be removed before returning.
+		if strings.TrimSpace(monitor.Name) != strings.TrimSpace(spec.Name) {
+			if err := m.client.DeleteMonitor(ctx, lbServiceID, virtualServerID, poolID, monitor.ID); err != nil {
+				return kept, changed, fmt.Errorf("deleting obsolete monitor %s from pool %s: %w", monitor.ID, poolID, err)
+			}
+			changed = true
 			continue
 		}
 		if strings.TrimSpace(kept.ID) != "" {

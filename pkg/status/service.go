@@ -2,6 +2,8 @@ package status
 
 import (
 	"context"
+	"fmt"
+	"net"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -11,6 +13,13 @@ import (
 // EnsureServiceVIP patches Service.status.loadBalancer.ingress to the desired
 // VIP only when the current status differs.
 func EnsureServiceVIP(ctx context.Context, c client.Client, svc *corev1.Service, vip string) error {
+	vip = strings.TrimSpace(vip)
+	if vip == "" {
+		return nil
+	}
+	if net.ParseIP(vip) == nil {
+		return fmt.Errorf("refusing to publish non-IP CMP VIP %q", vip)
+	}
 	current := ""
 	if len(svc.Status.LoadBalancer.Ingress) > 0 {
 		current = strings.TrimSpace(svc.Status.LoadBalancer.Ingress[0].IP)

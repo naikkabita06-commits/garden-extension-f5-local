@@ -106,11 +106,36 @@ func (d *Deployer) Ensure(ctx context.Context, req EnsureRequest) (*EnsureResult
 func DesiredBackendHash(frontendPort, nodePort int32, backends []model.BackendMember) string {
 	sorted := make([]model.BackendMember, len(backends))
 	copy(sorted, backends)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i].IP < sorted[j].IP })
+	sort.Slice(sorted, func(i, j int) bool {
+		if sorted[i].IP != sorted[j].IP {
+			return sorted[i].IP < sorted[j].IP
+		}
+		if sorted[i].Port != sorted[j].Port {
+			return sorted[i].Port < sorted[j].Port
+		}
+		return sorted[i].Weight < sorted[j].Weight
+	})
 	b := strings.Builder{}
 	b.WriteString(fmt.Sprintf("frontend=%d;nodeport=%d;", frontendPort, nodePort))
 	for _, n := range sorted {
-		b.WriteString(fmt.Sprintf("%s:%d;", n.IP, n.Weight))
+		b.WriteString(fmt.Sprintf("%s:%d:%d;", n.IP, n.Port, n.Weight))
+	}
+	h := sha256.Sum256([]byte(b.String()))
+	return hex.EncodeToString(h[:])
+}
+
+// DesiredVirtualServerHash covers every field that the CMP create endpoint
+// applies to a listener, in addition to backend identity. CMP Swagger exposes
+// no listener update operation, so a hash change is a deliberate replacement
+// signal rather than an opportunity for name-based adoption.
+func DesiredVirtualServerHash(vs model.VirtualServer, backends []model.BackendMember) string {
+	ranges := append([]string(nil), vs.SourceRanges...)
+	sort.Strings(ranges)
+	b := strings.Builder{}
+	b.WriteString(DesiredBackendHash(vs.FrontendPort, vs.BackendNodePort, backends))
+	b.WriteString(fmt.Sprintf("name=%s;protocol=%s;algorithm=%s;persistence=%s;draining=%d;ranges=%s;default-pool=%s;", vs.Name, vs.Protocol, vs.RoutingAlgorithm, vs.PersistenceType, vs.DrainingTimeout, strings.Join(ranges, ","), vs.DefaultPoolName))
+	if vs.Monitor != nil {
+		b.WriteString(fmt.Sprintf("monitor=%s:%s:%s:%d;", vs.Monitor.Name, vs.Monitor.Type, vs.Monitor.Path, vs.Monitor.Interval))
 	}
 	h := sha256.Sum256([]byte(b.String()))
 	return hex.EncodeToString(h[:])
@@ -197,12 +222,13 @@ func (d *Deployer) EnsureStack(ctx context.Context, req StackEnsureRequest) (*St
 		if currentID == "" && len(req.Stack.VirtualServers) == 1 {
 			currentID = observed.VirtualServerID
 		}
-		backendHash := DesiredBackendHash(vs.FrontendPort, vs.BackendNodePort, backends)
-		vsID, vsName, vsChanged, err := d.virtualServers.Ensure(ctx, VirtualServerEnsureRequest{LBServiceID: lbID, VIPPortID: vipID, Desired: vs, Backends: backends, CurrentID: currentID, DesiredHash: backendHash})
+		desiredHash := DesiredVirtualServerHash(vs, backends)
+		currentHash := observed.Graph.VirtualServers[vs.Name].DesiredHash
+		vsID, vsName, vsChanged, err := d.virtualServers.Ensure(ctx, VirtualServerEnsureRequest{LBServiceID: lbID, VIPPortID: vipID, Desired: vs, Backends: backends, CurrentID: currentID, CurrentHash: currentHash, DesiredHash: desiredHash, RecreateWhenHashMissing: true})
 		if err != nil {
 			return nil, err
 		}
-		observed.Graph.VirtualServers[vs.Name] = model.ObservedResource{LogicalID: vs.Name, ExternalID: vsID, Name: vsName, Ownership: vs.Ownership}
+		observed.Graph.VirtualServers[vs.Name] = model.ObservedResource{LogicalID: vs.Name, ExternalID: vsID, Name: vsName, DesiredHash: desiredHash, Ownership: vs.Ownership}
 		if len(req.Stack.VirtualServers) == 1 {
 			observed.VirtualServerID, observed.VirtualServerName = vsID, vsName
 		}
@@ -214,7 +240,9 @@ func (d *Deployer) EnsureStack(ctx context.Context, req StackEnsureRequest) (*St
 			if err != nil {
 				return nil, err
 			}
-			resource, poolChanged, err := d.pools.Ensure(ctx, lbID, vsID, pool, memberSpecs, pool.Name == vs.DefaultPoolName)
+			poolGraphKey := vs.Name + "/" + pool.Name
+			observedPoolID := observed.Graph.Pools[poolGraphKey].ExternalID
+			resource, poolChanged, err := d.pools.EnsureOwned(ctx, lbID, vsID, pool, memberSpecs, pool.Name == vs.DefaultPoolName, observedPoolID)
 			if err != nil {
 				return nil, err
 			}
@@ -223,7 +251,6 @@ func (d *Deployer) EnsureStack(ctx context.Context, req StackEnsureRequest) (*St
 			// Member reconciliation returns the complete desired/observed set for
 			// this pool. Prune prior graph entries before recording it so endpoint
 			// churn cannot grow the persisted annotation indefinitely.
-			poolGraphKey := vs.Name + "/" + pool.Name
 			for key := range observed.Graph.Members {
 				if graphPoolKey(key) == poolGraphKey {
 					delete(observed.Graph.Members, key)
@@ -257,9 +284,25 @@ func (d *Deployer) EnsureStack(ctx context.Context, req StackEnsureRequest) (*St
 				}
 				desiredRules = append(desiredRules, RoutingRuleSpec{Host: rule.Host, Path: rule.Path, MatchType: rule.MatchType, PoolID: poolID})
 			}
-			rules, rulesChanged, err := d.routingRules.Ensure(ctx, lbID, vsID, desiredRules)
+			// A routing rule list is not an ownership list. Restrict destructive
+			// reconciliation to IDs persisted in this stack's observed graph;
+			// same host/path rules belonging to another stack must be untouched.
+			ownedRuleIDs := map[string]struct{}{}
+			for key, resource := range observed.Graph.RoutingRules {
+				if graphVirtualServerName(key) == vs.Name && strings.TrimSpace(resource.ExternalID) != "" {
+					ownedRuleIDs[resource.ExternalID] = struct{}{}
+				}
+			}
+			rules, rulesChanged, err := d.routingRules.EnsureOwned(ctx, lbID, vsID, desiredRules, ownedRuleIDs)
 			if err != nil {
 				return nil, err
+			}
+			// EnsureOwned has removed every obsolete rule it owns. Remove those
+			// graph entries before recording the exact converged set.
+			for key := range observed.Graph.RoutingRules {
+				if graphVirtualServerName(key) == vs.Name {
+					delete(observed.Graph.RoutingRules, key)
+				}
 			}
 			for _, rule := range rules {
 				key := vs.Name + "/" + routingRuleKey(rule.Host, rule.Path, rule.MatchType, rule.PoolID)

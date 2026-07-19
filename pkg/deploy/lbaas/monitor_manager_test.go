@@ -8,10 +8,11 @@ import (
 )
 
 type stubMonitorClient struct {
-	monitors []MonitorResource
-	created  []MonitorSpec
-	updated  []MonitorSpec
-	deleted  string
+	monitors   []MonitorResource
+	created    []MonitorSpec
+	updated    []MonitorSpec
+	deleted    string
+	deletedIDs []string
 }
 
 func (s *stubMonitorClient) ListMonitors(context.Context, string, string, string) ([]MonitorResource, error) {
@@ -27,6 +28,7 @@ func (s *stubMonitorClient) UpdateMonitor(_ context.Context, _, _, _, id string,
 }
 func (s *stubMonitorClient) DeleteMonitor(_ context.Context, _, _, _, id string) error {
 	s.deleted = id
+	s.deletedIDs = append(s.deletedIDs, id)
 	return nil
 }
 
@@ -90,5 +92,16 @@ func TestMonitorManagerEnsureDeletesDuplicateMonitor(t *testing.T) {
 	}
 	if !changed || res.ID != "mon-1" || client.deleted != "mon-dup" {
 		t.Fatalf("expected duplicate delete, changed=%t res=%#v deleted=%q", changed, res, client.deleted)
+	}
+}
+
+func TestMonitorManagerEnsureDeletesMonitorWithOldName(t *testing.T) {
+	client := &stubMonitorClient{monitors: []MonitorResource{{ID: "mon-old", Name: "old", Protocol: "HTTP", Path: "/", Interval: 10}}}
+	res, changed, err := NewMonitorManager(client).Ensure(context.Background(), "lb-1", "vs-1", "pool-1", &model.Monitor{Name: "new", Type: "http", Path: "/ready", Interval: 15})
+	if err != nil {
+		t.Fatalf("Ensure failed: %v", err)
+	}
+	if !changed || res.ID != "mon-1" || len(client.created) != 1 || len(client.deletedIDs) != 1 || client.deletedIDs[0] != "mon-old" {
+		t.Fatalf("expected stale monitor replacement, changed=%t result=%#v created=%#v deleted=%#v", changed, res, client.created, client.deletedIDs)
 	}
 }
