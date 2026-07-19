@@ -2,6 +2,8 @@ package status
 
 import (
 	"context"
+	"fmt"
+	"net"
 	"strings"
 
 	networkingv1 "k8s.io/api/networking/v1"
@@ -14,6 +16,9 @@ func EnsureIngressVIP(ctx context.Context, c client.Client, ing *networkingv1.In
 	vip = strings.TrimSpace(vip)
 	if vip == "" {
 		return nil
+	}
+	if net.ParseIP(vip) == nil {
+		return fmt.Errorf("refusing to publish non-IP CMP VIP %q", vip)
 	}
 	current := ""
 	if len(ing.Status.LoadBalancer.Ingress) > 0 {

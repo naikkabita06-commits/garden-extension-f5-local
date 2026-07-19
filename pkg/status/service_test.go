@@ -32,3 +32,10 @@ func TestEnsureServiceVIP(t *testing.T) {
 		t.Fatalf("unexpected status: %#v", stored.Status.LoadBalancer.Ingress)
 	}
 }
+
+func TestEnsureServiceVIPRejectsPendingProviderValue(t *testing.T) {
+	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "svc"}}
+	if err := EnsureServiceVIP(context.Background(), nil, svc, "pending"); err == nil {
+		t.Fatal("expected non-IP provider value to be rejected")
+	}
+}
