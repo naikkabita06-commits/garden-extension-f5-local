@@ -268,9 +268,12 @@ func TestDeleteObsoletePoolsDeletesChildrenBeforePool(t *testing.T) {
 	observed.Graph.Pools["keep/old"] = model.ObservedResource{LogicalID: "keep/old", ExternalID: "pool-old"}
 	observed.Graph.Members["keep/old/member"] = model.ObservedResource{LogicalID: "keep/old/member", ExternalID: "member-old"}
 
-	err := deployer.deleteObsoletePools(context.Background(), "lb-1", &observed, &model.LoadBalancerStack{VirtualServers: []model.VirtualServer{{Name: "keep"}}})
+	changed, err := deployer.deleteObsoletePools(context.Background(), "lb-1", &observed, &model.LoadBalancerStack{VirtualServers: []model.VirtualServer{{Name: "keep"}}})
 	if err != nil {
 		t.Fatalf("deleteObsoletePools: %v", err)
+	}
+	if !changed {
+		t.Fatal("expected obsolete pool cleanup to report a change")
 	}
 	if len(client.deletedMemberIDs) != 1 || client.deletedMemberIDs[0] != "member-old" || client.deletedPoolID != "pool-old" {
 		t.Fatalf("expected member then pool deletion, members=%#v pool=%q", client.deletedMemberIDs, client.deletedPoolID)
