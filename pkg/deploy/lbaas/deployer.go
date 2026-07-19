@@ -272,9 +272,11 @@ func (d *Deployer) EnsureStack(ctx context.Context, req StackEnsureRequest) (*St
 	// resource has been observed under its logical graph key, drop the alias so
 	// it cannot later be mistaken for an obsolete listener during cleanup.
 	dropMigratedLegacyAliases(&observed)
-	if err := d.deleteObsoletePools(ctx, lbID, &observed, req.Stack); err != nil {
+	poolsDeleted, err := d.deleteObsoletePools(ctx, lbID, &observed, req.Stack)
+	if err != nil {
 		return nil, err
 	}
+	changed = changed || poolsDeleted
 	if err := d.deleteObsoleteVirtualServers(ctx, lbID, &observed, req.Stack); err != nil {
 		return nil, err
 	}
@@ -286,7 +288,8 @@ func (d *Deployer) EnsureStack(ctx context.Context, req StackEnsureRequest) (*St
 // reconciled before this point, so a pool is never removed while a desired rule
 // can still select it. Children are removed before the pool as required by the
 // CMP hierarchy.
-func (d *Deployer) deleteObsoletePools(ctx context.Context, lbID string, observed *model.ObservedState, stack *model.LoadBalancerStack) error {
+func (d *Deployer) deleteObsoletePools(ctx context.Context, lbID string, observed *model.ObservedState, stack *model.LoadBalancerStack) (bool, error) {
+	changed := false
 	desired := map[string]struct{}{}
 	for _, vs := range stack.VirtualServers {
 		for _, pool := range poolsForVirtualServer(stack, vs) {
@@ -299,38 +302,41 @@ func (d *Deployer) deleteObsoletePools(ctx context.Context, lbID string, observe
 		}
 		vsID := virtualServerIDForGraphKey(observed.Graph, key)
 		if vsID == "" {
-			return fmt.Errorf("obsolete pool %q has no recorded virtual-server parent", key)
+			return changed, fmt.Errorf("obsolete pool %q has no recorded virtual-server parent", key)
 		}
 		if d.pools == nil {
-			return fmt.Errorf("pool cleanup requires a PoolManager")
+			return changed, fmt.Errorf("pool cleanup requires a PoolManager")
 		}
 		for memberKey, member := range observed.Graph.Members {
 			if graphPoolKey(memberKey) != key || member.ExternalID == "" {
 				continue
 			}
 			if err := d.pools.members.client.DeletePoolMember(ctx, lbID, vsID, pool.ExternalID, member.ExternalID); err != nil {
-				return fmt.Errorf("deleting obsolete pool member %s: %w", member.ExternalID, err)
+				return changed, fmt.Errorf("deleting obsolete pool member %s: %w", member.ExternalID, err)
 			}
 			delete(observed.Graph.Members, memberKey)
+			changed = true
 		}
 		for monitorKey, monitor := range observed.Graph.Monitors {
 			if monitorKey != key || monitor.ExternalID == "" {
 				continue
 			}
 			if d.monitors == nil {
-				return fmt.Errorf("monitor cleanup requires a MonitorManager")
+				return changed, fmt.Errorf("monitor cleanup requires a MonitorManager")
 			}
 			if err := d.monitors.Cleanup(ctx, lbID, vsID, pool.ExternalID, monitor.ExternalID); err != nil {
-				return fmt.Errorf("deleting obsolete pool monitor %s: %w", monitor.ExternalID, err)
+				return changed, fmt.Errorf("deleting obsolete pool monitor %s: %w", monitor.ExternalID, err)
 			}
 			delete(observed.Graph.Monitors, monitorKey)
+			changed = true
 		}
 		if err := d.pools.Cleanup(ctx, lbID, vsID, pool.ExternalID); err != nil {
-			return fmt.Errorf("deleting obsolete pool %s: %w", pool.ExternalID, err)
+			return changed, fmt.Errorf("deleting obsolete pool %s: %w", pool.ExternalID, err)
 		}
 		delete(observed.Graph.Pools, key)
+		changed = true
 	}
-	return nil
+	return changed, nil
 }
 
 func dropMigratedLegacyAliases(observed *model.ObservedState) {
