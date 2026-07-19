@@ -237,6 +237,20 @@ func TestCleanupStackDeletesOnlyRecordedGraphResources(t *testing.T) {
 	}
 }
 
+func TestCleanupStackRejectsAmbiguousLBServiceGraph(t *testing.T) {
+	stub := &stubClient{}
+	state := model.ObservedState{Graph: model.NewObservedGraph()}
+	state.Graph.LBServices["one"] = model.ObservedResource{LogicalID: "one", ExternalID: "lb-1"}
+	state.Graph.LBServices["two"] = model.ObservedResource{LogicalID: "two", ExternalID: "lb-2"}
+	_, err := New(stub, "").CleanupStack(context.Background(), CleanupRequest{Current: state, DeleteLBService: true})
+	if err == nil || !strings.Contains(err.Error(), "multiple LB service IDs") {
+		t.Fatalf("expected ambiguous parent cleanup error, got %v", err)
+	}
+	if stub.deletedLB != 0 {
+		t.Fatalf("ambiguous graph must not delete a parent, got %d deletes", stub.deletedLB)
+	}
+}
+
 func TestDeleteObsoleteVirtualServersRemovesOnlyUndesiredListener(t *testing.T) {
 	stub := &stubClient{}
 	deployer := New(stub, "")

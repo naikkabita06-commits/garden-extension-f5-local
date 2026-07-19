@@ -257,9 +257,25 @@ func (d *Deployer) EnsureStack(ctx context.Context, req StackEnsureRequest) (*St
 				}
 				desiredRules = append(desiredRules, RoutingRuleSpec{Host: rule.Host, Path: rule.Path, MatchType: rule.MatchType, PoolID: poolID})
 			}
-			rules, rulesChanged, err := d.routingRules.Ensure(ctx, lbID, vsID, desiredRules)
+			// A routing rule list is not an ownership list. Restrict destructive
+			// reconciliation to IDs persisted in this stack's observed graph;
+			// same host/path rules belonging to another stack must be untouched.
+			ownedRuleIDs := map[string]struct{}{}
+			for key, resource := range observed.Graph.RoutingRules {
+				if graphVirtualServerName(key) == vs.Name && strings.TrimSpace(resource.ExternalID) != "" {
+					ownedRuleIDs[resource.ExternalID] = struct{}{}
+				}
+			}
+			rules, rulesChanged, err := d.routingRules.EnsureOwned(ctx, lbID, vsID, desiredRules, ownedRuleIDs)
 			if err != nil {
 				return nil, err
+			}
+			// EnsureOwned has removed every obsolete rule it owns. Remove those
+			// graph entries before recording the exact converged set.
+			for key := range observed.Graph.RoutingRules {
+				if graphVirtualServerName(key) == vs.Name {
+					delete(observed.Graph.RoutingRules, key)
+				}
 			}
 			for _, rule := range rules {
 				key := vs.Name + "/" + routingRuleKey(rule.Host, rule.Path, rule.MatchType, rule.PoolID)

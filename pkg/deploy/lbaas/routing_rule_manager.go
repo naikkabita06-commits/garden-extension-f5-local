@@ -34,6 +34,22 @@ func NewRoutingRuleManager(client RoutingRuleClient) *RoutingRuleManager {
 }
 
 func (m *RoutingRuleManager) Ensure(ctx context.Context, lbServiceID, virtualServerID string, desired []RoutingRuleSpec) ([]RoutingRuleResource, bool, error) {
+	// This compatibility method predates the observed graph.  New controller
+	// code must use EnsureOwned: a list response has no ownership metadata, so
+	// treating every returned rule as ours is unsafe.
+	return m.ensure(ctx, lbServiceID, virtualServerID, desired, nil, true)
+}
+
+// EnsureOwned reconciles rules owned by this stack only. ownedRuleIDs must be
+// populated from the persisted observed graph. Rules returned by CMP that are
+// not in that set are deliberately ignored: CMP's routing-rule response does
+// not expose labels or another stable ownership field, and a host/path match
+// is not ownership proof.
+func (m *RoutingRuleManager) EnsureOwned(ctx context.Context, lbServiceID, virtualServerID string, desired []RoutingRuleSpec, ownedRuleIDs map[string]struct{}) ([]RoutingRuleResource, bool, error) {
+	return m.ensure(ctx, lbServiceID, virtualServerID, desired, ownedRuleIDs, false)
+}
+
+func (m *RoutingRuleManager) ensure(ctx context.Context, lbServiceID, virtualServerID string, desired []RoutingRuleSpec, ownedRuleIDs map[string]struct{}, legacyAllOwned bool) ([]RoutingRuleResource, bool, error) {
 	if strings.TrimSpace(lbServiceID) == "" || strings.TrimSpace(virtualServerID) == "" {
 		return nil, false, fmt.Errorf("lb service id and virtual server id are required for routing rule reconciliation")
 	}
@@ -42,7 +58,14 @@ func (m *RoutingRuleManager) Ensure(ctx context.Context, lbServiceID, virtualSer
 		return nil, false, fmt.Errorf("listing routing rules for virtual server %s: %w", virtualServerID, err)
 	}
 	byKey := map[string]RoutingRuleResource{}
+	foreignKeys := map[string]struct{}{}
 	for _, rule := range existing {
+		if !legacyAllOwned {
+			if _, owned := ownedRuleIDs[strings.TrimSpace(rule.ID)]; !owned {
+				foreignKeys[routingRuleKey(rule.Host, rule.Path, rule.MatchType, rule.PoolID)] = struct{}{}
+				continue
+			}
+		}
 		byKey[routingRuleKey(rule.Host, rule.Path, rule.MatchType, rule.PoolID)] = rule
 	}
 	desiredKeys := map[string]struct{}{}
@@ -54,6 +77,9 @@ func (m *RoutingRuleManager) Ensure(ctx context.Context, lbServiceID, virtualSer
 		}
 		key := routingRuleKey(spec.Host, spec.Path, spec.MatchType, spec.PoolID)
 		desiredKeys[key] = struct{}{}
+		if _, foreign := foreignKeys[key]; foreign {
+			return out, changed, fmt.Errorf("routing rule host=%s path=%s pool=%s is owned by another stack", spec.Host, spec.Path, spec.PoolID)
+		}
 		if existing, ok := byKey[key]; ok && strings.TrimSpace(existing.ID) != "" {
 			out = append(out, existing)
 			continue

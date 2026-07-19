@@ -62,3 +62,28 @@ func TestRoutingRuleManagerDeletesAllRulesWhenDesiredIsEmpty(t *testing.T) {
 		t.Fatalf("expected all rules deleted, changed=%t rules=%#v deleted=%#v", changed, rules, client.deleted)
 	}
 }
+
+func TestRoutingRuleManagerEnsureOwnedDoesNotDeleteForeignRules(t *testing.T) {
+	client := &stubRoutingRuleClient{rules: []RoutingRuleResource{
+		{ID: "rule-owned", Host: "owned.example.com", Path: "/", MatchType: "prefix", PoolID: "pool-1"},
+		{ID: "rule-foreign", Host: "foreign.example.com", Path: "/", MatchType: "prefix", PoolID: "pool-2"},
+	}}
+	rules, changed, err := NewRoutingRuleManager(client).EnsureOwned(context.Background(), "lb-1", "vs-1", nil, map[string]struct{}{"rule-owned": {}})
+	if err != nil {
+		t.Fatalf("EnsureOwned failed: %v", err)
+	}
+	if !changed || len(rules) != 0 || len(client.deleted) != 1 || client.deleted[0] != "rule-owned" {
+		t.Fatalf("expected only owned rule deletion, changed=%t rules=%#v deleted=%#v", changed, rules, client.deleted)
+	}
+}
+
+func TestRoutingRuleManagerEnsureOwnedRejectsForeignRouteCollision(t *testing.T) {
+	client := &stubRoutingRuleClient{rules: []RoutingRuleResource{{ID: "rule-foreign", Host: "example.com", Path: "/", MatchType: "prefix", PoolID: "pool-1"}}}
+	_, _, err := NewRoutingRuleManager(client).EnsureOwned(context.Background(), "lb-1", "vs-1", []RoutingRuleSpec{{Host: "example.com", Path: "/", MatchType: "prefix", PoolID: "pool-1"}}, map[string]struct{}{})
+	if err == nil {
+		t.Fatal("expected foreign rule collision to fail")
+	}
+	if len(client.created) != 0 || len(client.deleted) != 0 {
+		t.Fatalf("foreign rule must not be mutated, created=%#v deleted=%#v", client.created, client.deleted)
+	}
+}

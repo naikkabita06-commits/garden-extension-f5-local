@@ -35,12 +35,9 @@ func (d *Deployer) CleanupStack(ctx context.Context, req CleanupRequest) (*Clean
 	current := req.Current
 	current.EnsureGraph()
 	result := &CleanupResult{}
-	lbID := current.LBServiceID
-	if lbID == "" {
-		for _, resource := range current.Graph.LBServices {
-			lbID = resource.ExternalID
-			break
-		}
+	lbID, err := cleanupLBServiceID(current)
+	if err != nil {
+		return result, err
 	}
 	if lbID == "" {
 		return result, nil
@@ -103,6 +100,31 @@ func (d *Deployer) CleanupStack(ctx context.Context, req CleanupRequest) (*Clean
 		result.DeletedLBService = true
 	}
 	return result, nil
+}
+
+// cleanupLBServiceID never selects an arbitrary map entry. A graph may contain
+// multiple parent LB services after a failed migration; deleting the first one
+// would violate the ownership boundary. In that case reconciliation must
+// recover the graph before cleanup can continue.
+func cleanupLBServiceID(current model.ObservedState) (string, error) {
+	ids := map[string]struct{}{}
+	if id := strings.TrimSpace(current.LBServiceID); id != "" {
+		ids[id] = struct{}{}
+	}
+	for _, resource := range current.Graph.LBServices {
+		if id := strings.TrimSpace(resource.ExternalID); id != "" {
+			ids[id] = struct{}{}
+		}
+	}
+	switch len(ids) {
+	case 0:
+		return "", nil
+	case 1:
+		for id := range ids {
+			return id, nil
+		}
+	}
+	return "", fmt.Errorf("observed graph contains multiple LB service IDs; refusing ambiguous cleanup")
 }
 
 func sortedResources(resources map[string]model.ObservedResource) []model.ObservedResource {
