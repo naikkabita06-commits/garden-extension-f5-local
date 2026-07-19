@@ -122,6 +122,24 @@ func TestEnsureSkipsVirtualServerWhenBackendHashMatches(t *testing.T) {
 	}
 }
 
+func TestDesiredBackendHashIncludesBackendPort(t *testing.T) {
+	first := DesiredBackendHash(80, 30080, []model.BackendMember{{IP: "10.0.0.1", Port: 30080, Weight: 10}})
+	second := DesiredBackendHash(80, 30080, []model.BackendMember{{IP: "10.0.0.1", Port: 30081, Weight: 10}})
+	if first == second {
+		t.Fatal("backend hash must change when the CMP member port changes")
+	}
+}
+
+func TestDesiredVirtualServerHashIncludesReplacementFields(t *testing.T) {
+	backends := []model.BackendMember{{IP: "10.0.0.1", Port: 30080, Weight: 10}}
+	base := model.VirtualServer{Name: "vs", FrontendPort: 80, BackendNodePort: 30080, Protocol: "HTTP", RoutingAlgorithm: "round_robin"}
+	changed := base
+	changed.PersistenceType = "source_ip"
+	if DesiredVirtualServerHash(base, backends) == DesiredVirtualServerHash(changed, backends) {
+		t.Fatal("virtual-server hash must change when a replacement field changes")
+	}
+}
+
 func TestEnsurePreservesExistingVirtualServerWhenHashIsNotManaged(t *testing.T) {
 	stub := &stubClient{lbServices: []LBService{{ID: "lb-1", Name: "lb"}}, vips: []VIP{{ID: "7", Address: "10.0.0.7"}}, vsList: []VirtualServer{{ID: "vs-1", Name: "vs"}}}
 	res, err := New(stub, "").Ensure(context.Background(), EnsureRequest{

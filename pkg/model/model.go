@@ -111,7 +111,11 @@ type ObservedResource struct {
 	ExternalID string
 	Name       string
 	Address    string
-	Ownership  Ownership
+	// DesiredHash is the canonical hash of the desired immutable/replacement
+	// fields last applied to this provider resource. It allows reconciliation to
+	// distinguish a real desired-state change from a stable observed ID.
+	DesiredHash string
+	Ownership   Ownership
 }
 
 // ObservedGraph is the per-resource provider graph observed during a reconcile.
