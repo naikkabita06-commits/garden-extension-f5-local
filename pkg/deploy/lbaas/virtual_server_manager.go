@@ -50,14 +50,9 @@ func (m *VirtualServerManager) Ensure(ctx context.Context, req VirtualServerEnsu
 			currentID = ""
 		}
 	}
-	if currentID == "" {
-		for _, listener := range listeners {
-			if strings.TrimSpace(listener.Name) == req.Desired.Name && strings.TrimSpace(listener.ID) != "" {
-				currentID = strings.TrimSpace(listener.ID)
-				break
-			}
-		}
-	}
+	// Never adopt a listener merely because its display name matches. The CMP
+	// listener response lacks ownership metadata, so only a persisted provider
+	// ID can prove this controller owns the resource.
 	if currentID != "" {
 		if req.CurrentHash != "" {
 			if req.CurrentHash == req.DesiredHash {

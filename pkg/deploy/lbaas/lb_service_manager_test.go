@@ -2,7 +2,6 @@ package lbaas
 
 import (
 	"context"
-	"strings"
 	"testing"
 )
 
@@ -17,19 +16,11 @@ func TestLBServiceManagerVerifiesCurrentID(t *testing.T) {
 	}
 }
 
-func TestLBServiceManagerRediscoversMissingCurrentIDByDesiredName(t *testing.T) {
+func TestLBServiceManagerDoesNotAdoptSameNameResource(t *testing.T) {
 	stub := &stubClient{lbServices: []LBService{{ID: "lb-other", Name: "app"}}}
 	id, changed, err := NewLBServiceManager(stub, "").Ensure(context.Background(), EnsureRequest{LBName: "app"}, "lb-1")
-	if err != nil || id != "lb-other" || changed {
-		t.Fatalf("expected desired LB rediscovery, id=%q changed=%t err=%v", id, changed, err)
-	}
-}
-
-func TestLBServiceManagerRejectsDuplicateNameAdoption(t *testing.T) {
-	stub := &stubClient{lbServices: []LBService{{ID: "lb-1", Name: "app"}, {ID: "lb-2", Name: "app"}}}
-	_, _, err := NewLBServiceManager(stub, "").Ensure(context.Background(), EnsureRequest{LBName: "app"}, "")
-	if err == nil || !strings.Contains(err.Error(), "multiple LB services") {
-		t.Fatalf("expected duplicate name error, got %v", err)
+	if err != nil || id != "lb-1" || !changed || stub.createdLB != 1 {
+		t.Fatalf("expected owned replacement creation, id=%q changed=%t created=%d err=%v", id, changed, stub.createdLB, err)
 	}
 }
 
