@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 
 	f5client "github.com/gardener/gardener-extension-f5/pkg/f5"
 	"github.com/gardener/gardener-extension-f5/pkg/model"
@@ -120,21 +121,23 @@ func sortedResources(resources map[string]model.ObservedResource) []model.Observ
 }
 
 func virtualServerIDForGraphKey(graph model.ObservedGraph, key string) string {
-	for name, vs := range graph.VirtualServers {
-		if key == name || len(key) > len(name) && key[:len(name)] == name && key[len(name)] == '/' {
-			return vs.ExternalID
-		}
+	// Graph keys are structured as virtual-server/pool[/child]. Do not use a
+	// display-name prefix here: names such as "web" and "web-admin" must never
+	// be allowed to select each other's parent during deletion.
+	name, _, ok := strings.Cut(key, "/")
+	if !ok {
+		name = key
 	}
-	return ""
+	return graph.VirtualServers[name].ExternalID
 }
 
 func poolParentIDsForGraphKey(graph model.ObservedGraph, key string) (string, string) {
-	for poolKey, pool := range graph.Pools {
-		if key == poolKey || len(key) > len(poolKey) && key[:len(poolKey)] == poolKey && key[len(poolKey)] == '/' {
-			return virtualServerIDForGraphKey(graph, poolKey), pool.ExternalID
-		}
+	parts := strings.SplitN(key, "/", 3)
+	if len(parts) < 2 {
+		return "", ""
 	}
-	return "", ""
+	poolKey := parts[0] + "/" + parts[1]
+	return graph.VirtualServers[parts[0]].ExternalID, graph.Pools[poolKey].ExternalID
 }
 
 func (d *Deployer) Cleanup(ctx context.Context, req CleanupRequest) (*CleanupResult, error) {
