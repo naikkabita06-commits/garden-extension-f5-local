@@ -12,6 +12,36 @@ import (
 // types may exist, but unsupported runtime features are rejected here so the
 // controller never silently provisions a partial or misleading data plane.
 func ValidateSupported(ing *networkingv1.Ingress) error {
+	if err := validateIngressShape(ing); err != nil {
+		return err
+	}
+	backendRefs := map[string]backendRef{}
+	consume := func(be networkingv1.IngressBackend) {
+		ref := backendRefFromService(be.Service)
+		backendRefs[ref.String()] = ref
+	}
+	for _, rule := range ing.Spec.Rules {
+		for _, path := range rule.HTTP.Paths {
+			consume(path.Backend)
+		}
+	}
+	if ing.Spec.DefaultBackend != nil {
+		consume(*ing.Spec.DefaultBackend)
+	}
+	if len(ing.Spec.TLS) > 0 {
+		return fmt.Errorf("TLS certificate upload and virtual-server binding are not yet supported by the Ingress deployer")
+	}
+	if len(backendRefs) > 1 {
+		return fmt.Errorf("multiple backend services or ports require routing-rule and pool deployment support that is not yet enabled")
+	}
+	return nil
+}
+
+// validateIngressShape checks Kubernetes and routing semantics shared by the
+// legacy single-Ingress path and the group graph builder. It intentionally
+// does not reject TLS or multiple backends: those are valid desired-state
+// constructs and are represented by the group desired-state builder.
+func validateIngressShape(ing *networkingv1.Ingress) error {
 	if ing == nil {
 		return fmt.Errorf("ingress must not be nil")
 	}
@@ -71,12 +101,6 @@ func ValidateSupported(ing *networkingv1.Ingress) error {
 		if strings.TrimSpace(tls.SecretName) == "" {
 			return fmt.Errorf("tls.secretName is required when TLS is configured")
 		}
-	}
-	if len(ing.Spec.TLS) > 0 {
-		return fmt.Errorf("TLS certificate upload and virtual-server binding are not yet supported by the Ingress deployer")
-	}
-	if len(backendRefs) > 1 {
-		return fmt.Errorf("multiple backend services or ports require routing-rule and pool deployment support that is not yet enabled")
 	}
 	if backendCount == 0 {
 		return fmt.Errorf("at least one service backend is required")
