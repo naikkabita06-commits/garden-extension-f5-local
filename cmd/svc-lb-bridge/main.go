@@ -509,74 +509,23 @@ func listManagedServiceRequests(ctx context.Context, c client.Client) []reconcil
 }
 
 func (r *serviceReconciler) cleanupCMPResources(ctx context.Context, svc *corev1.Service) error {
-	lbID := svc.Annotations[annLBServiceID]
-	vipID := svc.Annotations[annVIPPortID]
-	vsID := svc.Annotations[annVirtualServerID]
-
-	// Best-effort lookup by deterministic name if IDs are missing.
-	if strings.TrimSpace(lbID) == "" {
-		if found, err := lbaasdeploy.NewFromRaw(r.cmp, r.vpcID).FindLBServiceIDByName(ctx, desiredLBServiceName(svc)); err == nil {
-			lbID = found
-		}
+	observed := model.ObservedState{
+		LBServiceID:     strings.TrimSpace(svc.Annotations[annLBServiceID]),
+		VIPPortID:       strings.TrimSpace(svc.Annotations[annVIPPortID]),
+		VirtualServerID: strings.TrimSpace(svc.Annotations[annVirtualServerID]),
+		VIPAddress:      strings.TrimSpace(svc.Annotations[annVIPAddress]),
 	}
-
-	log := ctrl.Log.WithName("svc-lb-bridge").WithValues(
-		"service", fmt.Sprintf("%s/%s", svc.Namespace, svc.Name),
-		"lbServiceID", lbID, "vipPortID", vipID, "virtualServerID", vsID,
-	)
-
-	if lbID != "" {
-		// Delete VS: use ID if present; otherwise delete any VS matching our naming convention.
-		if vsID != "" {
-			log.Info("deleting CMP Virtual Server")
-			_, err := lbaasdeploy.NewFromRaw(r.cmp, r.vpcID).Cleanup(ctx, lbaasdeploy.CleanupRequest{
-				Current: model.ObservedState{
-					LBServiceID:     strings.TrimSpace(lbID),
-					VirtualServerID: strings.TrimSpace(vsID),
-				},
-			})
-			if err != nil {
-				return err
-			}
-		}
-
-		// If this LBService is shared (vip-group), only delete VIP+LBService when no other
-		// Services still reference the same LBService ID. This prevents destroying resources
-		// that are still in use by other group members.
-		shared := r.isLBServiceShared(ctx, svc, lbID)
-		if shared {
-			log.Info("LBService is shared with other Services; skipping VIP and LBService deletion")
-		}
-
-		if !shared {
-			// Delete VIP: use ID if present; otherwise delete all VIPs on this LB (dedicated LB per Service).
-			if vipID != "" {
-				log.Info("deleting CMP VIP")
-				_, err := lbaasdeploy.NewFromRaw(r.cmp, r.vpcID).Cleanup(ctx, lbaasdeploy.CleanupRequest{
-					Current: model.ObservedState{
-						LBServiceID: strings.TrimSpace(lbID),
-						VIPPortID:   strings.TrimSpace(vipID),
-					},
-					DeleteVIP: true,
-				})
-				if err != nil {
-					return err
-				}
-			}
-		}
-		if !shared && lbID != "" {
-			log.Info("deleting CMP LB Service")
-			_, err := lbaasdeploy.NewFromRaw(r.cmp, r.vpcID).Cleanup(ctx, lbaasdeploy.CleanupRequest{
-				Current:         model.ObservedState{LBServiceID: strings.TrimSpace(lbID)},
-				DeleteLBService: true,
-			})
-			if err != nil {
-				return err
-			}
-		}
+	if graph, ok := readObservedGraph(svc.Annotations); ok {
+		observed.Graph = graph
 	}
-
-	return nil
+	// A missing graph is a legacy object. EnsureGraph permits deletion of only
+	// its recorded scalar resources; it never falls back to names or all VIPs.
+	observed.EnsureGraph()
+	shared := r.isLBServiceShared(ctx, svc, observed.LBServiceID)
+	_, err := lbaasdeploy.NewFromRaw(r.cmp, r.vpcID).CleanupStack(ctx, lbaasdeploy.CleanupRequest{
+		Current: observed, DeleteVIP: !shared, DeleteLBService: !shared,
+	})
+	return err
 }
 
 // isLBServiceShared checks whether any other Service with a finalizer still references
