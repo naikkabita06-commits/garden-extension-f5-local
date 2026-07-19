@@ -25,8 +25,19 @@ type RawClient interface {
 
 type rawAdapter struct{ raw RawClient }
 
-func NewRawClient(raw RawClient) Client                { return rawAdapter{raw: raw} }
-func NewFromRaw(raw RawClient, vpcID string) *Deployer { return New(NewRawClient(raw), vpcID) }
+func NewRawClient(raw RawClient) Client { return rawAdapter{raw: raw} }
+
+// NewFromRaw enables every provider capability implemented by the underlying
+// client. This keeps callers on the stack deployer path from silently losing
+// pool/member reconciliation when they construct a deployer from the legacy
+// raw CMP client.
+func NewFromRaw(raw RawClient, vpcID string) *Deployer {
+	d := New(NewRawClient(raw), vpcID)
+	if pools, ok := raw.(RawPoolClient); ok {
+		d.pools = NewPoolManager(NewPoolClientFromRaw(pools))
+	}
+	return d
+}
 
 func (a rawAdapter) ListLBServices(ctx context.Context) ([]LBService, error) {
 	items, err := a.raw.ListLBServices(ctx, nil)
