@@ -98,3 +98,25 @@ func TestPoolManagerEnsureRejectsAmbiguousObservedPool(t *testing.T) {
 		t.Fatal("expected ambiguous pools to fail")
 	}
 }
+
+func TestPoolManagerEnsureOwnedDoesNotAdoptNameMatch(t *testing.T) {
+	client := &stubPoolClient{pools: []PoolResource{{ID: "pool-foreign", Name: "pool-web"}}}
+	_, _, err := NewPoolManager(client).EnsureOwned(context.Background(), "lb-1", "vs-1", model.Pool{Name: "pool-web"}, nil, false, "")
+	if err == nil {
+		t.Fatal("expected foreign pool name collision to fail")
+	}
+	if len(client.createdPools) != 0 {
+		t.Fatalf("foreign pool must not be adopted or duplicated: %#v", client.createdPools)
+	}
+}
+
+func TestPoolManagerEnsureOwnedUsesRecordedProviderID(t *testing.T) {
+	client := &stubPoolClient{pools: []PoolResource{{ID: "pool-owned", Name: "pool-web"}, {ID: "pool-foreign", Name: "pool-web"}}}
+	res, changed, err := NewPoolManager(client).EnsureOwned(context.Background(), "lb-1", "vs-1", model.Pool{Name: "pool-web"}, nil, false, "pool-owned")
+	if err != nil {
+		t.Fatalf("EnsureOwned failed: %v", err)
+	}
+	if changed || res.ID != "pool-owned" || len(client.createdPools) != 0 {
+		t.Fatalf("expected recorded pool reuse only, changed=%t result=%#v creates=%#v", changed, res, client.createdPools)
+	}
+}

@@ -66,6 +66,19 @@ func NewPoolManager(client PoolClient) *PoolManager {
 }
 
 func (m *PoolManager) Ensure(ctx context.Context, lbServiceID, virtualServerID string, desired model.Pool, members []PoolMemberSpec, setDefault bool) (PoolResource, bool, error) {
+	return m.ensure(ctx, lbServiceID, virtualServerID, desired, members, setDefault, "", true)
+}
+
+// EnsureOwned reconciles a pool only when its provider ID was recorded in this
+// stack's observed graph. CMP pool list entries do not carry ownership tags,
+// therefore matching a pool name is never sufficient to adopt it. A stale
+// graph ID is treated as drift and results in a create only when no foreign
+// pool already occupies the desired name.
+func (m *PoolManager) EnsureOwned(ctx context.Context, lbServiceID, virtualServerID string, desired model.Pool, members []PoolMemberSpec, setDefault bool, observedPoolID string) (PoolResource, bool, error) {
+	return m.ensure(ctx, lbServiceID, virtualServerID, desired, members, setDefault, observedPoolID, false)
+}
+
+func (m *PoolManager) ensure(ctx context.Context, lbServiceID, virtualServerID string, desired model.Pool, members []PoolMemberSpec, setDefault bool, observedPoolID string, legacyNameAdoption bool) (PoolResource, bool, error) {
 	if strings.TrimSpace(lbServiceID) == "" {
 		return PoolResource{}, false, fmt.Errorf("lb service id must not be empty")
 	}
@@ -79,9 +92,19 @@ func (m *PoolManager) Ensure(ctx context.Context, lbServiceID, virtualServerID s
 	if err != nil {
 		return PoolResource{}, false, fmt.Errorf("listing pools on virtual server %s: %w", virtualServerID, err)
 	}
+	observedPoolID = strings.TrimSpace(observedPoolID)
 	var pool PoolResource
+	nameCollision := false
 	for _, candidate := range existing {
+		if observedPoolID != "" && strings.TrimSpace(candidate.ID) == observedPoolID {
+			pool = candidate
+			continue
+		}
 		if strings.EqualFold(strings.TrimSpace(candidate.Name), strings.TrimSpace(desired.Name)) {
+			nameCollision = true
+			if !legacyNameAdoption {
+				continue
+			}
 			if strings.TrimSpace(pool.ID) != "" {
 				return PoolResource{}, false, fmt.Errorf("ambiguous CMP pools named %q on virtual server %s", desired.Name, virtualServerID)
 			}
@@ -90,6 +113,9 @@ func (m *PoolManager) Ensure(ctx context.Context, lbServiceID, virtualServerID s
 	}
 	changed := false
 	if strings.TrimSpace(pool.ID) == "" {
+		if nameCollision && !legacyNameAdoption {
+			return PoolResource{}, false, fmt.Errorf("pool %q on virtual server %s is owned by another stack", desired.Name, virtualServerID)
+		}
 		pool, err = m.client.CreatePool(ctx, lbServiceID, virtualServerID, PoolSpec{Name: desired.Name, Monitor: desired.Monitor, Members: members})
 		if err != nil {
 			return PoolResource{}, false, fmt.Errorf("creating pool %s on virtual server %s: %w", desired.Name, virtualServerID, err)
