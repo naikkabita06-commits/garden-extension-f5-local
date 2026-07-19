@@ -3,6 +3,7 @@ package lbaas
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/gardener/gardener-extension-f5/pkg/model"
@@ -281,5 +282,15 @@ func TestEnsureFailsWhenBackendPortHasNoResourceID(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected missing CMP resource_id to fail")
+	}
+}
+
+func TestEnsureRejectsAmbiguousBackendNetworkPortIdentity(t *testing.T) {
+	stub := &stubClient{searchNetworkPorts: func(ip string) []NetworkPort {
+		return []NetworkPort{{ID: 1, ResourceID: "compute-a", ResourceType: "compute", IP: ip}, {ID: 2, ResourceID: "compute-b", ResourceType: "compute", IP: ip}}
+	}}
+	_, err := New(stub, "").Ensure(context.Background(), EnsureRequest{VirtualServer: model.VirtualServer{Name: "vs", FrontendPort: 80, BackendNodePort: 30080}, Backends: []model.BackendMember{{IP: "10.0.0.1", Port: 30080}}})
+	if err == nil || !strings.Contains(err.Error(), "ambiguous CMP network ports") {
+		t.Fatalf("expected ambiguous identity error, got %v", err)
 	}
 }
