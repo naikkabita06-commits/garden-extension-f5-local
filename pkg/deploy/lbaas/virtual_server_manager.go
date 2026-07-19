@@ -50,14 +50,9 @@ func (m *VirtualServerManager) Ensure(ctx context.Context, req VirtualServerEnsu
 			currentID = ""
 		}
 	}
-	if currentID == "" {
-		for _, listener := range listeners {
-			if strings.TrimSpace(listener.Name) == req.Desired.Name && strings.TrimSpace(listener.ID) != "" {
-				currentID = strings.TrimSpace(listener.ID)
-				break
-			}
-		}
-	}
+	// Never adopt a listener merely because its display name matches. The CMP
+	// listener response lacks ownership metadata, so only a persisted provider
+	// ID can prove this controller owns the resource.
 	if currentID != "" {
 		if req.CurrentHash != "" {
 			if req.CurrentHash == req.DesiredHash {
@@ -153,6 +148,7 @@ func (m *VirtualServerManager) resolveBackendPort(ctx context.Context, ip string
 	if err != nil {
 		return NetworkPort{}, fmt.Errorf("searching CMP network port for backend IP %s: %w", ip, err)
 	}
+	var match *NetworkPort
 	for _, port := range ports {
 		if strings.TrimSpace(port.IP) == strings.TrimSpace(ip) && port.ID != 0 {
 			if strings.TrimSpace(port.ResourceType) == "" {
@@ -161,8 +157,15 @@ func (m *VirtualServerManager) resolveBackendPort(ctx context.Context, ip string
 			if strings.TrimSpace(port.ResourceID) == "" {
 				return NetworkPort{}, fmt.Errorf("CMP network port for backend IP %s has no resource_id", ip)
 			}
-			return port, nil
+			if match != nil {
+				return NetworkPort{}, fmt.Errorf("ambiguous CMP network ports for backend IP %s; refusing backend identity adoption", ip)
+			}
+			candidate := port
+			match = &candidate
 		}
+	}
+	if match != nil {
+		return *match, nil
 	}
 	return NetworkPort{}, fmt.Errorf("no CMP network port found for backend IP %s", ip)
 }

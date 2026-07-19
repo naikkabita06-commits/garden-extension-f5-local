@@ -161,7 +161,7 @@ func (r *ingressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	// Provision CMP resources.
 	cmpStart := time.Now()
-	ids, vip, err := r.ensureCMPResources(ctx, ing, stack)
+	ids, vip, graph, err := r.ensureCMPResources(ctx, ing, stack)
 	f5metrics.CMPAPICallDuration.WithLabelValues("ingress-lb", "EnsureLB").Observe(time.Since(cmpStart).Seconds())
 	if err != nil {
 		f5metrics.CMPAPICallsTotal.WithLabelValues("ingress-lb", "EnsureLB", "error").Inc()
@@ -185,6 +185,9 @@ func (r *ingressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	ing.Annotations[annIngressVIPPortID] = ids.VIPPortID
 	ing.Annotations[annIngressVSID] = ids.VirtualServerID
 	ing.Annotations[annIngressVIPAddress] = vip
+	if err := writeObservedGraph(ing.Annotations, graph); err != nil {
+		return ctrl.Result{}, err
+	}
 	if err := r.Patch(ctx, ing, client.MergeFrom(base)); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -259,7 +262,7 @@ func (r *ingressReconciler) getServiceAndNodePort(ctx context.Context, namespace
 	return svc, 0, fmt.Errorf("service %s/%s has no port matching ingress backend port name=%q number=%d", namespace, name, port.Name, port.Number)
 }
 
-func (r *ingressReconciler) ensureCMPResources(ctx context.Context, ing *networkingv1.Ingress, stack *model.LoadBalancerStack) (*f5client.CMPResourceIDs, string, error) {
+func (r *ingressReconciler) ensureCMPResources(ctx context.Context, ing *networkingv1.Ingress, stack *model.LoadBalancerStack) (*f5client.CMPResourceIDs, string, model.ObservedGraph, error) {
 	current := model.ObservedState{}
 	if ing != nil && ing.Annotations != nil {
 		current.LBServiceID = strings.TrimSpace(ing.Annotations[annIngressLBServiceID])
@@ -268,26 +271,19 @@ func (r *ingressReconciler) ensureCMPResources(ctx context.Context, ing *network
 		current.VIPAddress = strings.TrimSpace(ing.Annotations[annIngressVIPAddress])
 	}
 	if stack == nil || len(stack.VirtualServers) == 0 || len(stack.Ports) == 0 {
-		return nil, current.VIPAddress, fmt.Errorf("ingress load-balancer stack is empty")
+		return nil, current.VIPAddress, current.Graph, fmt.Errorf("ingress load-balancer stack is empty")
 	}
-	vs := stack.VirtualServers[0]
-	result, err := lbaasdeploy.NewFromRaw(r.cmp, r.vpcID).Ensure(ctx, lbaasdeploy.EnsureRequest{
-		LBName:        stack.LBService.Name,
-		LBDescription: stack.LBService.Description,
-		VirtualServer: vs,
-		Backends:      stack.Ports[0].Backends,
-		Current:       current,
-	})
+	if graph, ok := readObservedGraph(ing.Annotations); ok {
+		current.Graph = graph
+	}
+	result, err := lbaasdeploy.NewFromRaw(r.cmp, r.vpcID).EnsureStack(ctx, lbaasdeploy.StackEnsureRequest{Stack: stack, Current: current})
 	if err != nil {
-		return nil, current.VIPAddress, err
+		return nil, current.VIPAddress, current.Graph, err
 	}
-	ids := &f5client.CMPResourceIDs{
-		LBServiceID:       result.Observed.LBServiceID,
-		VIPPortID:         result.Observed.VIPPortID,
-		VirtualServerID:   result.Observed.VirtualServerID,
-		VirtualServerName: result.Observed.VirtualServerName,
-	}
-	return ids, result.Observed.VIPAddress, nil
+	observed := result.Observed
+	vs := observed.Graph.VirtualServers[stack.VirtualServers[0].Name]
+	ids := &f5client.CMPResourceIDs{LBServiceID: observed.LBServiceID, VIPPortID: observed.VIPPortID, VirtualServerID: vs.ExternalID, VirtualServerName: vs.Name}
+	return ids, result.Observed.VIPAddress, result.Observed.Graph, nil
 }
 
 func (r *ingressReconciler) cleanupCMPResources(ctx context.Context, ing *networkingv1.Ingress) error {
@@ -296,12 +292,12 @@ func (r *ingressReconciler) cleanupCMPResources(ctx context.Context, ing *networ
 		VIPPortID:       strings.TrimSpace(ing.Annotations[annIngressVIPPortID]),
 		VirtualServerID: strings.TrimSpace(ing.Annotations[annIngressVSID]),
 	}
+	if graph, ok := readObservedGraph(ing.Annotations); ok {
+		observed.Graph = graph
+	}
+	observed.EnsureGraph()
 	shared := r.isLBServiceShared(ctx, ing, observed.LBServiceID)
-	_, err := lbaasdeploy.NewFromRaw(r.cmp, r.vpcID).Cleanup(ctx, lbaasdeploy.CleanupRequest{
-		Current:         observed,
-		DeleteVIP:       !shared,
-		DeleteLBService: !shared,
-	})
+	_, err := lbaasdeploy.NewFromRaw(r.cmp, r.vpcID).CleanupStack(ctx, lbaasdeploy.CleanupRequest{Current: observed, DeleteVIP: !shared, DeleteLBService: !shared})
 	return err
 }
 
@@ -319,7 +315,18 @@ func (r *ingressReconciler) isLBServiceShared(ctx context.Context, self *network
 		if ing.Name == self.Name && ing.Namespace == self.Namespace {
 			continue
 		}
-		if ing.Annotations[annIngressLBServiceID] == lbID && controllerutil.ContainsFinalizer(&ing, ingressFinalizerName) {
+		if !controllerutil.ContainsFinalizer(&ing, ingressFinalizerName) {
+			continue
+		}
+		if graph, ok := readObservedGraph(ing.Annotations); ok {
+			for _, parent := range graph.LBServices {
+				if parent.ExternalID == lbID && parent.Ownership.SourceKind == "Ingress" && parent.Ownership.SourceNamespace == ing.Namespace && parent.Ownership.SourceName == ing.Name && (parent.Ownership.SourceUID == "" || parent.Ownership.SourceUID == string(ing.UID)) {
+					return true
+				}
+			}
+			continue
+		}
+		if ing.Annotations[annIngressLBServiceID] == lbID {
 			return true
 		}
 	}

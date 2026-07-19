@@ -60,7 +60,7 @@ func BuildLoadBalancerStack(ing *networkingv1.Ingress, cfg lbannotations.LBConfi
 		PersistenceType:  cfg.PersistenceType,
 		DrainingTimeout:  cfg.DrainingTimeout,
 		SourceRanges:     append([]string(nil), cfg.SourceRanges...),
-		Monitor:          &model.Monitor{Type: cfg.HealthType, Path: cfg.HealthPath, Interval: cfg.HealthInterval},
+		Monitor:          &model.Monitor{Name: safeName("mon-" + PoolName(ing)), Type: cfg.HealthType, Path: cfg.HealthPath, Interval: cfg.HealthInterval},
 		Ownership:        model.OwnershipFor(owner, opts.ClusterUID, "virtual-server", group),
 	}
 	pool := model.Pool{Name: PoolName(ing), Monitor: vs.Monitor, Ownership: model.OwnershipFor(owner, opts.ClusterUID, "pool", group)}

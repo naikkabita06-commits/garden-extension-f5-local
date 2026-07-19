@@ -31,13 +31,10 @@ func (m *LBServiceManager) Ensure(ctx context.Context, req EnsureRequest, curren
 		// deletion must converge back to the desired named LBService.
 		currentID = ""
 	}
-	foundID, err := findUniqueLBServiceByName(items, req.LBName)
-	if err != nil {
-		return "", false, err
-	}
-	if foundID != "" {
-		return foundID, false, nil
-	}
+	// A display-name match is never ownership proof. CMP's currently used
+	// LBService API does not expose a stable ownership/tag field, so adoption
+	// is deliberately forbidden until that contract exists. This avoids
+	// mutating an unrelated same-name resource.
 	createdID, err := m.create(ctx, req)
 	if err != nil {
 		return "", false, err

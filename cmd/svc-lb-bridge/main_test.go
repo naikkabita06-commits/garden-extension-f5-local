@@ -92,6 +92,27 @@ func (s *stubCMP) DeleteLBVirtualServer(_ context.Context, _, id string) error {
 	}
 	return nil
 }
+func (s *stubCMP) ListLBVirtualServerPools(_ context.Context, _, _ string) ([]json.RawMessage, error) {
+	return nil, nil
+}
+func (s *stubCMP) CreateLBVirtualServerPool(_ context.Context, _, _ string, q url.Values) (json.RawMessage, error) {
+	return json.RawMessage(`{"id":"pool-001","pool_name":"` + q.Get("pool_name") + `","members":[]}`), nil
+}
+func (s *stubCMP) GetLBVirtualServerPool(_ context.Context, _, _, _ string) (json.RawMessage, error) {
+	return json.RawMessage(`{"id":"pool-001","pool_name":"pool"}`), nil
+}
+func (s *stubCMP) DeleteLBVirtualServerPool(_ context.Context, _, _, _ string) error     { return nil }
+func (s *stubCMP) SetDefaultLBVirtualServerPool(_ context.Context, _, _, _ string) error { return nil }
+func (s *stubCMP) CreateLBVirtualServerPoolMember(_ context.Context, _, _, _ string, q url.Values) (json.RawMessage, error) {
+	return json.RawMessage(`{"id":"member-001"}`), nil
+}
+func (s *stubCMP) UpdateLBVirtualServerPoolMember(_ context.Context, _, _, _, _ string, q url.Values) (json.RawMessage, error) {
+	return json.RawMessage(`{"id":"member-001"}`), nil
+}
+func (s *stubCMP) DeleteLBVirtualServerPoolMember(_ context.Context, _, _, _, _ string) error {
+	return nil
+}
+
 func (s *stubCMP) SearchNetworkPortsByIP(_ context.Context, ip string) ([]json.RawMessage, error) {
 	s.searchN++
 	return []json.RawMessage{json.RawMessage(`{"id":5001,"resource_id":"compute-` + ip + `","resource_type":"compute","fixed_ip":"` + ip + `"}`)}, nil
@@ -213,6 +234,9 @@ func TestReconcile_AllocatesVIPAndProgramsCMPVirtualServer(t *testing.T) {
 	if strings.TrimSpace(gotSvc.Annotations[annBackendHash]) == "" {
 		t.Fatalf("expected backend-hash annotation to be set")
 	}
+	if gotSvc.Annotations[annObservedGeneration] != "0" {
+		t.Fatalf("expected observed generation annotation, got %q", gotSvc.Annotations[annObservedGeneration])
+	}
 	if len(gotSvc.Status.LoadBalancer.Ingress) != 1 || gotSvc.Status.LoadBalancer.Ingress[0].IP != "10.0.0.10" {
 		t.Fatalf("expected service status vip, got %#v", gotSvc.Status.LoadBalancer.Ingress)
 	}
@@ -244,7 +268,7 @@ func TestReconcile_RecreatesVirtualServerWhenNodesChange(t *testing.T) {
 		t.Fatalf("expected CreateLBVirtualServer called once, got %d", stub.createVSN)
 	}
 
-	// Add a new node, then reconcile again; should recreate VS.
+	// Add a new node, then reconcile again; pool-member convergence must preserve the listener.
 	n3 := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n3"}}
 	n3.Status.Addresses = []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "172.18.0.12"}}
 	n3.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}
@@ -256,11 +280,11 @@ func TestReconcile_RecreatesVirtualServerWhenNodesChange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile(2): %v", err)
 	}
-	if stub.deleteVSN != 1 {
-		t.Fatalf("expected DeleteLBVirtualServer called once, got %d", stub.deleteVSN)
+	if stub.deleteVSN != 0 {
+		t.Fatalf("expected listener preservation during member reconciliation, got %d deletes", stub.deleteVSN)
 	}
-	if stub.createVSN != 2 {
-		t.Fatalf("expected CreateLBVirtualServer called twice, got %d", stub.createVSN)
+	if stub.createVSN != 1 {
+		t.Fatalf("expected no listener recreation, got %d creates", stub.createVSN)
 	}
 }
 

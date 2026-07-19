@@ -16,6 +16,9 @@ func TestBuildLoadBalancerStackBuildsSharedGroupNamesAndMembers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildLoadBalancerStack: %v", err)
 	}
+	if stack.Pools[0].Monitor == nil || stack.Pools[0].Monitor.Name == "" {
+		t.Fatal("expected deterministic pool monitor name")
+	}
 	if stack.LBService.Name != "ing-group-app-blue" || stack.VirtualServers[0].Name != "ing-vs-app-web" || stack.Pools[0].Name != "ing-pool-app-web" {
 		t.Fatalf("unexpected names: lb=%q vs=%q pool=%q", stack.LBService.Name, stack.VirtualServers[0].Name, stack.Pools[0].Name)
 	}

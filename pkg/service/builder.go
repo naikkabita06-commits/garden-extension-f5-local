@@ -15,6 +15,12 @@ import (
 // into a typed desired-state stack. The builder does not call CMP or mutate
 // Kubernetes objects.
 func BuildLoadBalancerStack(svc *corev1.Service, cfg lbannotations.LBConfig, nodes []backend.Node) (*model.LoadBalancerStack, error) {
+	return BuildLoadBalancerStackWithPortBackends(svc, cfg, func(corev1.ServicePort) []backend.Node { return nodes })
+}
+
+// BuildLoadBalancerStackWithPortBackends builds independent member sets for
+// every Service port.
+func BuildLoadBalancerStackWithPortBackends(svc *corev1.Service, cfg lbannotations.LBConfig, backendsForPort func(corev1.ServicePort) []backend.Node) (*model.LoadBalancerStack, error) {
 	if svc == nil {
 		return nil, fmt.Errorf("service must not be nil")
 	}
@@ -39,8 +45,11 @@ func BuildLoadBalancerStack(svc *corev1.Service, cfg lbannotations.LBConfig, nod
 	}
 
 	for _, p := range svc.Spec.Ports {
-		if p.Port == 0 || p.NodePort == 0 {
-			continue
+		if p.Port == 0 {
+			return nil, fmt.Errorf("InvalidServicePort: service port %q has no frontend port", p.Name)
+		}
+		if p.NodePort == 0 {
+			return nil, fmt.Errorf("BackendNodePortRequired: service port %q (%d) requires a NodePort backend", p.Name, p.Port)
 		}
 		proto := MapK8sProtocolToCMP(p.Protocol, p.Port)
 		if cfg.ProtocolOverride != "" {
@@ -56,11 +65,11 @@ func BuildLoadBalancerStack(svc *corev1.Service, cfg lbannotations.LBConfig, nod
 			PersistenceType:  cfg.PersistenceType,
 			DrainingTimeout:  cfg.DrainingTimeout,
 			SourceRanges:     append([]string(nil), cfg.SourceRanges...),
-			Monitor:          &model.Monitor{Type: cfg.HealthType, Path: cfg.HealthPath, Interval: cfg.HealthInterval},
+			Monitor:          &model.Monitor{Name: safeName("mon-" + PoolName(svc, p.Port)), Type: cfg.HealthType, Path: cfg.HealthPath, Interval: cfg.HealthInterval},
 			Ownership:        model.OwnershipFor(owner, "", "virtual-server", ""),
 		}
 		pool := model.Pool{Name: PoolName(svc, p.Port), Monitor: vs.Monitor, Ownership: model.OwnershipFor(owner, "", "pool", VIPGroup(svc))}
-		for _, n := range nodes {
+		for _, n := range backendsForPort(p) {
 			member := model.BackendMember{IP: n.IP, Port: p.NodePort, Weight: n.Weight}
 			sp.Backends = append(sp.Backends, member)
 			pool.Members = append(pool.Members, member)
@@ -69,9 +78,6 @@ func BuildLoadBalancerStack(svc *corev1.Service, cfg lbannotations.LBConfig, nod
 		stack.VirtualServers = append(stack.VirtualServers, vs)
 		stack.Pools = append(stack.Pools, pool)
 		stack.Ports = append(stack.Ports, sp)
-	}
-	if len(stack.Ports) == 0 {
-		return nil, fmt.Errorf("service has no usable LoadBalancer NodePorts")
 	}
 	return stack, nil
 }
