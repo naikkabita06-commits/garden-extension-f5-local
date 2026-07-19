@@ -85,6 +85,30 @@ func (r *ingressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// Handle deletion.
 	if !ing.DeletionTimestamp.IsZero() {
 		if controllerutil.ContainsFinalizer(ing, ingressFinalizerName) {
+			// A group member leaving must first converge the graph built from the
+			// remaining members. Deleting the departing member's stored graph
+			// directly would remove routes and pools still needed by the group.
+			remaining, err := r.remainingGroupMembers(ctx, ing)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			if len(remaining) > 0 {
+				stack, err := lbingress.BuildGroupLoadBalancerStack(remaining, parseIngressConfig(remaining[0]), lbingress.GroupStackBuildOptions{BackendResolver: r.resolveGroupBackend(ctx)})
+				if err != nil {
+					return ctrl.Result{}, fmt.Errorf("building remaining ingress group: %w", err)
+				}
+				ids, vip, graph, err := r.ensureCMPResources(ctx, ing, stack)
+				if err != nil {
+					return ctrl.Result{}, fmt.Errorf("reconciling remaining ingress group: %w", err)
+				}
+				if err := r.persistGroupObserved(ctx, remaining, ids, vip, graph); err != nil {
+					return ctrl.Result{}, err
+				}
+				if _, err := lbfinalizers.Remove(ctx, r.Client, ing, ingressFinalizerName); err != nil {
+					return ctrl.Result{}, err
+				}
+				return ctrl.Result{}, nil
+			}
 			log.Info("cleaning up CMP LBaaS resources for Ingress")
 			r.Recorder.Eventf(ing, corev1.EventTypeNormal, "DeletingLoadBalancer", "Deleting CMP LBaaS resources for Ingress (LB=%s)", ing.Annotations[annIngressLBServiceID])
 			if err := r.cleanupCMPResources(ctx, ing); err != nil {
@@ -158,6 +182,28 @@ func (r *ingressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	log.Info("Ingress group reconciled", "vip", vip, "members", len(groupMembers))
 	r.Recorder.Eventf(ing, corev1.EventTypeNormal, "EnsuredLoadBalancer", "Ingress group reconciled via CMP LBaaS (VIP=%s, members=%d)", vip, len(groupMembers))
 	return ctrl.Result{}, nil
+}
+
+// remainingGroupMembers returns live F5 Ingresses sharing the departing
+// object's group. It intentionally ignores foreign Ingress classes: they are
+// not safe ownership references for an F5-managed frontend.
+func (r *ingressReconciler) remainingGroupMembers(ctx context.Context, departing *networkingv1.Ingress) ([]*networkingv1.Ingress, error) {
+	items := &networkingv1.IngressList{}
+	if err := r.List(ctx, items, client.InNamespace(departing.Namespace)); err != nil {
+		return nil, err
+	}
+	group := lbingress.GroupName(departing)
+	members := make([]*networkingv1.Ingress, 0)
+	for i := range items.Items {
+		candidate := &items.Items[i]
+		if candidate.Name == departing.Name || !candidate.DeletionTimestamp.IsZero() || !r.isOwnedIngress(candidate) {
+			continue
+		}
+		if group == "" || lbingress.GroupName(candidate) == group {
+			members = append(members, candidate)
+		}
+	}
+	return members, nil
 }
 
 // isOwnedIngress checks if this Ingress should be handled by the F5 controller.
