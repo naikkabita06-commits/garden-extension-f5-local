@@ -157,17 +157,47 @@ type ObservedState struct {
 // EnsureGraph initializes the observed graph and mirrors legacy scalar IDs into
 // their corresponding graph buckets when present.
 func (s *ObservedState) EnsureGraph() {
+	// Graphs written by older versions may contain only some buckets.  Preserve
+	// every observed entry while making each bucket safe for incremental
+	// reconciliation; replacing the whole graph here used to discard children.
 	if s.Graph.LBServices == nil {
-		s.Graph = NewObservedGraph()
+		s.Graph.LBServices = map[string]ObservedResource{}
+	}
+	if s.Graph.VIPs == nil {
+		s.Graph.VIPs = map[string]ObservedResource{}
+	}
+	if s.Graph.VirtualServers == nil {
+		s.Graph.VirtualServers = map[string]ObservedResource{}
+	}
+	if s.Graph.Pools == nil {
+		s.Graph.Pools = map[string]ObservedResource{}
+	}
+	if s.Graph.Members == nil {
+		s.Graph.Members = map[string]ObservedResource{}
+	}
+	if s.Graph.Monitors == nil {
+		s.Graph.Monitors = map[string]ObservedResource{}
+	}
+	if s.Graph.RoutingRules == nil {
+		s.Graph.RoutingRules = map[string]ObservedResource{}
+	}
+	if s.Graph.Certificates == nil {
+		s.Graph.Certificates = map[string]ObservedResource{}
 	}
 	if s.LBServiceID != "" {
-		s.Graph.LBServices["legacy/lb-service"] = ObservedResource{LogicalID: "legacy/lb-service", ExternalID: s.LBServiceID}
+		if _, ok := s.Graph.LBServices["legacy/lb-service"]; !ok {
+			s.Graph.LBServices["legacy/lb-service"] = ObservedResource{LogicalID: "legacy/lb-service", ExternalID: s.LBServiceID}
+		}
 	}
 	if s.VIPPortID != "" {
-		s.Graph.VIPs["legacy/vip"] = ObservedResource{LogicalID: "legacy/vip", ExternalID: s.VIPPortID, Address: s.VIPAddress}
+		if _, ok := s.Graph.VIPs["legacy/vip"]; !ok {
+			s.Graph.VIPs["legacy/vip"] = ObservedResource{LogicalID: "legacy/vip", ExternalID: s.VIPPortID, Address: s.VIPAddress}
+		}
 	}
 	if s.VirtualServerID != "" {
-		s.Graph.VirtualServers["legacy/virtual-server"] = ObservedResource{LogicalID: "legacy/virtual-server", ExternalID: s.VirtualServerID, Name: s.VirtualServerName}
+		if _, ok := s.Graph.VirtualServers["legacy/virtual-server"]; !ok {
+			s.Graph.VirtualServers["legacy/virtual-server"] = ObservedResource{LogicalID: "legacy/virtual-server", ExternalID: s.VirtualServerID, Name: s.VirtualServerName}
+		}
 	}
 }
 

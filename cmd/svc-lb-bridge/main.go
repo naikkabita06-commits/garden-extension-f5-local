@@ -301,12 +301,9 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		f5metrics.ManagedServicesTotal.WithLabelValues("svc-lb-bridge").Inc()
 	}
 
-	// Ensure CMP resources for every Service port. The LBService and VIP are shared
-	// across all listeners, while each listener keeps an independent provider ID and
-	// backend hash. This prevents a second port from adopting or replacing the first
-	// port's virtual server.
-	portObserved := readServicePortObserved(svc.Annotations)
-	desiredPortKeys := make(map[string]struct{}, len(stack.Ports))
+	// Reconcile the complete Service graph in one operation. This replaces the
+	// legacy per-listener entry point: pools and members are now converged under
+	// their own listener without recreating sibling listeners.
 	shared := model.ObservedState{
 		LBServiceID: strings.TrimSpace(svc.Annotations[annLBServiceID]),
 		VIPPortID:   strings.TrimSpace(svc.Annotations[annVIPPortID]),
@@ -315,49 +312,35 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if graph, ok := readObservedGraph(svc.Annotations); ok {
 		shared.Graph = graph
 	}
-	var lastIDs *f5client.CMPResourceIDs
-	var vip string
 	cmpStart := time.Now()
-	for _, p := range stack.Ports {
-		key := servicePortKey(p)
-		desiredPortKeys[key] = struct{}{}
-		previous := portObserved[key]
-		current := shared
-		current.VirtualServerID = previous.VirtualServerID
-		current.VirtualServerName = previous.VirtualServerName
-		ids, observed, backendHash, err := r.ensureCMPResourcesWithCurrent(ctx, svc, p.FrontendPort, p.NodePort, backends, p.Protocol, stack.Config, current, previous.BackendHash)
-		if err != nil {
-			f5metrics.CMPAPICallDuration.WithLabelValues("svc-lb-bridge", "EnsureLB").Observe(time.Since(cmpStart).Seconds())
-			f5metrics.CMPAPICallsTotal.WithLabelValues("svc-lb-bridge", "EnsureLB", "error").Inc()
-			f5metrics.ReconcileErrorsTotal.WithLabelValues("svc-lb-bridge").Inc()
-			if rle, ok := f5client.IsRateLimited(err); ok {
-				r.Recorder.Eventf(svc, corev1.EventTypeWarning, "RateLimited", "CMP API rate limited; retrying after %s", rle.RetryAfter)
-				log.Info("CMP rate limited; requeuing after Retry-After", "retryAfter", rle.RetryAfter)
-				return ctrl.Result{RequeueAfter: rle.RetryAfter}, nil
-			}
-			r.Recorder.Eventf(svc, corev1.EventTypeWarning, "SyncLoadBalancerFailed", "Error ensuring CMP LBaaS resources for port %d: %v", p.FrontendPort, err)
-			return ctrl.Result{}, err
+	stackResult, err := lbaasdeploy.NewFromRaw(r.cmp, r.vpcID).EnsureStack(ctx, lbaasdeploy.StackEnsureRequest{Stack: stack, Current: shared})
+	if err != nil {
+		f5metrics.CMPAPICallDuration.WithLabelValues("svc-lb-bridge", "EnsureLB").Observe(time.Since(cmpStart).Seconds())
+		f5metrics.CMPAPICallsTotal.WithLabelValues("svc-lb-bridge", "EnsureLB", "error").Inc()
+		f5metrics.ReconcileErrorsTotal.WithLabelValues("svc-lb-bridge").Inc()
+		if rle, ok := f5client.IsRateLimited(err); ok {
+			r.Recorder.Eventf(svc, corev1.EventTypeWarning, "RateLimited", "CMP API rate limited; retrying after %s", rle.RetryAfter)
+			return ctrl.Result{RequeueAfter: rle.RetryAfter}, nil
 		}
-		lastIDs = ids
-		portObserved[key] = servicePortObserved{VirtualServerID: ids.VirtualServerID, VirtualServerName: ids.VirtualServerName, BackendHash: backendHash}
-		shared = observed
-		if observed.VIPAddress != "" {
-			vip = observed.VIPAddress
+		r.Recorder.Eventf(svc, corev1.EventTypeWarning, "SyncLoadBalancerFailed", "Error ensuring CMP LBaaS resource graph: %v", err)
+		return ctrl.Result{}, err
+	}
+	shared = stackResult.Observed
+	vip := shared.VIPAddress
+	portObserved := make(map[string]servicePortObserved, len(stack.Ports))
+	for _, port := range stack.Ports {
+		vs := shared.Graph.VirtualServers[desiredVirtualServerName(svc, port.FrontendPort)]
+		portObserved[servicePortKey(port)] = servicePortObserved{
+			VirtualServerID: vs.ExternalID, VirtualServerName: vs.Name,
+			BackendHash: lbaasdeploy.DesiredBackendHash(port.FrontendPort, port.NodePort, port.Backends),
 		}
 	}
-	// Delete listeners for ports that have been removed. Parent LB/VIP resources
-	// remain in place, so an individual Service-port change cannot disrupt siblings.
-	for key, previous := range portObserved {
-		if _, wanted := desiredPortKeys[key]; wanted {
-			continue
-		}
-		if previous.VirtualServerID != "" {
-			if _, err := lbaasdeploy.NewFromRaw(r.cmp, r.vpcID).Cleanup(ctx, lbaasdeploy.CleanupRequest{Current: model.ObservedState{LBServiceID: shared.LBServiceID, VirtualServerID: previous.VirtualServerID}}); err != nil {
-				return ctrl.Result{}, fmt.Errorf("cleaning removed Service port %s: %w", key, err)
-			}
-		}
-		delete(portObserved, key)
+	lastIDs := &f5client.CMPResourceIDs{LBServiceID: shared.LBServiceID, VIPPortID: shared.VIPPortID, VirtualServerID: shared.VirtualServerID, VirtualServerName: shared.VirtualServerName}
+	if len(stack.Ports) > 0 && lastIDs.VirtualServerID == "" {
+		last := portObserved[servicePortKey(stack.Ports[len(stack.Ports)-1])]
+		lastIDs.VirtualServerID, lastIDs.VirtualServerName = last.VirtualServerID, last.VirtualServerName
 	}
+	f5metrics.CMPAPICallDuration.WithLabelValues("svc-lb-bridge", "EnsureLB").Observe(time.Since(cmpStart).Seconds())
 	f5metrics.CMPAPICallDuration.WithLabelValues("svc-lb-bridge", "EnsureLB").Observe(time.Since(cmpStart).Seconds())
 	f5metrics.CMPAPICallsTotal.WithLabelValues("svc-lb-bridge", "EnsureLB", "success").Inc()
 	if vip != "" {
