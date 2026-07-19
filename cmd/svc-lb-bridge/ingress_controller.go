@@ -315,7 +315,18 @@ func (r *ingressReconciler) isLBServiceShared(ctx context.Context, self *network
 		if ing.Name == self.Name && ing.Namespace == self.Namespace {
 			continue
 		}
-		if ing.Annotations[annIngressLBServiceID] == lbID && controllerutil.ContainsFinalizer(&ing, ingressFinalizerName) {
+		if !controllerutil.ContainsFinalizer(&ing, ingressFinalizerName) {
+			continue
+		}
+		if graph, ok := readObservedGraph(ing.Annotations); ok {
+			for _, parent := range graph.LBServices {
+				if parent.ExternalID == lbID && parent.Ownership.SourceKind == "Ingress" && parent.Ownership.SourceNamespace == ing.Namespace && parent.Ownership.SourceName == ing.Name && (parent.Ownership.SourceUID == "" || parent.Ownership.SourceUID == string(ing.UID)) {
+					return true
+				}
+			}
+			continue
+		}
+		if ing.Annotations[annIngressLBServiceID] == lbID {
 			return true
 		}
 	}
