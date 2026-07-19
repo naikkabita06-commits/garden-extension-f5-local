@@ -36,6 +36,9 @@ func TestBuildLoadBalancerStackBuildsPortsAndBackends(t *testing.T) {
 	if stack.LBService.Name != "app-ns-web" || stack.VIP.Name != "app-vip-ns-web" {
 		t.Fatalf("expected deterministic parent resources, got LB=%#v VIP=%#v", stack.LBService, stack.VIP)
 	}
+	if stack.Pools[0].Monitor == nil || stack.Pools[0].Monitor.Name == "" {
+		t.Fatal("expected deterministic pool monitor name")
+	}
 	if stack.VirtualServers[0].Name != "app-vs-ns-web-80" || stack.Pools[0].Name != "app-pool-ns-web-80" || stack.VirtualServers[0].DefaultPoolName != stack.Pools[0].Name {
 		t.Fatalf("expected deterministic listener and pool graph, got VS=%#v pool=%#v", stack.VirtualServers[0], stack.Pools[0])
 	}

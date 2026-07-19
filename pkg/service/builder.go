@@ -65,7 +65,7 @@ func BuildLoadBalancerStackWithPortBackends(svc *corev1.Service, cfg lbannotatio
 			PersistenceType:  cfg.PersistenceType,
 			DrainingTimeout:  cfg.DrainingTimeout,
 			SourceRanges:     append([]string(nil), cfg.SourceRanges...),
-			Monitor:          &model.Monitor{Type: cfg.HealthType, Path: cfg.HealthPath, Interval: cfg.HealthInterval},
+			Monitor:          &model.Monitor{Name: safeName("mon-" + PoolName(svc, p.Port)), Type: cfg.HealthType, Path: cfg.HealthPath, Interval: cfg.HealthInterval},
 			Ownership:        model.OwnershipFor(owner, "", "virtual-server", ""),
 		}
 		pool := model.Pool{Name: PoolName(svc, p.Port), Monitor: vs.Monitor, Ownership: model.OwnershipFor(owner, "", "pool", VIPGroup(svc))}
