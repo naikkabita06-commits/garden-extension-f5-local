@@ -93,7 +93,7 @@ func (r *ingressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 				return ctrl.Result{}, err
 			}
 			if len(remaining) > 0 {
-				stack, err := lbingress.BuildGroupLoadBalancerStack(remaining, parseIngressConfig(remaining[0]), lbingress.GroupStackBuildOptions{BackendResolver: r.resolveGroupBackend(ctx)})
+				stack, err := lbingress.BuildGroupLoadBalancerStack(remaining, parseIngressConfig(canonicalIngress(remaining)), lbingress.GroupStackBuildOptions{BackendResolver: r.resolveGroupBackend(ctx)})
 				if err != nil {
 					return ctrl.Result{}, fmt.Errorf("building remaining ingress group: %w", err)
 				}
@@ -134,7 +134,7 @@ func (r *ingressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if oldGroup := observedIngressGroup(ing); oldGroup != "" && oldGroup != lbingress.GroupName(ing) {
 		remaining := ingressGroupMembers(all.Items, ing.Namespace, oldGroup, ing.Name, r.isOwnedIngress)
 		if len(remaining) > 0 {
-			oldStack, err := lbingress.BuildGroupLoadBalancerStack(remaining, parseIngressConfig(remaining[0]), lbingress.GroupStackBuildOptions{BackendResolver: r.resolveGroupBackend(ctx)})
+			oldStack, err := lbingress.BuildGroupLoadBalancerStack(remaining, parseIngressConfig(canonicalIngress(remaining)), lbingress.GroupStackBuildOptions{BackendResolver: r.resolveGroupBackend(ctx)})
 			if err != nil {
 				return ctrl.Result{}, err
 			}
@@ -168,7 +168,9 @@ func (r *ingressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			groupMembers = append(groupMembers, member)
 		}
 	}
-	ingressCfg := parseIngressConfig(ing)
+	// ResolveGroup sorts members, so the canonical member makes shared frontend
+	// configuration independent of which member generated the event.
+	ingressCfg := parseIngressConfig(canonicalIngress(groupMembers))
 	stack, err := lbingress.BuildGroupLoadBalancerStack(groupMembers, ingressCfg, lbingress.GroupStackBuildOptions{
 		BackendResolver: r.resolveGroupBackend(ctx),
 	})
@@ -269,26 +271,17 @@ func ingressGroupMembers(items []networkingv1.Ingress, namespace, group, exclude
 	return members
 }
 
-// remainingGroupMembers returns live F5 Ingresses sharing the departing
-// object's group. It intentionally ignores foreign Ingress classes: they are
-// not safe ownership references for an F5-managed frontend.
-func (r *ingressReconciler) remainingGroupMembers(ctx context.Context, departing *networkingv1.Ingress) ([]*networkingv1.Ingress, error) {
-	items := &networkingv1.IngressList{}
-	if err := r.List(ctx, items, client.InNamespace(departing.Namespace)); err != nil {
-		return nil, err
+func canonicalIngress(members []*networkingv1.Ingress) *networkingv1.Ingress {
+	if len(members) == 0 {
+		return nil
 	}
-	group := lbingress.GroupName(departing)
-	members := make([]*networkingv1.Ingress, 0)
-	for i := range items.Items {
-		candidate := &items.Items[i]
-		if candidate.Name == departing.Name || !candidate.DeletionTimestamp.IsZero() || !r.isOwnedIngress(candidate) {
-			continue
-		}
-		if group == "" || lbingress.GroupName(candidate) == group {
-			members = append(members, candidate)
+	canonical := members[0]
+	for _, member := range members[1:] {
+		if member.Namespace+"/"+member.Name < canonical.Namespace+"/"+canonical.Name {
+			canonical = member
 		}
 	}
-	return members, nil
+	return canonical
 }
 
 // isOwnedIngress checks if this Ingress should be handled by the F5 controller.
