@@ -34,3 +34,15 @@ func TestReadTLSSecretRejectsInvalidSecret(t *testing.T) {
 		t.Fatal("expected invalid TLS material to fail")
 	}
 }
+
+func TestReadTLSSecretRejectsMissingDNSIdentity(t *testing.T) {
+	key, _ := rsa.GenerateKey(rand.Reader, 2048)
+	der, err := x509.CreateCertificate(rand.Reader, &x509.Certificate{SerialNumber: big.NewInt(2), NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour)}, &x509.Certificate{SerialNumber: big.NewInt(2)}, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = ReadTLSSecret(&corev1.Secret{Type: corev1.SecretTypeTLS, Data: map[string][]byte{corev1.TLSCertKey: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), corev1.TLSPrivateKeyKey: pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})}})
+	if err == nil {
+		t.Fatal("expected certificate without DNS identity to fail")
+	}
+}
