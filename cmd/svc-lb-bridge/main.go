@@ -59,6 +59,10 @@ const (
 	// annObservedGraph persists the complete provider graph. Scalar annotations
 	// remain migration compatibility mirrors for older consumers.
 	annObservedGraph = "f5.extensions.gardener.cloud/observed-graph"
+	// annObservedGeneration records the Service generation for which the
+	// complete provider graph has converged. It is intentionally separate from
+	// legacy scalar IDs so status consumers can distinguish stale success.
+	annObservedGeneration = "f5.extensions.gardener.cloud/observed-generation"
 
 	// User-facing input annotations for per-Service LB configuration.
 	// These override global defaults from F5LoadBalancerConfig CRD.
@@ -374,6 +378,7 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err := writeObservedGraph(svc.Annotations, shared.Graph); err != nil {
 		return ctrl.Result{}, err
 	}
+	svc.Annotations[annObservedGeneration] = fmt.Sprintf("%d", svc.Generation)
 	if err := r.Patch(ctx, svc, client.MergeFrom(base)); err != nil {
 		return ctrl.Result{}, err
 	}
