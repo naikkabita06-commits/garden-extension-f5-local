@@ -125,19 +125,38 @@ func (r *ingressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, nil
 	}
 
-	// Add finalizer.
-	if !controllerutil.ContainsFinalizer(ing, ingressFinalizerName) {
-		if _, err := lbfinalizers.Ensure(ctx, r.Client, ing, ingressFinalizerName); err != nil {
-			return ctrl.Result{}, err
-		}
-		f5metrics.ManagedServicesTotal.WithLabelValues("ingress-lb").Inc()
-	}
-
 	// Reconcile the entire IngressGroup, not the single event object. Persisting
 	// the resulting graph on every member makes any member a safe restart point.
 	all := &networkingv1.IngressList{}
 	if err := r.List(ctx, all, client.InNamespace(ing.Namespace)); err != nil {
 		return ctrl.Result{}, err
+	}
+	if oldGroup := observedIngressGroup(ing); oldGroup != "" && oldGroup != lbingress.GroupName(ing) {
+		remaining := ingressGroupMembers(all.Items, ing.Namespace, oldGroup, ing.Name, r.isOwnedIngress)
+		if len(remaining) > 0 {
+			oldStack, err := lbingress.BuildGroupLoadBalancerStack(remaining, parseIngressConfig(remaining[0]), lbingress.GroupStackBuildOptions{BackendResolver: r.resolveGroupBackend(ctx)})
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			ids, vip, graph, err := r.ensureCMPResources(ctx, ing, oldStack)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			if err := r.persistGroupObserved(ctx, remaining, ids, vip, graph); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+		// Do not let the new group adopt the old group's observed parent IDs.
+		base := ing.DeepCopy()
+		delete(ing.Annotations, annObservedGraph)
+		delete(ing.Annotations, annIngressLBServiceID)
+		delete(ing.Annotations, annIngressVIPPortID)
+		delete(ing.Annotations, annIngressVSID)
+		delete(ing.Annotations, annIngressVIPAddress)
+		if err := r.Patch(ctx, ing, client.MergeFrom(base)); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{Requeue: true}, nil
 	}
 	members, _, err := lbingress.ResolveGroup(ing, all.Items)
 	if err != nil {
@@ -156,6 +175,21 @@ func (r *ingressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err != nil {
 		r.Recorder.Eventf(ing, corev1.EventTypeWarning, "BuildLoadBalancerModelFailed", "Error building Ingress load-balancer model: %v", err)
 		return ctrl.Result{}, err
+	}
+	// Certificate uploads/bindings are deliberately capability-gated until the
+	// typed CertificateManager is wired. Do not add a finalizer for a stack the
+	// current deployer cannot ever converge.
+	if len(stack.Certificates) > 0 {
+		r.Recorder.Event(ing, corev1.EventTypeWarning, "TLSNotSupported", "TLS requires the CMP CertificateManager capability")
+		return ctrl.Result{}, fmt.Errorf("TLS certificate reconciliation is not configured")
+	}
+
+	// Add the finalizer only after validation has produced a deployable graph.
+	if !controllerutil.ContainsFinalizer(ing, ingressFinalizerName) {
+		if _, err := lbfinalizers.Ensure(ctx, r.Client, ing, ingressFinalizerName); err != nil {
+			return ctrl.Result{}, err
+		}
+		f5metrics.ManagedServicesTotal.WithLabelValues("ingress-lb").Inc()
 	}
 
 	// Provision CMP resources.
@@ -194,6 +228,11 @@ func (r *ingressReconciler) remainingGroupMembers(ctx context.Context, departing
 	}
 	group := lbingress.GroupName(departing)
 	members := make([]*networkingv1.Ingress, 0)
+	if group == "" {
+		// Ungrouped Ingresses are explicitly singleton groups. They must never
+		// borrow another ungrouped object's observed graph during finalization.
+		return members, nil
+	}
 	for i := range items.Items {
 		candidate := &items.Items[i]
 		if candidate.Name == departing.Name || !candidate.DeletionTimestamp.IsZero() || !r.isOwnedIngress(candidate) {
@@ -204,6 +243,30 @@ func (r *ingressReconciler) remainingGroupMembers(ctx context.Context, departing
 		}
 	}
 	return members, nil
+}
+
+func observedIngressGroup(ing *networkingv1.Ingress) string {
+	graph, ok := readObservedGraph(ing.Annotations)
+	if !ok {
+		return ""
+	}
+	for _, lb := range graph.LBServices {
+		if lb.Ownership.SourceKind == "IngressGroup" {
+			return lb.Ownership.SharedGroup
+		}
+	}
+	return ""
+}
+
+func ingressGroupMembers(items []networkingv1.Ingress, namespace, group, exclude string, owned func(*networkingv1.Ingress) bool) []*networkingv1.Ingress {
+	members := make([]*networkingv1.Ingress, 0)
+	for i := range items {
+		item := &items[i]
+		if item.Namespace == namespace && item.Name != exclude && item.DeletionTimestamp.IsZero() && lbingress.GroupName(item) == group && owned(item) {
+			members = append(members, item)
+		}
+	}
+	return members
 }
 
 // isOwnedIngress checks if this Ingress should be handled by the F5 controller.
