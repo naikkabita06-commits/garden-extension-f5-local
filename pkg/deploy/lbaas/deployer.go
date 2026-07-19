@@ -158,9 +158,6 @@ func (d *Deployer) EnsureStack(ctx context.Context, req StackEnsureRequest) (*St
 	if len(req.Stack.VirtualServers) == 0 {
 		return nil, fmt.Errorf("load-balancer stack has no virtual servers")
 	}
-	if len(req.Stack.Certificates) != 0 {
-		return nil, fmt.Errorf("certificate reconciliation requires a CertificateManager")
-	}
 	if len(req.Stack.Pools) != 0 && d.pools == nil {
 		return nil, fmt.Errorf("pool reconciliation requires a PoolManager")
 	}

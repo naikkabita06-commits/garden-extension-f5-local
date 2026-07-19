@@ -329,6 +329,8 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			shared.LBServiceID, shared.VIPPortID, shared.VIPAddress = parent.LBServiceID, parent.VIPPortID, parent.VIPAddress
 			shared.Graph = parent.Graph
 		}
+		r.Recorder.Eventf(svc, corev1.EventTypeWarning, "SyncLoadBalancerFailed", "Error ensuring CMP LBaaS resource graph: %v", err)
+		return ctrl.Result{}, err
 	}
 	cmpStart := time.Now()
 	stackResult, err := lbaasdeploy.NewFromRaw(r.cmp, r.vpcID).EnsureStack(ctx, lbaasdeploy.StackEnsureRequest{Stack: stack, Current: shared})
@@ -358,6 +360,7 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		last := portObserved[servicePortKey(stack.Ports[len(stack.Ports)-1])]
 		lastIDs.VirtualServerID, lastIDs.VirtualServerName = last.VirtualServerID, last.VirtualServerName
 	}
+	f5metrics.CMPAPICallDuration.WithLabelValues("svc-lb-bridge", "EnsureLB").Observe(time.Since(cmpStart).Seconds())
 	f5metrics.CMPAPICallDuration.WithLabelValues("svc-lb-bridge", "EnsureLB").Observe(time.Since(cmpStart).Seconds())
 	f5metrics.CMPAPICallDuration.WithLabelValues("svc-lb-bridge", "EnsureLB").Observe(time.Since(cmpStart).Seconds())
 	f5metrics.CMPAPICallsTotal.WithLabelValues("svc-lb-bridge", "EnsureLB", "success").Inc()
