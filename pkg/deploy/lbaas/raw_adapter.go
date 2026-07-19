@@ -496,9 +496,9 @@ func (a rawMonitorAdapter) DeleteMonitor(ctx context.Context, lb, vs, pool, id s
 }
 func monitorSpecQuery(s MonitorSpec) url.Values {
 	q := url.Values{}
-	q.Set("monitor_name", s.Name)
+	q.Set("name", s.Name)
 	q.Set("monitor_protocol", s.Protocol)
-	q.Set("monitor_path", s.Path)
+	q.Set("path", s.Path)
 	if s.Interval > 0 {
 		q.Set("interval", fmt.Sprintf("%d", s.Interval))
 	}
@@ -545,7 +545,7 @@ func (a rawRoutingRuleAdapter) CreateRoutingRule(ctx context.Context, lb, vs str
 	q.Set("host", s.Host)
 	q.Set("path", s.Path)
 	q.Set("match_type", s.MatchType)
-	q.Set("pool_id", s.PoolID)
+	q.Set("virtual_server_pool_id", s.PoolID)
 	raw, err := a.raw.CreateLBVirtualServerRoutingRule(ctx, lb, vs, q)
 	if err != nil {
 		return RoutingRuleResource{}, err
