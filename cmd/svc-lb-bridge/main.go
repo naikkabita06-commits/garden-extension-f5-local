@@ -56,6 +56,9 @@ const (
 	// annObservedPorts persists independent virtual-server state per Service port.
 	// The legacy scalar annotations above mirror the first listener for compatibility.
 	annObservedPorts = "f5.extensions.gardener.cloud/observed-ports"
+	// annObservedGraph persists the complete provider graph. Scalar annotations
+	// remain migration compatibility mirrors for older consumers.
+	annObservedGraph = "f5.extensions.gardener.cloud/observed-graph"
 
 	// User-facing input annotations for per-Service LB configuration.
 	// These override global defaults from F5LoadBalancerConfig CRD.
@@ -309,6 +312,9 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		VIPPortID:   strings.TrimSpace(svc.Annotations[annVIPPortID]),
 		VIPAddress:  strings.TrimSpace(svc.Annotations[annVIPAddress]),
 	}
+	if graph, ok := readObservedGraph(svc.Annotations); ok {
+		shared.Graph = graph
+	}
 	var lastIDs *f5client.CMPResourceIDs
 	var vip string
 	cmpStart := time.Now()
@@ -319,7 +325,7 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		current := shared
 		current.VirtualServerID = previous.VirtualServerID
 		current.VirtualServerName = previous.VirtualServerName
-		ids, portVIP, backendHash, err := r.ensureCMPResourcesWithCurrent(ctx, svc, p.FrontendPort, p.NodePort, backends, p.Protocol, stack.Config, current, previous.BackendHash)
+		ids, observed, backendHash, err := r.ensureCMPResourcesWithCurrent(ctx, svc, p.FrontendPort, p.NodePort, backends, p.Protocol, stack.Config, current, previous.BackendHash)
 		if err != nil {
 			f5metrics.CMPAPICallDuration.WithLabelValues("svc-lb-bridge", "EnsureLB").Observe(time.Since(cmpStart).Seconds())
 			f5metrics.CMPAPICallsTotal.WithLabelValues("svc-lb-bridge", "EnsureLB", "error").Inc()
@@ -334,9 +340,9 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 		lastIDs = ids
 		portObserved[key] = servicePortObserved{VirtualServerID: ids.VirtualServerID, VirtualServerName: ids.VirtualServerName, BackendHash: backendHash}
-		shared.LBServiceID, shared.VIPPortID, shared.VIPAddress = ids.LBServiceID, ids.VIPPortID, portVIP
-		if portVIP != "" {
-			vip = portVIP
+		shared = observed
+		if observed.VIPAddress != "" {
+			vip = observed.VIPAddress
 		}
 	}
 	// Delete listeners for ports that have been removed. Parent LB/VIP resources
@@ -374,6 +380,9 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err := writeServicePortObserved(svc.Annotations, portObserved); err != nil {
 		return ctrl.Result{}, err
 	}
+	if err := writeObservedGraph(svc.Annotations, shared.Graph); err != nil {
+		return ctrl.Result{}, err
+	}
 	if err := r.Patch(ctx, svc, client.MergeFrom(base)); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -397,7 +406,7 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	return ctrl.Result{}, nil
 }
 
-func (r *serviceReconciler) ensureCMPResourcesWithCurrent(ctx context.Context, svc *corev1.Service, frontendPort, nodePort int32, backends []backendNode, protocol string, cfg lbServiceConfig, current model.ObservedState, currentHash string) (*f5client.CMPResourceIDs, string, string, error) {
+func (r *serviceReconciler) ensureCMPResourcesWithCurrent(ctx context.Context, svc *corev1.Service, frontendPort, nodePort int32, backends []backendNode, protocol string, cfg lbServiceConfig, current model.ObservedState, currentHash string) (*f5client.CMPResourceIDs, model.ObservedState, string, error) {
 
 	members := make([]model.BackendMember, 0, len(backends))
 	for _, backend := range backends {
@@ -425,7 +434,7 @@ func (r *serviceReconciler) ensureCMPResourcesWithCurrent(ctx context.Context, s
 		RecreateWhenHashMissing: true,
 	})
 	if err != nil {
-		return nil, current.VIPAddress, "", err
+		return nil, current, "", err
 	}
 	ids := &f5client.CMPResourceIDs{
 		LBServiceID:       result.Observed.LBServiceID,
@@ -433,7 +442,7 @@ func (r *serviceReconciler) ensureCMPResourcesWithCurrent(ctx context.Context, s
 		VirtualServerID:   result.Observed.VirtualServerID,
 		VirtualServerName: result.Observed.VirtualServerName,
 	}
-	return ids, result.Observed.VIPAddress, result.BackendHash, nil
+	return ids, result.Observed, result.BackendHash, nil
 }
 
 type servicePortObserved struct {
@@ -463,6 +472,29 @@ func writeServicePortObserved(annotations map[string]string, observed map[string
 		return fmt.Errorf("marshalling per-port observed state: %w", err)
 	}
 	annotations[annObservedPorts] = string(b)
+	return nil
+}
+
+func readObservedGraph(annotations map[string]string) (model.ObservedGraph, bool) {
+	if annotations == nil || strings.TrimSpace(annotations[annObservedGraph]) == "" {
+		return model.ObservedGraph{}, false
+	}
+	var graph model.ObservedGraph
+	if err := json.Unmarshal([]byte(annotations[annObservedGraph]), &graph); err != nil {
+		return model.ObservedGraph{}, false
+	}
+	if graph.LBServices == nil {
+		return model.ObservedGraph{}, false
+	}
+	return graph, true
+}
+
+func writeObservedGraph(annotations map[string]string, graph model.ObservedGraph) error {
+	b, err := json.Marshal(graph)
+	if err != nil {
+		return fmt.Errorf("marshalling observed graph: %w", err)
+	}
+	annotations[annObservedGraph] = string(b)
 	return nil
 }
 

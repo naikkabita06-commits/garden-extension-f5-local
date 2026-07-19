@@ -203,6 +203,10 @@ func TestReconcile_AllocatesVIPAndProgramsCMPVirtualServer(t *testing.T) {
 	if gotSvc.Annotations[annLBServiceID] != "lb-001" {
 		t.Fatalf("expected lb-service-id annotation, got %q", gotSvc.Annotations[annLBServiceID])
 	}
+	graph, ok := readObservedGraph(gotSvc.Annotations)
+	if !ok || graph.LBServices["app-ns-web"].ExternalID != "lb-001" || graph.VirtualServers["app-vs-ns-web-8080"].ExternalID != "vs-001" {
+		t.Fatalf("expected complete observed graph annotation, got %#v", graph)
+	}
 	if gotSvc.Annotations[annVIPAddress] != "10.0.0.10" {
 		t.Fatalf("expected vip-address annotation, got %q", gotSvc.Annotations[annVIPAddress])
 	}
