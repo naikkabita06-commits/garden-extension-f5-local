@@ -134,6 +134,13 @@ type Client interface {
 	GetLBVirtualServer(ctx context.Context, lbServiceID, vsID string) (json.RawMessage, error)
 	DeleteLBVirtualServer(ctx context.Context, lbServiceID, vsID string) error
 
+	// CMP LBaaS certificates (v2.1: /load-balancers/{lb_service_id}/certificates)
+	ListLBServiceCertificates(ctx context.Context, lbServiceID string) ([]json.RawMessage, error)
+	CreateLBServiceCertificate(ctx context.Context, lbServiceID string, query url.Values) (json.RawMessage, error)
+	DeleteLBServiceCertificate(ctx context.Context, lbServiceID, certificateID string) error
+	AttachLBVirtualServerCertificate(ctx context.Context, lbServiceID, virtualServerID, certificateID string) error
+	DetachLBVirtualServerCertificate(ctx context.Context, lbServiceID, virtualServerID, certificateID string) error
+
 	// CMP Network API (v2.1: /networks/ports/search-by-ip/)
 	SearchNetworkPortsByIP(ctx context.Context, ip string) ([]json.RawMessage, error)
 
@@ -1090,6 +1097,103 @@ func (c *client) DeleteLBVirtualServer(ctx context.Context, lbServiceID, vsID st
 		return fmt.Errorf("virtual server id must not be empty")
 	}
 	err := c.doRequest(ctx, http.MethodDelete, c.lbPath("/"+lbServiceID+"/virtual-servers/"+vsID), nil, nil)
+	if IsNotFound(err) {
+		return nil
+	}
+	return err
+}
+
+// ListLBServiceCertificates calls GET /load-balancers/{lbServiceID}/certificates.
+func (c *client) ListLBServiceCertificates(ctx context.Context, lbServiceID string) ([]json.RawMessage, error) {
+	lbServiceID = strings.TrimSpace(lbServiceID)
+	if lbServiceID == "" {
+		return nil, fmt.Errorf("lb service id must not be empty")
+	}
+	var out []json.RawMessage
+	if err := c.doRequest(ctx, http.MethodGet, c.lbPath("/"+lbServiceID+"/certificates"), nil, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// CreateLBServiceCertificate calls POST /load-balancers/{lbServiceID}/certificates.
+func (c *client) CreateLBServiceCertificate(ctx context.Context, lbServiceID string, query url.Values) (json.RawMessage, error) {
+	lbServiceID = strings.TrimSpace(lbServiceID)
+	if lbServiceID == "" {
+		return nil, fmt.Errorf("lb service id must not be empty")
+	}
+	path := "/" + lbServiceID + "/certificates"
+	if query != nil {
+		if enc := query.Encode(); enc != "" {
+			path += "?" + enc
+		}
+	}
+	var out json.RawMessage
+	if err := c.doRequest(ctx, http.MethodPost, c.lbPath(path), nil, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// DeleteLBServiceCertificate calls DELETE /load-balancers/{lbServiceID}/certificates/{certificateID}.
+func (c *client) DeleteLBServiceCertificate(ctx context.Context, lbServiceID, certificateID string) error {
+	lbServiceID = strings.TrimSpace(lbServiceID)
+	certificateID = strings.TrimSpace(certificateID)
+	if lbServiceID == "" {
+		return fmt.Errorf("lb service id must not be empty")
+	}
+	if certificateID == "" {
+		return fmt.Errorf("certificate id must not be empty")
+	}
+	err := c.doRequest(ctx, http.MethodDelete, c.lbPath("/"+lbServiceID+"/certificates/"+certificateID), nil, nil)
+	if IsNotFound(err) {
+		return nil
+	}
+	return err
+}
+
+// AttachLBVirtualServerCertificate calls PUT /load-balancers/{lbServiceID}/virtual-servers/{virtualServerID}/certificates/ with certificate_id query param.
+func (c *client) AttachLBVirtualServerCertificate(ctx context.Context, lbServiceID, virtualServerID, certificateID string) error {
+	lbServiceID = strings.TrimSpace(lbServiceID)
+	virtualServerID = strings.TrimSpace(virtualServerID)
+	certificateID = strings.TrimSpace(certificateID)
+	if lbServiceID == "" {
+		return fmt.Errorf("lb service id must not be empty")
+	}
+	if virtualServerID == "" {
+		return fmt.Errorf("virtual server id must not be empty")
+	}
+	if certificateID == "" {
+		return fmt.Errorf("certificate id must not be empty")
+	}
+	path := "/" + lbServiceID + "/virtual-servers/" + virtualServerID + "/certificates/"
+	q := url.Values{}
+	q.Set("certificate_id", certificateID)
+	path += "?" + q.Encode()
+	err := c.doRequest(ctx, http.MethodPut, c.lbPath(path), nil, nil)
+	if IsNotFound(err) {
+		return nil
+	}
+	return err
+}
+
+// DetachLBVirtualServerCertificate calls PUT /load-balancers/{lbServiceID}/virtual-servers/{virtualServerID}/certificates/ with an empty certificate_id.
+func (c *client) DetachLBVirtualServerCertificate(ctx context.Context, lbServiceID, virtualServerID, certificateID string) error {
+	lbServiceID = strings.TrimSpace(lbServiceID)
+	virtualServerID = strings.TrimSpace(virtualServerID)
+	if lbServiceID == "" {
+		return fmt.Errorf("lb service id must not be empty")
+	}
+	if virtualServerID == "" {
+		return fmt.Errorf("virtual server id must not be empty")
+	}
+	path := "/" + lbServiceID + "/virtual-servers/" + virtualServerID + "/certificates/"
+	q := url.Values{}
+	if strings.TrimSpace(certificateID) != "" {
+		q.Set("certificate_id", certificateID)
+	}
+	path += "?" + q.Encode()
+	err := c.doRequest(ctx, http.MethodPut, c.lbPath(path), nil, nil)
 	if IsNotFound(err) {
 		return nil
 	}

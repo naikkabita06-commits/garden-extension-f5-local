@@ -1,0 +1,28 @@
+apiVersion: extensions.gardener.cloud/v1alpha1
+kind: Extension
+metadata:
+  name: f5
+  namespace: shoot--local--local
+spec:
+  type: f5-loadbalancer
+  providerConfig:
+    spec:
+      enablePerShootControlPlaneVIP: false
+      enableApplicationLB: true
+
+      ccpApiEndpoint: "https://n1devcmp-user.airteldev.com/api/"
+      tenantOrPartition: "qa-tenant"
+      # vpcId is passed as CMP_VPC_ID to the svc-lb-bridge. Required by most CMP
+      # deployments so that LBService and VirtualServer are created inside the
+      # correct VPC. Get this from the CMP project settings.
+      # vpcId: "your-vpc-id-here"
+      credentialsSecretRef:
+        name: cmp-f5-credentials
+        namespace: shoot--local--local
+
+      cis:
+        # image: "f5networks/k8s-bigip-ctlr:2.14.0"
+        bridgeImage: "registry.local.gardener.cloud:5001/extensions/f5:v0.1.0-dev-gardener-1.139.2-fix1"
+        # bigipUrl: "https://<bigip-mgmt>"
+        # partition: "<bigip-partition>"
+        # extraArgs: []

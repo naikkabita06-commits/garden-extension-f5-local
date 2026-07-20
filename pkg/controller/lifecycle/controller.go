@@ -21,6 +21,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -969,6 +970,7 @@ func (a *actuator) Migrate(ctx context.Context, log logr.Logger, ex *extensionsv
 // Input: ctx, shootNamespace (Seed namespace containing the Shoot's kubeconfig Secret). Output: client.Client for the Shoot, error on failure.
 func (a *actuator) getShootClient(ctx context.Context, shootNamespace string) (client.Client, error) {
 	shootScheme := runtime.NewScheme()
+
 	if err := clientgoscheme.AddToScheme(shootScheme); err != nil {
 		return nil, fmt.Errorf("adding core scheme: %w", err)
 	}
@@ -979,11 +981,45 @@ func (a *actuator) getShootClient(ctx context.Context, shootNamespace string) (c
 		return nil, fmt.Errorf("adding rbac scheme: %w", err)
 	}
 
-	shootClients, err := extensionsutil.NewClientsForShoot(ctx, a.client, shootNamespace, client.Options{Scheme: shootScheme}, extensionsconfigv1alpha1.RESTOptions{})
+	_, shootClient, err := extensionsutil.NewClientForShoot(
+		ctx,
+		a.client,
+		shootNamespace,
+		client.Options{Scheme: shootScheme},
+		extensionsconfigv1alpha1.RESTOptions{},
+	)
 	if err != nil {
 		return nil, fmt.Errorf("creating shoot client: %w", err)
 	}
-	return shootClients.Client(), nil
+
+	logger := logf.FromContext(ctx).WithName("shoot-client")
+
+	var nsList corev1.NamespaceList
+	if err := shootClient.List(ctx, &nsList); err != nil {
+		return nil, fmt.Errorf("listing Shoot namespaces: %w", err)
+	}
+
+	logger.Info(
+		"Connected to Shoot",
+		"shootNamespace", shootNamespace,
+		"namespaceCount", len(nsList.Items),
+	)
+
+	var kubeSystem corev1.Namespace
+	if err := shootClient.Get(
+		ctx,
+		client.ObjectKey{Name: "kube-system"},
+		&kubeSystem,
+	); err != nil {
+		return nil, fmt.Errorf("reading Shoot kube-system namespace: %w", err)
+	}
+
+	logger.Info(
+		"Shoot cluster identity",
+		"kubeSystemUID", string(kubeSystem.UID),
+	)
+
+	return shootClient, nil
 }
 
 // reconcileCISInShoot deploys the Shoot-side Service→CMP LBaaS bridge into the Shoot cluster for application-plane

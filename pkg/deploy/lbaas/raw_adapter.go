@@ -20,12 +20,19 @@ type RawClient interface {
 	ListLBVirtualServers(ctx context.Context, lbServiceID string) ([]json.RawMessage, error)
 	CreateLBVirtualServer(ctx context.Context, lbServiceID string, query url.Values) (json.RawMessage, error)
 	DeleteLBVirtualServer(ctx context.Context, lbServiceID, vsID string) error
+	ListLBServiceCertificates(ctx context.Context, lbServiceID string) ([]json.RawMessage, error)
+	CreateLBServiceCertificate(ctx context.Context, lbServiceID string, query url.Values) (json.RawMessage, error)
+	DeleteLBServiceCertificate(ctx context.Context, lbServiceID, certificateID string) error
+	AttachLBVirtualServerCertificate(ctx context.Context, lbServiceID, virtualServerID, certificateID string) error
+	DetachLBVirtualServerCertificate(ctx context.Context, lbServiceID, virtualServerID, certificateID string) error
 	SearchNetworkPortsByIP(ctx context.Context, ip string) ([]json.RawMessage, error)
 }
 
 type rawAdapter struct{ raw RawClient }
 
 func NewRawClient(raw RawClient) Client { return rawAdapter{raw: raw} }
+
+func NewCertificateClientFromRaw(raw RawClient) CertificateClient { return rawCertificateAdapter{raw: raw} }
 
 // NewFromRaw enables every provider capability implemented by the underlying
 // client. This keeps callers on the stack deployer path from silently losing
@@ -41,6 +48,9 @@ func NewFromRaw(raw RawClient, vpcID string) *Deployer {
 	}
 	if rules, ok := raw.(RawRoutingRuleClient); ok {
 		d.routingRules = NewRoutingRuleManager(rawRoutingRuleAdapter{raw: rules})
+	}
+	if certificates, ok := raw.(RawClient); ok {
+		d.certificates = NewCertificateManager(NewCertificateClientFromRaw(certificates))
 	}
 	return d
 }
@@ -201,6 +211,80 @@ func (a rawAdapter) SearchNetworkPortsByIP(ctx context.Context, ip string) ([]Ne
 		}
 	}
 	return out, nil
+}
+
+type rawCertificateAdapter struct{ raw RawClient }
+
+func (a rawCertificateAdapter) ListCertificates(ctx context.Context, lbServiceID string) ([]CertificateResource, error) {
+	items, err := a.raw.ListLBServiceCertificates(ctx, lbServiceID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]CertificateResource, 0, len(items))
+	for _, raw := range items {
+		if cert := parseCertificate(raw); cert.ID != "" {
+			out = append(out, cert)
+		}
+	}
+	return out, nil
+}
+
+func (a rawCertificateAdapter) UploadCertificate(ctx context.Context, lbServiceID string, spec CertificateSpec) (CertificateResource, error) {
+	q := url.Values{}
+	q.Set("name", spec.Name)
+	if spec.Certificate != "" {
+		q.Set("sslCert", spec.Certificate)
+	}
+	if spec.PrivateKey != "" {
+		q.Set("sslPvtKey", spec.PrivateKey)
+	}
+	if spec.CA != "" {
+		q.Set("caCert", spec.CA)
+	}
+	raw, err := a.raw.CreateLBServiceCertificate(ctx, lbServiceID, q)
+	if err != nil {
+		return CertificateResource{}, err
+	}
+	return parseCertificate(raw), nil
+}
+
+func (a rawCertificateAdapter) DeleteCertificate(ctx context.Context, lbServiceID, certificateID string) error {
+	return a.raw.DeleteLBServiceCertificate(ctx, lbServiceID, certificateID)
+}
+
+func (a rawCertificateAdapter) BindCertificate(ctx context.Context, lbServiceID, virtualServerID, certificateID string) error {
+	return a.raw.AttachLBVirtualServerCertificate(ctx, lbServiceID, virtualServerID, certificateID)
+}
+
+func (a rawCertificateAdapter) UnbindCertificate(ctx context.Context, lbServiceID, virtualServerID, certificateID string) error {
+	return a.raw.DetachLBVirtualServerCertificate(ctx, lbServiceID, virtualServerID, certificateID)
+}
+
+func parseCertificate(raw json.RawMessage) CertificateResource {
+	var cert struct {
+		ID           string   `json:"id"`
+		Name         string   `json:"name"`
+		Fingerprint  string   `json:"fingerprint"`
+		SecretName   string   `json:"secret_name"`
+		Certificate  string   `json:"ssl_cert"`
+		PrivateKey   string   `json:"ssl_pvt_key"`
+		CA           string   `json:"ca_cert"`
+		HostNames    []string `json:"host_names"`
+		AltName      string   `json:"certificate_name"`
+		AltID        string   `json:"certificate_id"`
+	}
+	if json.Unmarshal(raw, &cert) != nil {
+		return CertificateResource{}
+	}
+	id := strings.TrimSpace(cert.ID)
+	if id == "" {
+		id = strings.TrimSpace(cert.AltID)
+	}
+	name := strings.TrimSpace(cert.Name)
+	if name == "" {
+		name = strings.TrimSpace(cert.AltName)
+	}
+	return CertificateResource{ID: id, Name: name, Fingerprint: strings.TrimSpace(cert.Fingerprint), SecretName: strings.TrimSpace(cert.SecretName), Certificate: strings.TrimSpace(cert.Certificate), PrivateKey: strings.TrimSpace(cert.PrivateKey), CA: strings.TrimSpace(cert.CA), HostNames: append([]string(nil), cert.HostNames...)}
 }
 
 type RawPoolClient interface {

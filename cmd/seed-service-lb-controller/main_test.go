@@ -64,6 +64,11 @@ func (s *stubCMP) DeleteLBVirtualServer(_ context.Context, _, _ string) error {
 	s.deleteVSN++
 	return nil
 }
+func (s *stubCMP) ListLBServiceCertificates(context.Context, string) ([]json.RawMessage, error) { return nil, nil }
+func (s *stubCMP) CreateLBServiceCertificate(context.Context, string, url.Values) (json.RawMessage, error) { return nil, nil }
+func (s *stubCMP) DeleteLBServiceCertificate(context.Context, string, string) error { return nil }
+func (s *stubCMP) AttachLBVirtualServerCertificate(context.Context, string, string, string) error { return nil }
+func (s *stubCMP) DetachLBVirtualServerCertificate(context.Context, string, string, string) error { return nil }
 func (s *stubCMP) ListLBVirtualServerPools(context.Context, string, string) ([]json.RawMessage, error) {
 	return nil, nil
 }

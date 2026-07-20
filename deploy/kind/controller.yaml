@@ -1,0 +1,57 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: garden-f5-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gardener-extension-f5
+  namespace: garden-f5-system
+---
+# Demo RBAC: cluster-admin so the controller can read Extension/F5LoadBalancerConfig
+# and access Shoot kubeconfigs/secrets in the technical namespaces.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: gardener-extension-f5-cluster-admin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+  - kind: ServiceAccount
+    name: gardener-extension-f5
+    namespace: garden-f5-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gardener-extension-f5
+  namespace: garden-f5-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gardener-extension-f5
+  template:
+    metadata:
+      labels:
+        app: gardener-extension-f5
+    spec:
+      serviceAccountName: gardener-extension-f5
+      containers:
+        - name: controller
+          image: gardener-extension-f5:dev
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi

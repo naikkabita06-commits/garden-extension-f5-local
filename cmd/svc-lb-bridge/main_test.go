@@ -24,22 +24,27 @@ import (
 )
 
 type stubCMP struct {
-	createLBN int
-	listLBN   int
-	createVN  int
-	listVIPN  int
-	createVSN int
-	listVSN   int
-	deleteVSN int
-	deleteVN  int
-	deleteLBN int
-	searchN   int
-	lastVSQ   url.Values
+	createLBN      int
+	listLBN        int
+	createVN       int
+	listVIPN       int
+	createVSN      int
+	listVSN        int
+	deleteVSN      int
+	deleteVN       int
+	deleteLBN      int
+	searchN        int
+	lastVSQ        url.Values
+	createCertN    int
+	lastCertQ      url.Values
+	attachCertN    int
+	attachedCertID string
 
 	// Optional canned responses for list calls.
 	lbServices []json.RawMessage
 	vips       []json.RawMessage
 	vsList     []json.RawMessage
+	certs      []json.RawMessage
 }
 
 func (s *stubCMP) CreateLBService(_ context.Context, _ url.Values) (json.RawMessage, error) {
@@ -90,6 +95,25 @@ func (s *stubCMP) DeleteLBVirtualServer(_ context.Context, _, id string) error {
 			break
 		}
 	}
+	return nil
+}
+func (s *stubCMP) ListLBServiceCertificates(context.Context, string) ([]json.RawMessage, error) {
+	return append([]json.RawMessage(nil), s.certs...), nil
+}
+func (s *stubCMP) CreateLBServiceCertificate(_ context.Context, _ string, q url.Values) (json.RawMessage, error) {
+	s.createCertN++
+	s.lastCertQ = q
+	created := json.RawMessage(`{"id":"cert-001","name":"` + q.Get("name") + `"}`)
+	s.certs = append(s.certs, created)
+	return created, nil
+}
+func (s *stubCMP) DeleteLBServiceCertificate(context.Context, string, string) error { return nil }
+func (s *stubCMP) AttachLBVirtualServerCertificate(_ context.Context, _, _, certID string) error {
+	s.attachCertN++
+	s.attachedCertID = certID
+	return nil
+}
+func (s *stubCMP) DetachLBVirtualServerCertificate(context.Context, string, string, string) error {
 	return nil
 }
 func (s *stubCMP) ListLBVirtualServerPools(_ context.Context, _, _ string) ([]json.RawMessage, error) {
@@ -442,5 +466,44 @@ func TestReconcile_ProgramsAndTracksEveryServicePortIndependently(t *testing.T) 
 	observed := readServicePortObserved(got.Annotations)
 	if len(observed) != 2 || observed["http/80/http"].VirtualServerID == "" || observed["https/443/https"].VirtualServerID == "" {
 		t.Fatalf("expected per-port observed virtual servers, got %#v", observed)
+	}
+}
+
+func TestReconcile_VIPGroupBootstrapsSharedParentWithoutSibling(t *testing.T) {
+	ctx := context.Background()
+
+	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{
+		Name:      "grouped",
+		Namespace: "ns",
+		Annotations: map[string]string{
+			annVIPGroup: "shared-apps",
+		},
+	}}
+	svc.Spec.Type = corev1.ServiceTypeLoadBalancer
+	svc.Spec.Ports = []corev1.ServicePort{{Name: "http", Port: 8080, NodePort: 30080, Protocol: corev1.ProtocolTCP}}
+	svc.Spec.LoadBalancerClass = ptr.To(defaultLBClass)
+
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n1"}}
+	node.Status.Addresses = []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "172.18.0.10"}}
+	node.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}
+
+	r, c, stub := newTestReconciler(t, svc, node)
+
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(svc)}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if stub.createLBN != 1 || stub.createVN != 1 || stub.createVSN != 1 {
+		t.Fatalf("expected grouped bootstrap to create shared LB/VIP/VS, got lb=%d vip=%d vs=%d", stub.createLBN, stub.createVN, stub.createVSN)
+	}
+
+	got := &corev1.Service{}
+	if err := c.Get(ctx, client.ObjectKeyFromObject(svc), got); err != nil {
+		t.Fatalf("getting Service: %v", err)
+	}
+	if got.Annotations[annLBServiceID] == "" || got.Annotations[annVIPPortID] == "" || got.Annotations[annVIPAddress] == "" {
+		t.Fatalf("expected grouped bootstrap to persist shared parent annotations, got %#v", got.Annotations)
+	}
+	if len(got.Status.LoadBalancer.Ingress) != 1 || got.Status.LoadBalancer.Ingress[0].IP == "" {
+		t.Fatalf("expected service status ingress VIP, got %#v", got.Status.LoadBalancer.Ingress)
 	}
 }

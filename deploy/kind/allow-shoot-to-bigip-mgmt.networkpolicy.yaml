@@ -1,0 +1,21 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-to-f5-bigip-mgmt-100-65-242-181
+  namespace: shoot--local--local
+  annotations:
+    gardener.cloud/description: "Allow egress from provider-local machine pods to BIG-IP management endpoint (demo workaround for CGNAT-blocked range)."
+spec:
+  podSelector:
+    matchLabels:
+      app: machine
+      machine-provider: local
+  policyTypes:
+  - Egress
+  egress:
+  - to:
+    - ipBlock:
+        cidr: 100.65.242.181/32
+    ports:
+    - protocol: TCP
+      port: 443

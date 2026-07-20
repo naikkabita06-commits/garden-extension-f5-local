@@ -1,0 +1,26 @@
+apiVersion: core.gardener.cloud/v1beta1
+kind: ControllerRegistration
+metadata:
+  name: gardener-extension-f5
+spec:
+  resources:
+    # AirtelCloud-required extension type — must include seed so it can be listed
+    # in the Seed spec under spec.extensions. Without clusterCompatibility: [seed],
+    # the Gardener API server defaults it to [shoot] only and rejects the Seed.
+    - kind: Extension
+      type: f5-loadbalancer
+      primary: true
+      clusterCompatibility:
+      - seed
+      - shoot
+    # Backward-compatible legacy type (only enabled when explicitly used)
+    - kind: Extension
+      type: f5
+      primary: true
+      clusterCompatibility:
+      - seed
+      - shoot
+  deployment:
+    policy: Always
+    deploymentRefs:
+      - name: gardener-extension-f5

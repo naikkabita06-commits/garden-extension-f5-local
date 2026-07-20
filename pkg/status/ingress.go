@@ -17,6 +17,9 @@ func EnsureIngressVIP(ctx context.Context, c client.Client, ing *networkingv1.In
 	if vip == "" {
 		return nil
 	}
+	if strings.EqualFold(strings.TrimSpace(vip), "pending") || strings.EqualFold(strings.TrimSpace(vip), "unknown") {
+		return fmt.Errorf("refusing to publish placeholder CMP VIP %q", vip)
+	}
 	if net.ParseIP(vip) == nil {
 		return fmt.Errorf("refusing to publish non-IP CMP VIP %q", vip)
 	}

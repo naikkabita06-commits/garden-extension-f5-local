@@ -21,6 +21,7 @@ type Deployer struct {
 	pools          *PoolManager
 	monitors       *MonitorManager
 	routingRules   *RoutingRuleManager
+	certificates   *CertificateManager
 }
 
 func New(client Client, vpcID string) *Deployer {
@@ -124,16 +125,14 @@ func DesiredBackendHash(frontendPort, nodePort int32, backends []model.BackendMe
 	return hex.EncodeToString(h[:])
 }
 
-// DesiredVirtualServerHash covers every field that the CMP create endpoint
-// applies to a listener, in addition to backend identity. CMP Swagger exposes
-// no listener update operation, so a hash change is a deliberate replacement
-// signal rather than an opportunity for name-based adoption.
-func DesiredVirtualServerHash(vs model.VirtualServer, backends []model.BackendMember) string {
+// DesiredVirtualServerHash covers the listener fields that should trigger a
+// CMP virtual-server replacement. Backend membership changes are handled by
+// pool-member reconciliation and must not recreate the listener.
+func DesiredVirtualServerHash(vs model.VirtualServer, _ []model.BackendMember) string {
 	ranges := append([]string(nil), vs.SourceRanges...)
 	sort.Strings(ranges)
 	b := strings.Builder{}
-	b.WriteString(DesiredBackendHash(vs.FrontendPort, vs.BackendNodePort, backends))
-	b.WriteString(fmt.Sprintf("name=%s;protocol=%s;algorithm=%s;persistence=%s;draining=%d;ranges=%s;default-pool=%s;", vs.Name, vs.Protocol, vs.RoutingAlgorithm, vs.PersistenceType, vs.DrainingTimeout, strings.Join(ranges, ","), vs.DefaultPoolName))
+	b.WriteString(fmt.Sprintf("frontend=%d;nodeport=%d;name=%s;protocol=%s;algorithm=%s;persistence=%s;draining=%d;ranges=%s;default-pool=%s;", vs.FrontendPort, vs.BackendNodePort, vs.Name, vs.Protocol, vs.RoutingAlgorithm, vs.PersistenceType, vs.DrainingTimeout, strings.Join(ranges, ","), vs.DefaultPoolName))
 	if vs.Monitor != nil {
 		b.WriteString(fmt.Sprintf("monitor=%s:%s:%s:%d;", vs.Monitor.Name, vs.Monitor.Type, vs.Monitor.Path, vs.Monitor.Interval))
 	}
@@ -158,7 +157,7 @@ type StackEnsureResult struct {
 // NewWithResourceManagers constructs a stack deployer. Pool, monitor, and rule
 // clients are explicit because CMP installations expose these capabilities
 // independently from the legacy LB/VIP/virtual-server client.
-func NewWithResourceManagers(client Client, vpcID string, pools PoolClient, monitors MonitorClient, rules RoutingRuleClient) *Deployer {
+func NewWithResourceManagers(client Client, vpcID string, pools PoolClient, monitors MonitorClient, rules RoutingRuleClient, certificates CertificateClient) *Deployer {
 	d := New(client, vpcID)
 	if pools != nil {
 		d.pools = NewPoolManager(pools)
@@ -168,6 +167,9 @@ func NewWithResourceManagers(client Client, vpcID string, pools PoolClient, moni
 	}
 	if rules != nil {
 		d.routingRules = NewRoutingRuleManager(rules)
+	}
+	if certificates != nil {
+		d.certificates = NewCertificateManager(certificates)
 	}
 	return d
 }
@@ -189,7 +191,7 @@ func (d *Deployer) EnsureStack(ctx context.Context, req StackEnsureRequest) (*St
 	if len(req.Stack.RoutingRules) != 0 && d.routingRules == nil {
 		return nil, fmt.Errorf("routing-rule reconciliation requires a RoutingRuleManager")
 	}
-	if len(req.Stack.Certificates) != 0 {
+	if len(req.Stack.Certificates) != 0 && d.certificates == nil {
 		return nil, fmt.Errorf("certificate reconciliation requires a CertificateManager")
 	}
 
@@ -233,6 +235,18 @@ func (d *Deployer) EnsureStack(ctx context.Context, req StackEnsureRequest) (*St
 			observed.VirtualServerID, observed.VirtualServerName = vsID, vsName
 		}
 		changed = changed || vsChanged
+
+		if len(req.Stack.Certificates) != 0 && strings.EqualFold(vs.Protocol, "HTTPS") {
+			certObserved, certChanged, err := d.certificates.Ensure(ctx, lbID, vsID, req.Stack.Certificates, observed.Graph.Certificates)
+			if err != nil {
+				return nil, err
+			}
+			observed.Graph.Certificates = map[string]model.ObservedResource{}
+			for _, cert := range certObserved {
+				observed.Graph.Certificates[cert.LogicalID] = cert
+			}
+			changed = changed || certChanged
+		}
 
 		poolIDs := map[string]string{}
 		for _, pool := range poolsForVirtualServer(req.Stack, vs) {

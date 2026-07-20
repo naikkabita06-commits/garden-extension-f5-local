@@ -146,6 +146,9 @@ func run(ctx context.Context) error {
 		Watches(&corev1.Node{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, _ client.Object) []reconcile.Request {
 			return listManagedIngressRequests(ctx, mgr.GetClient())
 		})).
+		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+			return listManagedIngressRequestsForSecret(ctx, mgr.GetClient(), obj.GetNamespace(), obj.GetName())
+		})).
 		Complete(ingR); err != nil {
 		return fmt.Errorf("creating ingress controller: %w", err)
 	}
@@ -329,8 +332,6 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			shared.LBServiceID, shared.VIPPortID, shared.VIPAddress = parent.LBServiceID, parent.VIPPortID, parent.VIPAddress
 			shared.Graph = parent.Graph
 		}
-		r.Recorder.Eventf(svc, corev1.EventTypeWarning, "SyncLoadBalancerFailed", "Error ensuring CMP LBaaS resource graph: %v", err)
-		return ctrl.Result{}, err
 	}
 	cmpStart := time.Now()
 	stackResult, err := lbaasdeploy.NewFromRaw(r.cmp, r.vpcID).EnsureStack(ctx, lbaasdeploy.StackEnsureRequest{Stack: stack, Current: shared})

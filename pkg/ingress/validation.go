@@ -28,9 +28,6 @@ func ValidateSupported(ing *networkingv1.Ingress) error {
 	if ing.Spec.DefaultBackend != nil {
 		consume(*ing.Spec.DefaultBackend)
 	}
-	if len(ing.Spec.TLS) > 0 {
-		return fmt.Errorf("TLS certificate upload and virtual-server binding are not yet supported by the Ingress deployer")
-	}
 	if len(backendRefs) > 1 {
 		return fmt.Errorf("multiple backend services or ports require routing-rule and pool deployment support that is not yet enabled")
 	}

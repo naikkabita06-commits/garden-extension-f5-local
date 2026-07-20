@@ -178,12 +178,16 @@ func (r *ingressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		r.Recorder.Eventf(ing, corev1.EventTypeWarning, "BuildLoadBalancerModelFailed", "Error building Ingress load-balancer model: %v", err)
 		return ctrl.Result{}, err
 	}
-	// Certificate uploads/bindings are deliberately capability-gated until the
-	// typed CertificateManager is wired. Do not add a finalizer for a stack the
-	// current deployer cannot ever converge.
-	if len(stack.Certificates) > 0 {
+	// TLS certificates require a certificate-capable CMP client. If it is not
+	// configured, surface a clear error rather than silently provisioning a
+	// partially secure frontend.
+	if len(stack.Certificates) > 0 && !r.hasCertificateCapability() {
 		r.Recorder.Event(ing, corev1.EventTypeWarning, "TLSNotSupported", "TLS requires the CMP CertificateManager capability")
 		return ctrl.Result{}, fmt.Errorf("TLS certificate reconciliation is not configured")
+	}
+	if err := r.populateTLSCertificates(ctx, ing.Namespace, stack); err != nil {
+		r.Recorder.Eventf(ing, corev1.EventTypeWarning, "InvalidCertificate", "%v", err)
+		return ctrl.Result{}, err
 	}
 
 	// Add the finalizer only after validation has produced a deployable graph.
@@ -393,6 +397,42 @@ func (r *ingressReconciler) persistGroupObserved(ctx context.Context, members []
 	return nil
 }
 
+func (r *ingressReconciler) hasCertificateCapability() bool {
+	return r.cmp != nil
+}
+
+func (r *ingressReconciler) populateTLSCertificates(ctx context.Context, namespace string, stack *model.LoadBalancerStack) error {
+	if stack == nil || len(stack.Certificates) == 0 {
+		return nil
+	}
+	cache := map[string]lbingress.TLSMaterial{}
+	for i := range stack.Certificates {
+		cert := &stack.Certificates[i]
+		secretName := strings.TrimSpace(cert.SecretName)
+		if secretName == "" {
+			return fmt.Errorf("certificate %q has no Secret reference", cert.Name)
+		}
+		material, ok := cache[secretName]
+		if !ok {
+			secret := &corev1.Secret{}
+			if err := r.Get(ctx, types.NamespacedName{Namespace: namespace, Name: secretName}, secret); err != nil {
+				return fmt.Errorf("reading TLS Secret %s/%s: %w", namespace, secretName, err)
+			}
+			validated, err := lbingress.ReadTLSSecret(secret)
+			if err != nil {
+				return err
+			}
+			cache[secretName] = validated
+			material = validated
+		}
+		cert.Fingerprint = material.Fingerprint
+		cert.Certificate = string(material.Certificate)
+		cert.PrivateKey = string(material.PrivateKey)
+		cert.CA = string(material.CA)
+	}
+	return nil
+}
+
 func (r *ingressReconciler) ensureCMPResources(ctx context.Context, ing *networkingv1.Ingress, stack *model.LoadBalancerStack) (*f5client.CMPResourceIDs, string, model.ObservedGraph, error) {
 	current := model.ObservedState{}
 	if ing != nil && ing.Annotations != nil {
@@ -484,4 +524,68 @@ func listManagedIngressRequests(ctx context.Context, c client.Client) []reconcil
 		}
 	}
 	return reqs
+}
+
+func listManagedIngressRequestsForSecret(ctx context.Context, c client.Client, namespace, secretName string) []reconcile.Request {
+	if strings.TrimSpace(namespace) == "" || strings.TrimSpace(secretName) == "" {
+		return nil
+	}
+	ingList := &networkingv1.IngressList{}
+	if err := c.List(ctx, ingList, client.InNamespace(namespace)); err != nil {
+		return nil
+	}
+	reqs := make([]reconcile.Request, 0)
+	seen := map[string]struct{}{}
+	for i := range ingList.Items {
+		ing := &ingList.Items[i]
+		if ing.DeletionTimestamp != nil || !isOwnedIngressObject(ing) || !ingressReferencesTLSSecret(ing, secretName) {
+			continue
+		}
+		group := lbingress.GroupName(ing)
+		for j := range ingList.Items {
+			candidate := &ingList.Items[j]
+			if candidate.DeletionTimestamp != nil || !isOwnedIngressObject(candidate) {
+				continue
+			}
+			if group != "" && lbingress.GroupName(candidate) != group {
+				continue
+			}
+			if group == "" && (candidate.Namespace != ing.Namespace || candidate.Name != ing.Name) {
+				continue
+			}
+			key := candidate.Namespace + "/" + candidate.Name
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: candidate.Namespace, Name: candidate.Name}})
+		}
+	}
+	return reqs
+}
+
+func ingressReferencesTLSSecret(ing *networkingv1.Ingress, secretName string) bool {
+	secretName = strings.TrimSpace(secretName)
+	if ing == nil || secretName == "" {
+		return false
+	}
+	for _, tls := range ing.Spec.TLS {
+		if strings.TrimSpace(tls.SecretName) == secretName {
+			return true
+		}
+	}
+	return false
+}
+
+func isOwnedIngressObject(ing *networkingv1.Ingress) bool {
+	if ing == nil {
+		return false
+	}
+	if ing.Spec.IngressClassName != nil {
+		return *ing.Spec.IngressClassName == ingressClassName
+	}
+	if ann, ok := ing.Annotations["kubernetes.io/ingress.class"]; ok {
+		return ann == ingressClassName
+	}
+	return false
 }

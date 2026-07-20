@@ -1,0 +1,25 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-garden-f5-system-to-shoot-kube-apiserver
+  namespace: shoot--local--local
+  annotations:
+    gardener.cloud/description: Allow the gardener-extension-f5 controller (demo) to reach the Shoot kube-apiserver service.
+spec:
+  podSelector:
+    matchLabels:
+      app: kubernetes
+      role: apiserver
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: garden-f5-system
+          podSelector:
+            matchLabels:
+              app: gardener-extension-f5
+      ports:
+        - protocol: TCP
+          port: 443

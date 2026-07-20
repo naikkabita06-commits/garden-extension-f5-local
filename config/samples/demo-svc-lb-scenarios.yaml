@@ -1,0 +1,306 @@
+# =============================================================================
+# Demo: Service type=LoadBalancer – CMP resource-sharing scenarios
+# =============================================================================
+#
+# PREREQUISITES – verify before applying
+# ──────────────────────────────────────
+# 1. svc-lb-bridge is running:
+#      kubectl -n f5-cis-system get pods
+#
+# 2. CMP_VPC_ID is set in the bridge:
+#      kubectl -n f5-cis-system get deploy f5-svc-lb-bridge -o jsonpath='{.spec.template.spec.containers[0].env}'
+#    If blank, add spec.vpcId to the Extension providerConfig, e.g.:
+#      kubectl -n shoot--local--local edit extension f5
+#      # under spec.providerConfig.spec add: vpcId: "your-vpc-id"
+#    Without this, CMP creates the LBService without a VPC scope (may fail).
+#
+# 3. Shoot worker nodes are CMP compute instances.
+#    The bridge resolves each worker node InternalIP via:
+#      GET /networks/ports/search-by-ip/?fixed_ip=<nodeIP>
+#    If the node IPs are not CMP compute ports (e.g. kind/local), VS creation
+#    will fail with "no CMP network port found for backend IP <ip>".
+#
+# DEPLOYMENT ORDER (important for scenarios 2 & 3)
+# ─────────────────────────────────────────────────
+# Shared-VIP services (app-b/c/d) rely on app-b being fully reconciled before
+# app-c or app-d are created. If deployed simultaneously, each Service may
+# create a separate LBService instead of sharing.
+#
+#   Step 1:  kubectl apply -f demo-svc-lb-scenarios.yaml  (just the Namespace + app-a)
+#   Step 2:  kubectl apply -f demo-svc-lb-scenarios-b.yaml
+#   Step 3:  wait for app-b-svc EXTERNAL-IP to be set, then:
+#   Step 4:  kubectl apply -f demo-svc-lb-scenarios-cd.yaml
+#
+# For convenience this single file deploys everything at once, which works if
+# the controller processes objects sequentially (single-replica bridge).
+# Watch with: kubectl -n demo-svc-lb get svc -w
+#
+# ┌────────────────────────────────────────────────────────────────────────────┐
+# │ Scenario 1 – app-a  │ Own LBService │ Own VIP (unique IP)  │ Own VS       │
+# │ Scenario 2 – app-b  │ Own LBService │ Own VIP (unique IP)  │ Own VS       │
+# │ Scenario 3 – app-c  │ SHARED LBSvc  │ SHARED VIP (same IP) │ Own VS :9090 │
+# │ Scenario 3 – app-d  │ SHARED LBSvc  │ SHARED VIP (same IP) │ Own VS :7070 │
+# └────────────────────────────────────────────────────────────────────────────┘
+#
+# HOW SHARING WORKS (code path)
+# ──────────────────────────────
+# 1. Service annotation  f5.extensions.gardener.cloud/vip-group: <name>
+# 2. pkg/service/builder.go LBServiceName() → same name for same group
+# 3. sharedParentObservedState() reads sibling Service's observed-graph annotation
+#    to inherit LBServiceID + VIPPortID (avoids duplicate CMP LBService creation)
+# 4. EnsureStack → LBServiceManager skips create (ID already known)
+#             → VIPManager skips create (ID already known)
+#             → VirtualServerManager creates new VS on the shared LBService/VIP
+#
+# UNIQUE FRONTEND PORT REQUIREMENT
+# ──────────────────────────────────
+# Two Virtual Servers on the same VIP IP must use different spec.ports[*].port.
+# The F5 rejects two listeners on the same IP:port.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Shared namespace
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo-svc-lb
+
+---
+# ===========================================================================
+# SCENARIO 1 – App A
+# Different LBService │ Different VIP │ Different VS
+#
+# No vip-group annotation → the controller creates a dedicated CMP LBService
+# named "app-demo-svc-lb-app-a", allocates an exclusive VIP (IP-A), and
+# creates VS "app-vs-demo-svc-lb-app-a-8080".
+# ===========================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-a
+  namespace: demo-svc-lb
+  labels:
+    app: app-a
+    scenario: "1-standalone"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: app-a
+  template:
+    metadata:
+      labels:
+        app: app-a
+    spec:
+      containers:
+      - name: echo
+        image: traefik/whoami:v1.10.2
+        args: ["--port=5678"]
+        ports:
+        - containerPort: 5678
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: app-a-svc
+  namespace: demo-svc-lb
+  labels:
+    scenario: "1-standalone"
+  annotations:
+    # --- NO vip-group annotation ---
+    # Result: own CMP LBService + own VIP + own VS.
+    #
+    # Optional overrides (uncomment to customise):
+    # f5.extensions.gardener.cloud/routing-algorithm: round_robin
+    # f5.extensions.gardener.cloud/health-check-type: http
+    # f5.extensions.gardener.cloud/health-check-path: /healthz
+spec:
+  type: LoadBalancer
+  loadBalancerClass: f5.extensions.gardener.cloud/bigip
+  selector:
+    app: app-a
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 5678
+    protocol: TCP
+
+---
+# ===========================================================================
+# SCENARIO 2 – App B
+# Different LBService (from App A) │ Different VIP │ Different VS
+#
+# vip-group: demo-blue → LBService named "app-group-demo-svc-lb-demo-blue".
+# App B is the FIRST member of this group, so it creates the shared LBService
+# and a new VIP (IP-B, distinct from App A's IP-A).
+# VS = "app-vs-demo-svc-lb-app-b-8080"
+#
+# App C and App D (below) will inherit IP-B because they join the same group.
+# ===========================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-b
+  namespace: demo-svc-lb
+  labels:
+    app: app-b
+    scenario: "2-shared-lb-parent"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: app-b
+  template:
+    metadata:
+      labels:
+        app: app-b
+    spec:
+      containers:
+      - name: echo
+        image: traefik/whoami:v1.10.2
+        args: ["--port=5678"]
+        ports:
+        - containerPort: 5678
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: app-b-svc
+  namespace: demo-svc-lb
+  labels:
+    scenario: "2-shared-lb-parent"
+  annotations:
+    # vip-group creates / joins a shared CMP LBService.
+    # App B is the first member → allocates IP-B for the group.
+    f5.extensions.gardener.cloud/vip-group: demo-blue
+    #
+    # Optional overrides:
+    # f5.extensions.gardener.cloud/routing-algorithm: least_connections
+spec:
+  type: LoadBalancer
+  loadBalancerClass: f5.extensions.gardener.cloud/bigip
+  selector:
+    app: app-b
+  ports:
+  - name: http
+    port: 8080       # frontend port on shared VIP IP-B:8080
+    targetPort: 5678
+    protocol: TCP
+
+---
+# ===========================================================================
+# SCENARIO 3a – App C
+# SAME LBService as App B │ SAME VIP (IP-B) │ Different VS
+#
+# vip-group: demo-blue (same as App B) → controller finds the existing
+# LBService "app-group-demo-svc-lb-demo-blue" and the VIP IP-B already owned
+# by App B. It reuses both and creates only a new VS:
+#   "app-vs-demo-svc-lb-app-c-9090"  on IP-B:9090
+#
+# MUST use a different frontend port from App B (8080) to avoid VS conflict.
+# ===========================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-c
+  namespace: demo-svc-lb
+  labels:
+    app: app-c
+    scenario: "3-shared-lb-vip"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: app-c
+  template:
+    metadata:
+      labels:
+        app: app-c
+    spec:
+      containers:
+      - name: echo
+        image: traefik/whoami:v1.10.2
+        args: ["--port=5678"]
+        ports:
+        - containerPort: 5678
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: app-c-svc
+  namespace: demo-svc-lb
+  labels:
+    scenario: "3-shared-lb-vip"
+  annotations:
+    # Same vip-group → inherits LBService + VIP (IP-B) from App B.
+    # Creates own VS on a DIFFERENT port.
+    f5.extensions.gardener.cloud/vip-group: demo-blue
+spec:
+  type: LoadBalancer
+  loadBalancerClass: f5.extensions.gardener.cloud/bigip
+  selector:
+    app: app-c
+  ports:
+  - name: http
+    port: 9090       # frontend port on shared VIP IP-B:9090
+    targetPort: 5678
+    protocol: TCP
+
+---
+# ===========================================================================
+# SCENARIO 3b – App D
+# SAME LBService as App B │ SAME VIP (IP-B) │ Different VS
+#
+# Third member of the group. Reuses IP-B, adds VS:
+#   "app-vs-demo-svc-lb-app-d-7070"  on IP-B:7070
+# ===========================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-d
+  namespace: demo-svc-lb
+  labels:
+    app: app-d
+    scenario: "3-shared-lb-vip"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: app-d
+  template:
+    metadata:
+      labels:
+        app: app-d
+    spec:
+      containers:
+      - name: echo
+        image: traefik/whoami:v1.10.2
+        args: ["--port=5678"]
+        ports:
+        - containerPort: 5678
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: app-d-svc
+  namespace: demo-svc-lb
+  labels:
+    scenario: "3-shared-lb-vip"
+  annotations:
+    # Same vip-group → inherits LBService + VIP (IP-B) from App B.
+    f5.extensions.gardener.cloud/vip-group: demo-blue
+spec:
+  type: LoadBalancer
+  loadBalancerClass: f5.extensions.gardener.cloud/bigip
+  selector:
+    app: app-d
+  ports:
+  - name: http
+    port: 7070       # frontend port on shared VIP IP-B:7070
+    targetPort: 5678
+    protocol: TCP

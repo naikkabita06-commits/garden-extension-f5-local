@@ -94,10 +94,15 @@ func run(ctx context.Context) error {
 	}
 
 	if webhookEnabled {
-		mgr.GetWebhookServer().Register("/convert", webhookconversion.NewWebhookHandler(s))
+		mgr.GetWebhookServer().Register(
+			"/convert",
+			webhookconversion.NewWebhookHandler(
+				s,
+				mgr.GetConverterRegistry(),
+			),
+		)
 		setupLog.Info("registered CRD conversion webhook", "path", "/convert")
 	}
-
 	setupLog.Info("starting manager")
 	if err := mgr.Start(ctx); err != nil {
 		return fmt.Errorf("starting manager: %w", err)

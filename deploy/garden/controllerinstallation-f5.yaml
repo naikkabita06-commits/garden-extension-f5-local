@@ -1,0 +1,15 @@
+# ControllerInstallation installs the extension controller into a specific Seed.
+#
+# Edit spec.seedRef.name to the name of your Seed (for example an OpenStack Seed).
+# Apply this object to the *Garden (management) cluster*.
+apiVersion: core.gardener.cloud/v1beta1
+kind: ControllerInstallation
+metadata:
+  name: gardener-extension-f5
+spec:
+  deploymentRef:
+    name: gardener-extension-f5
+  registrationRef:
+    name: gardener-extension-f5
+  seedRef:
+    name: local

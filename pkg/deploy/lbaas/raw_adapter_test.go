@@ -35,6 +35,15 @@ func (s rawAdapterStub) CreateLBVirtualServer(context.Context, string, url.Value
 	return nil, nil
 }
 func (s rawAdapterStub) DeleteLBVirtualServer(context.Context, string, string) error { return nil }
+func (s rawAdapterStub) ListLBServiceCertificates(context.Context, string) ([]json.RawMessage, error) {
+	return nil, nil
+}
+func (s rawAdapterStub) CreateLBServiceCertificate(context.Context, string, url.Values) (json.RawMessage, error) {
+	return nil, nil
+}
+func (s rawAdapterStub) DeleteLBServiceCertificate(context.Context, string, string) error { return nil }
+func (s rawAdapterStub) AttachLBVirtualServerCertificate(context.Context, string, string, string) error { return nil }
+func (s rawAdapterStub) DetachLBVirtualServerCertificate(context.Context, string, string, string) error { return nil }
 func (s rawAdapterStub) SearchNetworkPortsByIP(context.Context, string) ([]json.RawMessage, error) {
 	return append([]json.RawMessage(nil), s.ports...), nil
 }

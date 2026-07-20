@@ -3,11 +3,39 @@ package lbaas
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/gardener/gardener-extension-f5/pkg/model"
 )
+
+type certificateBinding struct {
+	virtualServerID string
+	certificateID   string
+}
+
+type stubCertificateClient struct {
+	resources []CertificateResource
+	uploaded  []CertificateSpec
+	bindings  []certificateBinding
+}
+
+func (s *stubCertificateClient) ListCertificates(context.Context, string) ([]CertificateResource, error) {
+	return append([]CertificateResource(nil), s.resources...), nil
+}
+func (s *stubCertificateClient) UploadCertificate(_ context.Context, _ string, spec CertificateSpec) (CertificateResource, error) {
+	s.uploaded = append(s.uploaded, spec)
+	created := CertificateResource{ID: "cert-" + strconv.Itoa(len(s.uploaded)), Name: spec.Name}
+	s.resources = append(s.resources, created)
+	return created, nil
+}
+func (s *stubCertificateClient) DeleteCertificate(context.Context, string, string) error { return nil }
+func (s *stubCertificateClient) BindCertificate(_ context.Context, _ string, virtualServerID, certificateID string) error {
+	s.bindings = append(s.bindings, certificateBinding{virtualServerID: virtualServerID, certificateID: certificateID})
+	return nil
+}
+func (s *stubCertificateClient) UnbindCertificate(context.Context, string, string, string) error { return nil }
 
 type stubClient struct {
 	lbServices         []LBService
@@ -363,6 +391,26 @@ func TestEnsureRejectsVirtualServerCreateWithoutProviderID(t *testing.T) {
 	_, err := New(stub, "").Ensure(context.Background(), EnsureRequest{VirtualServer: model.VirtualServer{Name: "vs", FrontendPort: 80, BackendNodePort: 30080}, Backends: []model.BackendMember{{IP: "10.0.0.1", Port: 30080}}})
 	if err == nil || !strings.Contains(err.Error(), "without a provider id") {
 		t.Fatalf("expected missing provider ID error, got %v", err)
+	}
+}
+
+func TestEnsureStackBindsCertificatesToHTTPSVirtualServers(t *testing.T) {
+	certClient := &stubCertificateClient{}
+	deployer := NewWithResourceManagers(&stubClient{}, "", nil, nil, nil, certClient)
+	_, err := deployer.EnsureStack(context.Background(), StackEnsureRequest{Stack: &model.LoadBalancerStack{
+		LBService: model.LBService{Name: "lb"},
+		VIP:       model.VIP{Name: "vip"},
+		VirtualServers: []model.VirtualServer{{Name: "https-vs", FrontendPort: 443, BackendNodePort: 30443, Protocol: "HTTPS"}},
+		Certificates:   []model.Certificate{{Name: "tls", SecretName: "tls-secret"}},
+	}})
+	if err != nil {
+		t.Fatalf("EnsureStack: %v", err)
+	}
+	if len(certClient.uploaded) != 1 {
+		t.Fatalf("expected one certificate upload, got %d", len(certClient.uploaded))
+	}
+	if len(certClient.bindings) != 1 || certClient.bindings[0].certificateID != "cert-1" || certClient.bindings[0].virtualServerID != "vs-1" {
+		t.Fatalf("expected certificate to be bound to the HTTPS virtual server, got %#v", certClient.bindings)
 	}
 }
 

@@ -84,6 +84,15 @@ type Certificate struct {
 	Name       string
 	SecretName string
 	Hosts      []string
+	// Fingerprint is the content hash of certificate+key material used to
+	// detect rotations even when the logical certificate name is unchanged.
+	Fingerprint string
+	// Certificate, PrivateKey, and CA hold validated TLS material loaded from
+	// Kubernetes Secrets. They are reconcile inputs only and must not be
+	// persisted in observed-state annotations.
+	Certificate string
+	PrivateKey  string
+	CA          string
 	Ownership  Ownership
 }
 
