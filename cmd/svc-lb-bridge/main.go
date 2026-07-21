@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -139,7 +140,7 @@ func run(ctx context.Context) error {
 	}
 
 	// Register the Ingress controller (like CIS, watches Ingress with class "f5").
-	ingR := newIngressReconciler(mgr.GetClient(), mgr.GetScheme(), r.cmp, r.vpcID)
+	ingR := newIngressReconciler(mgr.GetClient(), mgr.GetScheme(), r.cmp, r.defaultVPCID)
 	ingR.Recorder = mgr.GetEventRecorderFor("ingress-lb")
 	if err := ctrl.NewControllerManagedBy(mgr).
 		For(&networkingv1.Ingress{}).
@@ -172,7 +173,10 @@ type serviceReconciler struct {
 	cmp               cmpLBaaS
 	cmpEndpoint       string
 	loadBalancerClass string
-	vpcID             string
+	defaultVPCID      string
+	defaultVPCName    string
+	defaultNetworkID  string
+	defaultFlavorID   int32
 }
 
 func newReconciler(c client.Client, scheme *runtime.Scheme) (*serviceReconciler, error) {
@@ -193,6 +197,34 @@ func newReconciler(c client.Client, scheme *runtime.Scheme) (*serviceReconciler,
 		return nil, fmt.Errorf("CMP_PROJECT_ID must be set")
 	}
 
+	vpcID := strings.TrimSpace(os.Getenv("CMP_VPC_ID"))
+	if vpcID == "" {
+		return nil, fmt.Errorf("CMP_VPC_ID must be set")
+	}
+
+	vpcName := strings.TrimSpace(os.Getenv("CMP_VPC_NAME"))
+	if vpcName == "" {
+		return nil, fmt.Errorf("CMP_VPC_NAME must be set")
+	}
+
+	networkID := strings.TrimSpace(os.Getenv("CMP_NETWORK_ID"))
+	if networkID == "" {
+		return nil, fmt.Errorf("CMP_NETWORK_ID must be set")
+	}
+
+	rawFlavorID := strings.TrimSpace(os.Getenv("CMP_LB_FLAVOR_ID"))
+	if rawFlavorID == "" {
+		return nil, fmt.Errorf("CMP_LB_FLAVOR_ID must be set")
+	}
+
+	parsedFlavorID, err := strconv.ParseInt(rawFlavorID, 10, 32)
+	if err != nil {
+		return nil, fmt.Errorf("CMP_LB_FLAVOR_ID must be a valid positive integer: %w", err)
+	}
+	if parsedFlavorID <= 0 {
+		return nil, fmt.Errorf("CMP_LB_FLAVOR_ID must be greater than zero")
+	}
+
 	log := ctrl.Log.WithName("svc-lb-bridge")
 	cmpClient, err := f5client.NewClientWithCeAuth(log, endpoint, orgName, projectID, ceAuth)
 	if err != nil {
@@ -200,12 +232,19 @@ func newReconciler(c client.Client, scheme *runtime.Scheme) (*serviceReconciler,
 	}
 
 	return &serviceReconciler{
-		Client:            c,
-		Scheme:            scheme,
-		cmp:               cmpClient,
-		cmpEndpoint:       endpoint,
-		loadBalancerClass: envOrDefault("F5_SVC_LB_LOADBALANCER_CLASS", defaultLBClass),
-		vpcID:             strings.TrimSpace(os.Getenv("CMP_VPC_ID")),
+		Client:      c,
+		Scheme:      scheme,
+		cmp:         cmpClient,
+		cmpEndpoint: endpoint,
+		loadBalancerClass: envOrDefault(
+			"F5_SVC_LB_LOADBALANCER_CLASS",
+			defaultLBClass,
+		),
+
+		defaultVPCID:     vpcID,
+		defaultVPCName:   vpcName,
+		defaultNetworkID: networkID,
+		defaultFlavorID:  int32(parsedFlavorID),
 	}, nil
 }
 
@@ -308,6 +347,20 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, nil
 	}
 
+	stack.LBService.VPCID = r.defaultVPCID
+	stack.LBService.VPCName = r.defaultVPCName
+	// Network and flavor use Shoot-level defaults unless the Service provides
+	// an explicit annotation override.
+	stack.LBService.NetworkID = r.defaultNetworkID
+	if strings.TrimSpace(lbCfg.NetworkID) != "" {
+		stack.LBService.NetworkID = strings.TrimSpace(lbCfg.NetworkID)
+	}
+
+	stack.LBService.FlavorID = r.defaultFlavorID
+	if lbCfg.FlavorID > 0 {
+		stack.LBService.FlavorID = lbCfg.FlavorID
+	}
+
 	// Ensure finalizer so we can cleanup CMP resources.
 	if !controllerutil.ContainsFinalizer(svc, finalizerName) {
 		if _, err := lbfinalizers.Ensure(ctx, r.Client, svc, finalizerName); err != nil {
@@ -334,7 +387,7 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 	}
 	cmpStart := time.Now()
-	stackResult, err := lbaasdeploy.NewFromRaw(r.cmp, r.vpcID).EnsureStack(ctx, lbaasdeploy.StackEnsureRequest{Stack: stack, Current: shared})
+	stackResult, err := lbaasdeploy.NewFromRaw(r.cmp, r.defaultVPCID).EnsureStack(ctx, lbaasdeploy.StackEnsureRequest{Stack: stack, Current: shared})
 	if err != nil {
 		f5metrics.CMPAPICallDuration.WithLabelValues("svc-lb-bridge", "EnsureLB").Observe(time.Since(cmpStart).Seconds())
 		f5metrics.CMPAPICallsTotal.WithLabelValues("svc-lb-bridge", "EnsureLB", "error").Inc()
@@ -430,7 +483,7 @@ func (r *serviceReconciler) ensureCMPResourcesWithCurrent(ctx context.Context, s
 		SourceRanges:     append([]string(nil), cfg.SourceRanges...),
 		Monitor:          &model.Monitor{Type: cfg.HealthType, Path: cfg.HealthPath, Interval: cfg.HealthInterval},
 	}
-	result, err := lbaasdeploy.NewFromRaw(r.cmp, r.vpcID).Ensure(ctx, lbaasdeploy.EnsureRequest{
+	result, err := lbaasdeploy.NewFromRaw(r.cmp, r.defaultVPCID).Ensure(ctx, lbaasdeploy.EnsureRequest{
 		LBName:                  desiredLBServiceName(svc),
 		LBDescription:           fmt.Sprintf("App LB for %s/%s", svc.Namespace, svc.Name),
 		VirtualServer:           vs,
@@ -505,10 +558,19 @@ func writeObservedGraph(annotations map[string]string, graph model.ObservedGraph
 }
 
 func desiredLBServiceName(svc *corev1.Service) string {
+	var name string
+
 	if g := strings.TrimSpace(svc.Annotations[annVIPGroup]); g != "" {
-		return sanitizeKey(fmt.Sprintf("app-group-%s-%s", svc.Namespace, g))
+		name = sanitizeKey(fmt.Sprintf("app-group-%s-%s", svc.Namespace, g))
+	} else {
+		name = sanitizeKey(fmt.Sprintf("app-%s-%s", svc.Namespace, svc.Name))
 	}
-	return sanitizeKey(fmt.Sprintf("app-%s-%s", svc.Namespace, svc.Name))
+
+	if len(name) > 20 {
+		name = name[:20]
+	}
+
+	return name
 }
 
 func desiredVirtualServerName(svc *corev1.Service, frontendPort int32) string {
@@ -545,7 +607,7 @@ func (r *serviceReconciler) cleanupCMPResources(ctx context.Context, svc *corev1
 	// its recorded scalar resources; it never falls back to names or all VIPs.
 	observed.EnsureGraph()
 	shared := r.isLBServiceShared(ctx, svc, observed.LBServiceID)
-	_, err := lbaasdeploy.NewFromRaw(r.cmp, r.vpcID).CleanupStack(ctx, lbaasdeploy.CleanupRequest{
+	_, err := lbaasdeploy.NewFromRaw(r.cmp, r.defaultVPCID).CleanupStack(ctx, lbaasdeploy.CleanupRequest{
 		Current: observed, DeleteVIP: !shared, DeleteLBService: !shared,
 	})
 	return err

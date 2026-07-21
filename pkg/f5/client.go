@@ -54,6 +54,15 @@ func (e *HTTPStatusError) Error() string {
 	)
 }
 
+func IsAlreadyExists(err error) bool {
+	var httpErr *HTTPStatusError
+	if !errors.As(err, &httpErr) {
+		return false
+	}
+
+	return httpErr.StatusCode == http.StatusConflict
+}
+
 func IsNotFound(err error) bool {
 	var se *HTTPStatusError
 	return err != nil && AsStatusError(err, &se) && se.StatusCode == http.StatusNotFound

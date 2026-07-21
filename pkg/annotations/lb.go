@@ -17,6 +17,8 @@ const (
 	SourceRanges     = "f5.extensions.gardener.cloud/source-ranges"
 	DrainingTimeout  = "f5.extensions.gardener.cloud/connection-draining-timeout"
 	VIPGroup         = "f5.extensions.gardener.cloud/vip-group"
+	NetworkID        = "f5.extensions.gardener.cloud/network-id"
+	FlavorID         = "f5.extensions.gardener.cloud/flavor-id"
 )
 
 // LBConfig is the normalized, user-facing load-balancer configuration parsed
@@ -31,6 +33,10 @@ type LBConfig struct {
 	SourceRanges     []string
 	PersistenceType  string
 	DrainingTimeout  int32
+
+	// CMP placement
+	NetworkID string
+	FlavorID  int32
 }
 
 func DefaultLBConfig() LBConfig {
@@ -108,6 +114,16 @@ func parseAnnotations(cfg *LBConfig, ann map[string]string) {
 					cfg.SourceRanges = append(cfg.SourceRanges, c)
 				}
 			}
+		}
+	}
+
+	if v := strings.TrimSpace(ann[NetworkID]); v != "" {
+		cfg.NetworkID = v
+	}
+
+	if v := strings.TrimSpace(ann[FlavorID]); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.FlavorID = int32(n)
 		}
 	}
 }

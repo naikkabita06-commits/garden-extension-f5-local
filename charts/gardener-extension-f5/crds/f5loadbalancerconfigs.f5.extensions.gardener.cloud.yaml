@@ -37,6 +37,19 @@ spec:
                   type: string
                 tenantOrPartition:
                   type: string
+                vpcId:
+                  type: string
+                  minLength: 1
+                vpcName:
+                  type: string
+                  minLength: 1
+                networkId:
+                  type: string
+                  minLength: 1
+                flavorId:
+                  type: integer
+                  format: int32
+                  minimum: 1
                 credentialsSecretRef:
                   type: object
                   required:

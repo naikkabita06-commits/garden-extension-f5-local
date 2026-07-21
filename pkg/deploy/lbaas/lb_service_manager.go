@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"strings"
+
+	f5client "github.com/gardener/gardener-extension-f5/pkg/f5"
 )
 
 type LBServiceManager struct {
@@ -77,11 +79,26 @@ func (m *LBServiceManager) create(ctx context.Context, req EnsureRequest) (strin
 		VPCID:       vpcID,
 		VPCName:     req.VPCName,
 	})
-	if err != nil {
-		return "", fmt.Errorf("creating LB service via CMP: %w", err)
+	if err == nil {
+		return strings.TrimSpace(created.ID), nil
 	}
-	if strings.TrimSpace(created.ID) == "" {
-		return "", fmt.Errorf("LB Service created but no ID returned")
+
+	// Recovery path only for "already exists".
+	if f5client.IsAlreadyExists(err) {
+		id, lookupErr := m.findByName(ctx, req.LBName)
+		if lookupErr != nil {
+			return "", fmt.Errorf(
+				"LBService %q already exists but could not uniquely identify it: %w",
+				req.LBName,
+				lookupErr,
+			)
+		}
+
+		if id != "" {
+			return id, nil
+		}
 	}
-	return strings.TrimSpace(created.ID), nil
+
+	return "", fmt.Errorf("creating LB service via CMP: %w", err)
+
 }

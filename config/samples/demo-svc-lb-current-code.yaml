@@ -1,0 +1,189 @@
+# Service type=LoadBalancer demo for the CURRENT svc-lb-bridge implementation.
+#
+# IMPORTANT:
+# - This manifest contains four applications.
+# - Apply the Service objects in the order documented in the runbook.
+# - Current code supports:
+#     A/B: separate LBService + separate VIP + separate VS
+#     C/D: same LBService + same VIP + separate VS
+# - Current code does NOT support same LBService + different VIPs for different Services.
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo-svc-lb
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-a
+  namespace: demo-svc-lb
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: app-a
+  template:
+    metadata:
+      labels:
+        app: app-a
+    spec:
+      containers:
+        - name: whoami
+          image: traefik/whoami:v1.10.2
+          args: ["--port=5678"]
+          ports:
+            - name: http
+              containerPort: 5678
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-b
+  namespace: demo-svc-lb
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: app-b
+  template:
+    metadata:
+      labels:
+        app: app-b
+    spec:
+      containers:
+        - name: whoami
+          image: traefik/whoami:v1.10.2
+          args: ["--port=5678"]
+          ports:
+            - name: http
+              containerPort: 5678
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-c
+  namespace: demo-svc-lb
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: app-c
+  template:
+    metadata:
+      labels:
+        app: app-c
+    spec:
+      containers:
+        - name: whoami
+          image: traefik/whoami:v1.10.2
+          args: ["--port=5678"]
+          ports:
+            - name: http
+              containerPort: 5678
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-d
+  namespace: demo-svc-lb
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: app-d
+  template:
+    metadata:
+      labels:
+        app: app-d
+    spec:
+      containers:
+        - name: whoami
+          image: traefik/whoami:v1.10.2
+          args: ["--port=5678"]
+          ports:
+            - name: http
+              containerPort: 5678
+---
+# Scenario 1, service A: dedicated LBService, VIP and VS.
+apiVersion: v1
+kind: Service
+metadata:
+  name: app-a-svc
+  namespace: demo-svc-lb
+  labels:
+    demo-step: standalone
+spec:
+  type: LoadBalancer
+  loadBalancerClass: f5.extensions.gardener.cloud/bigip
+  selector:
+    app: app-a
+  ports:
+    - name: http
+      protocol: TCP
+      port: 8080
+      targetPort: 5678
+---
+# Scenario 1, service B: another dedicated LBService, VIP and VS.
+# Comparing A and B demonstrates different LB, different VIP and different VS.
+apiVersion: v1
+kind: Service
+metadata:
+  name: app-b-svc
+  namespace: demo-svc-lb
+  labels:
+    demo-step: standalone
+spec:
+  type: LoadBalancer
+  loadBalancerClass: f5.extensions.gardener.cloud/bigip
+  selector:
+    app: app-b
+  ports:
+    - name: http
+      protocol: TCP
+      port: 8081
+      targetPort: 5678
+---
+# Scenario 3 parent: first member of demo-blue.
+# It creates the group's LBService, VIP and its own VS.
+apiVersion: v1
+kind: Service
+metadata:
+  name: app-c-svc
+  namespace: demo-svc-lb
+  labels:
+    demo-step: shared-parent
+  annotations:
+    f5.extensions.gardener.cloud/vip-group: demo-blue
+spec:
+  type: LoadBalancer
+  loadBalancerClass: f5.extensions.gardener.cloud/bigip
+  selector:
+    app: app-c
+  ports:
+    - name: http
+      protocol: TCP
+      port: 9090
+      targetPort: 5678
+---
+# Scenario 3 child: same vip-group as app-c.
+# It reuses the group's LBService and VIP, but creates a different VS.
+apiVersion: v1
+kind: Service
+metadata:
+  name: app-d-svc
+  namespace: demo-svc-lb
+  labels:
+    demo-step: shared-child
+  annotations:
+    f5.extensions.gardener.cloud/vip-group: demo-blue
+spec:
+  type: LoadBalancer
+  loadBalancerClass: f5.extensions.gardener.cloud/bigip
+  selector:
+    app: app-d
+  ports:
+    - name: http
+      protocol: TCP
+      port: 7070
+      targetPort: 5678

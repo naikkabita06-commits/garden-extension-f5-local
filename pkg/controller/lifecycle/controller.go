@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"reflect"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,13 +21,14 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
-	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -1048,6 +1050,21 @@ func (a *actuator) reconcileCISInShoot(ctx context.Context, log logr.Logger, ex 
 	if cfg.Spec.CredentialsSecretRef == nil || cfg.Spec.CredentialsSecretRef.Name == "" || cfg.Spec.CredentialsSecretRef.Namespace == "" {
 		return permanent(fmt.Errorf("spec.credentialsSecretRef.name and spec.credentialsSecretRef.namespace must be set when enableApplicationLB=true"))
 	}
+	if strings.TrimSpace(cfg.Spec.VPCID) == "" {
+		return permanent(fmt.Errorf("spec.vpcId must not be empty when enableApplicationLB=true"))
+	}
+
+	if strings.TrimSpace(cfg.Spec.VPCName) == "" {
+		return permanent(fmt.Errorf("spec.vpcName must not be empty when enableApplicationLB=true"))
+	}
+
+	if strings.TrimSpace(cfg.Spec.NetworkID) == "" {
+		return permanent(fmt.Errorf("spec.networkId must not be empty when enableApplicationLB=true"))
+	}
+
+	if cfg.Spec.FlavorID <= 0 {
+		return permanent(fmt.Errorf("spec.flavorId must be greater than zero when enableApplicationLB=true"))
+	}
 
 	shootClient, err := a.getShootClient(ctx, ex.Namespace)
 	if err != nil {
@@ -1095,7 +1112,9 @@ func (a *actuator) reconcileCISInShoot(ctx context.Context, log logr.Logger, ex 
 	cr := &rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: cisName}}
 	if _, err := controllerutil.CreateOrUpdate(ctx, shootClient, cr, func() error {
 		cr.Rules = []rbacv1.PolicyRule{
-			{APIGroups: []string{""}, Resources: []string{"services", "nodes", "endpoints"}, Verbs: []string{"get", "list", "watch"}},
+			{APIGroups: []string{""}, Resources: []string{"services"}, Verbs: []string{"get", "list", "watch", "patch", "update"}},
+			{APIGroups: []string{""}, Resources: []string{"nodes", "endpoints"}, Verbs: []string{"get", "list", "watch"}},
+			{APIGroups: []string{""}, Resources: []string{"secrets"}, Verbs: []string{"get", "list", "watch"}},
 			{APIGroups: []string{""}, Resources: []string{"services/status"}, Verbs: []string{"update", "patch"}},
 			{APIGroups: []string{""}, Resources: []string{"events"}, Verbs: []string{"create", "patch"}},
 			{APIGroups: []string{"discovery.k8s.io"}, Resources: []string{"endpointslices"}, Verbs: []string{"get", "list", "watch"}},
@@ -1138,6 +1157,9 @@ func (a *actuator) reconcileCISInShoot(ctx context.Context, log logr.Logger, ex 
 					{Name: "CMP_ORGANISATION_NAME", Value: orgName},
 					{Name: "CMP_PROJECT_ID", Value: projectID},
 					{Name: "CMP_VPC_ID", Value: strings.TrimSpace(cfg.Spec.VPCID)},
+					{Name: "CMP_VPC_NAME", Value: strings.TrimSpace(cfg.Spec.VPCName)},
+					{Name: "CMP_NETWORK_ID", Value: strings.TrimSpace(cfg.Spec.NetworkID)},
+					{Name: "CMP_LB_FLAVOR_ID", Value: strconv.FormatInt(int64(cfg.Spec.FlavorID), 10)},
 					{Name: "F5_SVC_LB_LOADBALANCER_CLASS", Value: "f5.extensions.gardener.cloud/bigip"},
 				},
 			},
@@ -1383,19 +1405,24 @@ func (a *actuator) discoverKubeAPIServerBackends(
 		return nil, fmt.Errorf("getting kube-apiserver Service %s/%s: %w", svcNamespace, svcName, err)
 	}
 
-	eps := &corev1.Endpoints{}
-	if err := a.client.Get(ctx, types.NamespacedName{Namespace: svcNamespace, Name: svcName}, eps); err != nil {
-		return nil, fmt.Errorf("getting kube-apiserver Endpoints %s/%s: %w", svcNamespace, svcName, err)
+	sliceList := &discoveryv1.EndpointSliceList{}
+	if err := a.client.List(ctx, sliceList, client.InNamespace(svcNamespace), client.MatchingLabels{"kubernetes.io/service-name": svcName}); err != nil {
+		return nil, fmt.Errorf("listing kube-apiserver EndpointSlices %s/%s: %w", svcNamespace, svcName, err)
 	}
 
 	var backends []f5client.Backend
-	for _, subset := range eps.Subsets {
-		for _, addr := range subset.Addresses {
-			for _, port := range subset.Ports {
-				backends = append(backends, f5client.Backend{
-					IP:   addr.IP,
-					Port: port.Port,
-				})
+	for _, slice := range sliceList.Items {
+		for _, endpoint := range slice.Endpoints {
+			if endpoint.Addresses == nil || len(endpoint.Addresses) == 0 {
+				continue
+			}
+			for _, port := range slice.Ports {
+				for _, addr := range endpoint.Addresses {
+					backends = append(backends, f5client.Backend{
+						IP:   addr,
+						Port: *port.Port,
+					})
+				}
 			}
 		}
 	}

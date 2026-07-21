@@ -32,7 +32,9 @@ type rawAdapter struct{ raw RawClient }
 
 func NewRawClient(raw RawClient) Client { return rawAdapter{raw: raw} }
 
-func NewCertificateClientFromRaw(raw RawClient) CertificateClient { return rawCertificateAdapter{raw: raw} }
+func NewCertificateClientFromRaw(raw RawClient) CertificateClient {
+	return rawCertificateAdapter{raw: raw}
+}
 
 // NewFromRaw enables every provider capability implemented by the underlying
 // client. This keeps callers on the stack deployer path from silently losing
@@ -86,6 +88,12 @@ func (a rawAdapter) CreateLBService(ctx context.Context, spec LBServiceSpec) (LB
 	if spec.VPCName != "" {
 		form.Set("vpc_name", spec.VPCName)
 	}
+	fmt.Printf(
+		"CMP CreateLBService name=%q len=%d form=%v\n",
+		spec.Name,
+		len(spec.Name),
+		form,
+	)
 	raw, err := a.raw.CreateLBService(ctx, form)
 	if err != nil {
 		return LBService{}, err
@@ -262,16 +270,16 @@ func (a rawCertificateAdapter) UnbindCertificate(ctx context.Context, lbServiceI
 
 func parseCertificate(raw json.RawMessage) CertificateResource {
 	var cert struct {
-		ID           string   `json:"id"`
-		Name         string   `json:"name"`
-		Fingerprint  string   `json:"fingerprint"`
-		SecretName   string   `json:"secret_name"`
-		Certificate  string   `json:"ssl_cert"`
-		PrivateKey   string   `json:"ssl_pvt_key"`
-		CA           string   `json:"ca_cert"`
-		HostNames    []string `json:"host_names"`
-		AltName      string   `json:"certificate_name"`
-		AltID        string   `json:"certificate_id"`
+		ID          string   `json:"id"`
+		Name        string   `json:"name"`
+		Fingerprint string   `json:"fingerprint"`
+		SecretName  string   `json:"secret_name"`
+		Certificate string   `json:"ssl_cert"`
+		PrivateKey  string   `json:"ssl_pvt_key"`
+		CA          string   `json:"ca_cert"`
+		HostNames   []string `json:"host_names"`
+		AltName     string   `json:"certificate_name"`
+		AltID       string   `json:"certificate_id"`
 	}
 	if json.Unmarshal(raw, &cert) != nil {
 		return CertificateResource{}

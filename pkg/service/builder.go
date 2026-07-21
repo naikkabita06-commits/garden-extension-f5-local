@@ -1,6 +1,8 @@
 package service
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	fmt "fmt"
 	"strings"
 
@@ -29,6 +31,9 @@ func BuildLoadBalancerStackWithPortBackends(svc *corev1.Service, cfg lbannotatio
 	}
 
 	owner := model.Owner{Kind: "Service", Namespace: svc.Namespace, Name: svc.Name, UID: string(svc.UID)}
+	// Provider placement fields such as FlavorID, NetworkID, VPCID, and VPCName
+	// are applied by the controller after model construction. They are Shoot-level
+	// defaults and are intentionally not derived from the Kubernetes Service here.
 	stack := &model.LoadBalancerStack{
 		Owner:     owner,
 		Ownership: model.OwnershipFor(owner, "", "stack", ""),
@@ -90,24 +95,22 @@ func VIPGroup(svc *corev1.Service) string {
 	return strings.TrimSpace(svc.Annotations[lbannotations.VIPGroup])
 }
 
-// LBServiceName deterministically identifies the parent LBService. Services in
-// the same VIP group deliberately share this parent, while all child resources
-// remain owner-specific.
-func LBServiceName(svc *corev1.Service) string {
-	if svc == nil {
-		return ""
-	}
-	if group := VIPGroup(svc); group != "" {
-		return safeName(fmt.Sprintf("app-group-%s-%s", svc.Namespace, group))
-	}
-	return safeName(fmt.Sprintf("app-%s-%s", svc.Namespace, svc.Name))
-}
-
 func VIPName(svc *corev1.Service) string {
 	if svc == nil {
 		return ""
 	}
-	return safeName(fmt.Sprintf("app-vip-%s-%s", svc.Namespace, svc.Name))
+
+	if group := VIPGroup(svc); group != "" {
+		return limitedSafeName(
+			fmt.Sprintf("app-vip-group-%s-%s", svc.Namespace, group),
+			maxLBServiceNameLength,
+		)
+	}
+
+	return limitedSafeName(
+		fmt.Sprintf("app-vip-%s-%s", svc.Namespace, svc.Name),
+		maxLBServiceNameLength,
+	)
 }
 
 func VirtualServerName(svc *corev1.Service, frontendPort int32) string {
@@ -124,13 +127,66 @@ func PoolName(svc *corev1.Service, frontendPort int32) string {
 	return safeName(fmt.Sprintf("app-pool-%s-%s-%d", svc.Namespace, svc.Name, frontendPort))
 }
 
+const maxLBServiceNameLength = 20
+
+// LBServiceName deterministically identifies the parent LBService. Services in
+// the same VIP group deliberately share this parent, while all child resources
+// remain owner-specific.
+func LBServiceName(svc *corev1.Service) string {
+	if svc == nil {
+		return ""
+	}
+
+	var name string
+
+	if group := VIPGroup(svc); group != "" {
+		// Services in the same VIP group must intentionally produce
+		// the same LBService name.
+		name = fmt.Sprintf(
+			"app-group-%s-%s",
+			svc.Namespace,
+			group,
+		)
+	} else {
+		// Dedicated LBService per Kubernetes Service.
+		name = fmt.Sprintf(
+			"app-%s-%s",
+			svc.Namespace,
+			svc.Name,
+		)
+	}
+
+	return limitedSafeName(name, maxLBServiceNameLength)
+}
+
+func limitedSafeName(name string, maxLength int) string {
+	name = safeName(name)
+
+	if len(name) <= maxLength {
+		return name
+	}
+
+	sum := sha256.Sum256([]byte(name))
+	hash := hex.EncodeToString(sum[:])[:6]
+
+	// Reserve one character for "-".
+	prefixLength := maxLength - len(hash) - 1
+	prefix := strings.Trim(name[:prefixLength], "-")
+
+	return prefix + "-" + hash
+}
+
 func safeName(name string) string {
 	name = strings.ToLower(strings.TrimSpace(name))
+
 	name = strings.Map(func(r rune) rune {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+		if (r >= 'a' && r <= 'z') ||
+			(r >= '0' && r <= '9') ||
+			r == '-' {
 			return r
 		}
 		return '-'
 	}, name)
+
 	return strings.Trim(name, "-")
 }
