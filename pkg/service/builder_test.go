@@ -27,10 +27,10 @@ func TestBuildLoadBalancerStackBuildsPortsAndBackends(t *testing.T) {
 		t.Fatalf("expected one port, got %d", len(stack.Ports))
 	}
 	port := stack.Ports[0]
-	if port.FrontendPort != 80 || port.NodePort != 30080 || port.Protocol != "HTTP" {
+	if port.FrontendPort != 80 || port.NodePort != 30080 || port.Protocol != "TCP" {
 		t.Fatalf("unexpected port model: %#v", port)
 	}
-	if len(port.Backends) != 1 || port.Backends[0].IP != "10.0.0.1" || port.Backends[0].Port != 30080 || port.Backends[0].Weight != 50 {
+	if len(port.Backends) != 1 || port.Backends[0].IP != "10.0.0.1" || port.Backends[0].Port != 30080 || port.Backends[0].Weight != 1 {
 		t.Fatalf("unexpected backends: %#v", port.Backends)
 	}
 	if stack.LBService.Name != "app-ns-web" || stack.VIP.Name != "app-vip-ns-web" {
@@ -54,11 +54,11 @@ func TestBuildLoadBalancerStackUsesVIPGroupOnlyForSharedParent(t *testing.T) {
 	}
 	expectedLBName := LBServiceName(svc)
 	if stack.LBService.Name != expectedLBName ||
-	stack.LBService.Ownership.SharedGroup != "Blue Team" {
-	t.Fatalf(
-		"expected grouped parent LB name %q, got %#v",
-		expectedLBName,
-		stack.LBService,)
+		stack.LBService.Ownership.SharedGroup != "Blue Team" {
+		t.Fatalf(
+			"expected grouped parent LB name %q, got %#v",
+			expectedLBName,
+			stack.LBService)
 	}
 	if stack.VirtualServers[0].Name != "app-vs-ns-web-443" || stack.VirtualServers[0].Ownership.SharedGroup != "" {
 		t.Fatalf("expected owner-specific listener, got %#v", stack.VirtualServers[0])

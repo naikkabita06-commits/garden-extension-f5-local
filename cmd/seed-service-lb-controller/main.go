@@ -278,17 +278,13 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	// Build a typed desired-state snapshot before mutating CMP resources.
 	lbCfg := parseLBServiceConfig(svc)
-	nodeIPs, err := lbbackend.ListNodeInternalIPs(ctx, r.Client)
+	nodes, err := lbbackend.ListNodeBackends(ctx, r.Client)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if len(nodeIPs) == 0 {
+	if len(nodes) == 0 {
 		log.Info("skipping: no nodes found")
 		return ctrl.Result{}, nil
-	}
-	nodes := make([]lbbackend.Node, 0, len(nodeIPs))
-	for _, ip := range nodeIPs {
-		nodes = append(nodes, lbbackend.Node{IP: ip, Weight: 50})
 	}
 	stack, err := lbservice.BuildLoadBalancerStack(svc, lbCfg, nodes)
 	if err != nil {
@@ -310,7 +306,7 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// Provision via CMP LBaaS: LBService → VIP → VirtualServer
 	protocol := stack.Ports[0].Protocol
 	cmpStart := time.Now()
-	ids, vip, graph, err := r.ensureCMPResources(ctx, svc, frontendPort, nodePort, nodeIPs, protocol, stack.Config)
+	ids, vip, graph, err := r.ensureCMPResources(ctx, svc, frontendPort, nodePort, nodes, protocol, stack.Config)
 	f5metrics.CMPAPICallDuration.WithLabelValues("seed-service-lb-controller", "EnsureLB").Observe(time.Since(cmpStart).Seconds())
 	if err != nil {
 		f5metrics.CMPAPICallsTotal.WithLabelValues("seed-service-lb-controller", "EnsureLB", "error").Inc()
@@ -350,7 +346,7 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		vip = "pending"
 	}
 	log.Info("CMP LBaaS resources provisioned", "lbServiceID", ids.LBServiceID, "vipPortID", ids.VIPPortID, "vsID", ids.VirtualServerID, "vip", vip)
-	r.Recorder.Eventf(svc, corev1.EventTypeNormal, "EnsuredLoadBalancer", "CMP LBaaS resources provisioned (LB=%s, VS=%s, VIP=%s, backends=%d)", ids.LBServiceID, ids.VirtualServerID, vip, len(nodeIPs))
+	r.Recorder.Eventf(svc, corev1.EventTypeNormal, "EnsuredLoadBalancer", "CMP LBaaS resources provisioned (LB=%s, VS=%s, VIP=%s, backends=%d)", ids.LBServiceID, ids.VirtualServerID, vip, len(nodes))
 
 	if vip != "" && vip != "pending" {
 		if err := lbstatus.EnsureServiceVIP(ctx, r.Client, svc, vip); err != nil {
@@ -361,7 +357,7 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	return ctrl.Result{}, nil
 }
 
-func (r *serviceReconciler) ensureCMPResources(ctx context.Context, svc *corev1.Service, frontendPort, nodePort int32, nodeIPs []string, protocol string, cfg lbServiceConfig) (*f5client.CMPResourceIDs, string, model.ObservedGraph, error) {
+func (r *serviceReconciler) ensureCMPResources(ctx context.Context, svc *corev1.Service, frontendPort, nodePort int32, nodes []lbbackend.Node, protocol string, cfg lbServiceConfig) (*f5client.CMPResourceIDs, string, model.ObservedGraph, error) {
 	current := model.ObservedState{}
 	if svc != nil && svc.Annotations != nil {
 		current.LBServiceID = strings.TrimSpace(svc.Annotations[annLBServiceID])
@@ -373,9 +369,9 @@ func (r *serviceReconciler) ensureCMPResources(ctx context.Context, svc *corev1.
 		}
 	}
 
-	members := make([]model.BackendMember, 0, len(nodeIPs))
-	for _, ip := range nodeIPs {
-		members = append(members, model.BackendMember{IP: ip, Port: nodePort, Weight: 50})
+	members := make([]model.BackendMember, 0, len(nodes))
+	for _, node := range nodes {
+		members = append(members, model.BackendMember{NodeName: node.NodeName, ProviderID: node.ProviderID, ComputeID: node.ComputeID, IP: node.IP, Port: nodePort, Weight: 1})
 	}
 
 	vs := model.VirtualServer{
@@ -392,7 +388,7 @@ func (r *serviceReconciler) ensureCMPResources(ctx context.Context, svc *corev1.
 	pool := model.Pool{Name: sanitizeKey(fmt.Sprintf("seed-pool-%s-%s-%d", svc.Namespace, svc.Name, frontendPort)), Members: members, Monitor: vs.Monitor}
 	vs.DefaultPoolName = pool.Name
 	desired := &model.LoadBalancerStack{LBService: model.LBService{Name: sanitizeKey(fmt.Sprintf("seed-%s-%s", svc.Namespace, svc.Name)), Description: fmt.Sprintf("Seed LB for %s/%s", svc.Namespace, svc.Name), FlavorID: r.flavorID, NetworkID: r.networkID, VPCID: r.vpcID, VPCName: r.vpcName}, VIP: model.VIP{Name: "seed-vip"}, VirtualServers: []model.VirtualServer{vs}, Pools: []model.Pool{pool}}
-	result, err := lbaasdeploy.NewFromRaw(r.cmp, r.vpcID).EnsureStack(ctx, lbaasdeploy.StackEnsureRequest{Stack: desired, Current: current})
+	result, err := lbaasdeploy.NewFromRaw(r.cmp, r.vpcID).EnsureStack(ctx, lbaasdeploy.StackEnsureRequest{Stack: desired, Current: current, AggregateVirtualServer: true, RecoverVirtualServersByName: true})
 	if err != nil {
 		return nil, current.VIPAddress, current.Graph, err
 	}
@@ -411,7 +407,7 @@ func (r *serviceReconciler) cleanupCMPResources(ctx context.Context, svc *corev1
 		_ = json.Unmarshal([]byte(raw), &observed.Graph)
 	}
 	observed.EnsureGraph()
-	_, err := lbaasdeploy.NewFromRaw(r.cmp, r.vpcID).CleanupStack(ctx, lbaasdeploy.CleanupRequest{Current: observed, DeleteVIP: true, DeleteLBService: true})
+	_, err := lbaasdeploy.NewFromRaw(r.cmp, r.vpcID).CleanupStack(ctx, lbaasdeploy.CleanupRequest{Current: observed, DeleteVIP: true, DeleteLBService: true, AggregateVirtualServers: true})
 	return err
 }
 

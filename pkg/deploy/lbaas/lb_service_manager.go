@@ -30,6 +30,9 @@ func (m *LBServiceManager) Ensure(
 
 		switch {
 		case err == nil:
+			if placementErr := validateLBServicePlacement(svc, req); placementErr != nil {
+				return "", false, placementErr
+			}
 			// The annotation/observed graph contains an ID and CMP confirms
 			// that this exact LBService still exists.
 			if readyErr := validateLBServiceReadiness(svc); readyErr != nil {
@@ -41,11 +44,7 @@ func (m *LBServiceManager) Ensure(
 					if delErr := m.client.DeleteLBService(ctx, currentID); delErr != nil && !f5client.IsNotFound(delErr) {
 						return "", false, fmt.Errorf("deleting failed LBService %q before recreate: %w", currentID, delErr)
 					}
-					createdID, createErr := m.create(ctx, req)
-					if createErr != nil {
-						return "", false, createErr
-					}
-					return m.ensureCreatedReady(ctx, createdID)
+					return "", false, &ProvisioningPendingError{ResourceType: "LBService", ResourceID: currentID, Status: "deleting", Detail: "failed managed LBService deleted; waiting for CMP deletion before replacement"}
 				}
 				return "", false, readyErr
 			}
@@ -72,16 +71,21 @@ func (m *LBServiceManager) Ensure(
 			)
 		}
 	}
+	if recoveredID, lookupErr := m.findByName(ctx, req.LBName); lookupErr != nil {
+		return "", false, fmt.Errorf("looking up deterministic LBService %q before create: %w", req.LBName, lookupErr)
+	} else if recoveredID != "" {
+		return m.ensureCreatedReady(ctx, recoveredID, req)
+	}
 
 	createdID, err := m.create(ctx, req)
 	if err != nil {
 		return "", false, err
 	}
 
-	return m.ensureCreatedReady(ctx, createdID)
+	return m.ensureCreatedReady(ctx, createdID, req)
 }
 
-func (m *LBServiceManager) ensureCreatedReady(ctx context.Context, createdID string) (string, bool, error) {
+func (m *LBServiceManager) ensureCreatedReady(ctx context.Context, createdID string, req EnsureRequest) (string, bool, error) {
 
 	created, err := m.client.GetLBService(ctx, createdID)
 	if err != nil {
@@ -98,6 +102,9 @@ func (m *LBServiceManager) ensureCreatedReady(ctx context.Context, createdID str
 		return "", false, fmt.Errorf("checking LBService %q readiness via CMP: %w", createdID, err)
 	}
 	if err := validateLBServiceReadiness(created); err != nil {
+		return "", false, err
+	}
+	if err := validateLBServicePlacement(created, req); err != nil {
 		return "", false, err
 	}
 
@@ -122,11 +129,6 @@ func validateLBServiceReadiness(svc LBService) error {
 		}
 	}
 
-	if status == "" && opStatus == "" {
-		// Some CMP responses omit status fields on read; treat that as usable.
-		return nil
-	}
-
 	if isReadyLBStatus(status) || isReadyLBStatus(opStatus) {
 		return nil
 	}
@@ -137,6 +139,37 @@ func validateLBServiceReadiness(svc LBService) error {
 		Status:       strings.TrimSpace(svc.Status),
 		Detail:       strings.TrimSpace(svc.OperatingStatus),
 	}
+}
+
+func validateLBServicePlacement(svc LBService, req EnsureRequest) error {
+	expectedVPC := strings.TrimSpace(req.VPCID)
+	expectedNetwork := strings.TrimSpace(req.NetworkID)
+	if expectedVPC != "" {
+		if strings.TrimSpace(svc.VPCID) == "" {
+			return fmt.Errorf("supplied LBService %q response has no VPC identity", svc.ID)
+		}
+		if strings.TrimSpace(svc.VPCID) != expectedVPC {
+			return fmt.Errorf("supplied LBService %q belongs to VPC %q, expected %q", svc.ID, svc.VPCID, expectedVPC)
+		}
+	}
+	if expectedNetwork != "" {
+		if strings.TrimSpace(svc.NetworkID) == "" {
+			return fmt.Errorf("supplied LBService %q response has no subnet identity", svc.ID)
+		}
+		if strings.TrimSpace(svc.NetworkID) != expectedNetwork {
+			return fmt.Errorf("supplied LBService %q belongs to subnet %q, expected %q", svc.ID, svc.NetworkID, expectedNetwork)
+		}
+	}
+	expectedRegion := strings.TrimSpace(req.Region)
+	if expectedRegion != "" {
+		if strings.TrimSpace(svc.Region) == "" {
+			return fmt.Errorf("supplied LBService %q response has no region", svc.ID)
+		}
+		if !strings.EqualFold(strings.TrimSpace(svc.Region), expectedRegion) {
+			return fmt.Errorf("supplied LBService %q belongs to region %q, expected %q", svc.ID, svc.Region, expectedRegion)
+		}
+	}
+	return nil
 }
 
 func isReadyLBStatus(status string) bool {

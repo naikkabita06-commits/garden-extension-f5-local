@@ -83,6 +83,25 @@ func ListNodeInternalIPs(ctx context.Context, c client.Client) ([]string, error)
 	return out, nil
 }
 
+// ListNodeBackends returns every node with its provider identity and backend
+// address. Seed-facing load balancers use this variant because they target all
+// seed nodes, while still requiring the exact CMP compute UUID needed by the
+// aggregate virtual-server API.
+func ListNodeBackends(ctx context.Context, c client.Client) ([]Node, error) {
+	nl := &corev1.NodeList{}
+	if err := c.List(ctx, nl); err != nil {
+		return nil, err
+	}
+	out := make([]Node, 0, len(nl.Items))
+	for i := range nl.Items {
+		node := &nl.Items[i]
+		if ip := backendIP(node); ip != "" {
+			out = append(out, Node{NodeName: node.Name, ProviderID: strings.TrimSpace(node.Spec.ProviderID), ComputeID: ComputeID(node), IP: ip, Weight: 1})
+		}
+	}
+	return deduplicateNodes(out), nil
+}
+
 // IsNodeReady returns true if the node has condition Ready=True.
 func IsNodeReady(node *corev1.Node) bool {
 	for _, c := range node.Status.Conditions {

@@ -14,6 +14,8 @@ const (
 	HealthInterval   = "f5.extensions.gardener.cloud/health-check-interval"
 	HealthType       = "f5.extensions.gardener.cloud/health-check-type"
 	HealthPath       = "f5.extensions.gardener.cloud/health-check-path"
+	HealthPort       = "f5.extensions.gardener.cloud/health-check-port"
+	HealthTimeout    = "f5.extensions.gardener.cloud/health-check-timeout"
 	SourceRanges     = "f5.extensions.gardener.cloud/source-ranges"
 	DrainingTimeout  = "f5.extensions.gardener.cloud/connection-draining-timeout"
 	VIPGroup         = "f5.extensions.gardener.cloud/vip-group"
@@ -33,6 +35,8 @@ type LBConfig struct {
 	HealthInterval   int32
 	HealthType       string
 	HealthPath       string
+	HealthPort       int32
+	HealthTimeout    int32
 	ProtocolOverride string
 	SourceRanges     []string
 	PersistenceType  string
@@ -45,7 +49,7 @@ type LBConfig struct {
 }
 
 func DefaultLBConfig() LBConfig {
-	return LBConfig{RoutingAlgorithm: "round_robin", HealthInterval: 30, HealthType: "tcp"}
+	return LBConfig{RoutingAlgorithm: "ROUND_ROBIN", HealthInterval: 30, HealthTimeout: 16, HealthType: "tcp"}
 }
 
 // ParseService reads supported F5 annotations and Kubernetes-native Service
@@ -56,7 +60,7 @@ func ParseService(svc *corev1.Service) LBConfig {
 		return cfg
 	}
 	if svc.Spec.SessionAffinity == corev1.ServiceAffinityClientIP {
-		cfg.PersistenceType = "source_addr"
+		cfg.PersistenceType = "source_ip"
 	}
 	parseAnnotations(&cfg, svc.Annotations)
 	if len(svc.Spec.LoadBalancerSourceRanges) > 0 {
@@ -105,6 +109,16 @@ func parseAnnotations(cfg *LBConfig, ann map[string]string) {
 		cfg.HealthPath = v
 		if cfg.HealthType == "tcp" {
 			cfg.HealthType = "http"
+		}
+	}
+	if v := strings.TrimSpace(ann[HealthPort]); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 65535 {
+			cfg.HealthPort = int32(n)
+		}
+	}
+	if v := strings.TrimSpace(ann[HealthTimeout]); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.HealthTimeout = int32(n)
 		}
 	}
 	if v := strings.TrimSpace(ann[DrainingTimeout]); v != "" {

@@ -70,12 +70,12 @@ func BuildLoadBalancerStackWithPortBackends(svc *corev1.Service, cfg lbannotatio
 			PersistenceType:  cfg.PersistenceType,
 			DrainingTimeout:  cfg.DrainingTimeout,
 			SourceRanges:     append([]string(nil), cfg.SourceRanges...),
-			Monitor:          &model.Monitor{Name: safeName("mon-" + PoolName(svc, p.Port)), Type: cfg.HealthType, Path: cfg.HealthPath, Interval: cfg.HealthInterval},
+			Monitor:          &model.Monitor{Name: safeName("mon-" + PoolName(svc, p.Port)), Type: cfg.HealthType, Path: cfg.HealthPath, Interval: cfg.HealthInterval, Port: cfg.HealthPort, Timeout: cfg.HealthTimeout},
 			Ownership:        model.OwnershipFor(owner, "", "virtual-server", ""),
 		}
 		pool := model.Pool{Name: PoolName(svc, p.Port), Monitor: vs.Monitor, Ownership: model.OwnershipFor(owner, "", "pool", VIPGroup(svc))}
 		for _, n := range backendsForPort(p) {
-			member := model.BackendMember{NodeName: n.NodeName, ProviderID: n.ProviderID, ComputeID: n.ComputeID, IP: n.IP, Port: p.NodePort, Weight: n.Weight}
+			member := model.BackendMember{NodeName: n.NodeName, ProviderID: n.ProviderID, ComputeID: n.ComputeID, IP: n.IP, Port: p.NodePort, Weight: 1}
 			sp.Backends = append(sp.Backends, member)
 			pool.Members = append(pool.Members, member)
 		}

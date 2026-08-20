@@ -220,3 +220,29 @@ go test  ./cmd/svc-lb-bridge/...               ✅
 go test  ./cmd/seed-service-lb-controller/...  ✅
 go test  ./pkg/...                             ✅
 ```
+# Service LoadBalancer CMP contract hardening
+
+- Use CMP's aggregate, form-encoded virtual-server create contract for
+  `Service` listeners. The request now carries the deterministic pool,
+  health-monitor settings, and complete backend-node objects; the Service path
+  no longer creates a second pool/member/monitor graph through unrelated child
+  endpoints.
+- Resolve every backend from `Node.spec.providerID` (or the explicit local-test
+  node annotation), fetch that exact CMP compute, and select the unique compute
+  port containing the node backend IP. The unreliable network
+  `search-by-ip` endpoint is no longer used by Service reconciliation.
+- Validate provided LB placement (VPC, subnet, region), provided VIP membership,
+  subnet, status, and IPv4 compatibility, and reject duplicate
+  VIP/protocol/frontend-port tuples before create or adoption.
+- Recover deterministic LB and virtual-server resources after ambiguous create
+  outcomes, validate exact virtual-server details before adoption, and wait for
+  asynchronous deletion before replacing or deleting parent resources.
+- Preserve the agreed VIP crash behavior: do not adopt arbitrary unattached
+  VIPs and do not checkpoint a newly allocated VIP as Service-owned until a
+  deterministic virtual server proves ownership.
+- Map Kubernetes TCP/UDP literally unless an explicit application-protocol
+  annotation is supplied, use CMP-compatible persistence/routing values, and
+  include monitor and backend changes in desired-state hashing.
+
+The separately tracked CMP VIP pagination compatibility change and repository
+credential-history remediation are intentionally outside this change.

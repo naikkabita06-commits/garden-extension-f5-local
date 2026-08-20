@@ -14,8 +14,8 @@ func TestMapK8sProtocolToCMP(t *testing.T) {
 		want  string
 	}{
 		{name: "udp", proto: corev1.ProtocolUDP, port: 53, want: "UDP"},
-		{name: "http", proto: corev1.ProtocolTCP, port: 80, want: "HTTP"},
-		{name: "https", proto: corev1.ProtocolTCP, port: 443, want: "HTTPS"},
+		{name: "tcp-port-80-is-not-inferred-http", proto: corev1.ProtocolTCP, port: 80, want: "TCP"},
+		{name: "tcp-port-443-is-not-inferred-https", proto: corev1.ProtocolTCP, port: 443, want: "TCP"},
 		{name: "tcp", proto: corev1.ProtocolTCP, port: 9000, want: "TCP"},
 	}
 	for _, tt := range tests {

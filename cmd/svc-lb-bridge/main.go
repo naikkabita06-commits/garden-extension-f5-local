@@ -57,6 +57,7 @@ const (
 	annVirtualServerID = "f5.extensions.gardener.cloud/virtual-server-id"
 	annLBServiceIDMode = "f5.extensions.gardener.cloud/lb-service-id-mode"
 	annVIPPortIDMode   = "f5.extensions.gardener.cloud/vip-port-id-mode"
+	annVIPGroup        = lbannotations.VIPGroup
 	idModeProvided     = "provided"
 	idModeManaged      = "managed"
 	annVIPAddress      = "f5.extensions.gardener.cloud/vip-address"
@@ -182,6 +183,7 @@ type serviceReconciler struct {
 	defaultVPCName    string
 	defaultNetworkID  string
 	defaultFlavorID   int32
+	defaultRegion     string
 	shootNamespace    string
 }
 
@@ -271,6 +273,7 @@ func newReconciler(c client.Client, scheme *runtime.Scheme) (*serviceReconciler,
 		defaultVPCName:   vpcName,
 		defaultNetworkID: networkID,
 		defaultFlavorID:  int32(parsedFlavorID),
+		defaultRegion:    region,
 		shootNamespace:   shootNamespace,
 	}, nil
 }
@@ -351,6 +354,10 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	// Build a typed desired-state snapshot before mutating CMP resources.
+	if strings.TrimSpace(svc.Annotations[annVIPPortID]) != "" && strings.TrimSpace(svc.Annotations[annLBServiceID]) == "" {
+		r.Recorder.Event(svc, corev1.EventTypeWarning, "InvalidProvidedResources", "vip-port-id requires lb-service-id")
+		return ctrl.Result{}, nil
+	}
 	lbCfg := parseLBServiceConfig(svc)
 	portBackends := make(map[int32][]backendNode, len(svc.Spec.Ports))
 	for _, port := range svc.Spec.Ports {
@@ -391,6 +398,7 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 	stack.LBService.VPCID = r.defaultVPCID
 	stack.LBService.VPCName = r.defaultVPCName
+	stack.LBService.Region = r.defaultRegion
 	// Network and flavor use Shoot-level defaults unless the Service provides
 	// an explicit annotation override.
 	stack.LBService.NetworkID = r.defaultNetworkID
@@ -436,6 +444,7 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		StrictLBServiceID:           strictLBServiceID,
 		StrictVIPPortID:             strictVIPPortID,
 		RecoverVirtualServersByName: true,
+		AggregateVirtualServer:      true,
 		LBReadyHook: func(observed model.ObservedState) error {
 			return r.persistLBCheckpoint(ctx, svc, observed, strictLBServiceID)
 		},
@@ -612,8 +621,6 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		last := portObserved[servicePortKey(stack.Ports[len(stack.Ports)-1])]
 		lastIDs.VirtualServerID, lastIDs.VirtualServerName = last.VirtualServerID, last.VirtualServerName
 	}
-	f5metrics.CMPAPICallDuration.WithLabelValues("svc-lb-bridge", "EnsureLB").Observe(time.Since(cmpStart).Seconds())
-	f5metrics.CMPAPICallDuration.WithLabelValues("svc-lb-bridge", "EnsureLB").Observe(time.Since(cmpStart).Seconds())
 	f5metrics.CMPAPICallDuration.WithLabelValues("svc-lb-bridge", "EnsureLB").Observe(time.Since(cmpStart).Seconds())
 	f5metrics.CMPAPICallsTotal.WithLabelValues("svc-lb-bridge", "EnsureLB", "success").Inc()
 	if vip != "" {
@@ -794,13 +801,15 @@ func (r *serviceReconciler) cleanupCMPResources(ctx context.Context, svc *corev1
 	// A missing graph is a legacy object. EnsureGraph permits deletion of only
 	// its recorded scalar resources; it never falls back to names or all VIPs.
 	observed.EnsureGraph()
-	shared := r.isLBServiceShared(ctx, svc, observed.LBServiceID)
+	lbShared := r.isLBServiceShared(ctx, svc, observed.LBServiceID)
+	vipShared := r.isVIPShared(ctx, svc, observed.LBServiceID, observed.VIPPortID)
 	lbProvided := strings.EqualFold(strings.TrimSpace(svc.Annotations[annLBServiceIDMode]), idModeProvided)
 	vipProvided := strings.EqualFold(strings.TrimSpace(svc.Annotations[annVIPPortIDMode]), idModeProvided)
 	_, err := lbaasdeploy.NewFromRaw(r.cmp, r.defaultVPCID).CleanupStack(ctx, lbaasdeploy.CleanupRequest{
-		Current:         observed,
-		DeleteVIP:       !shared && !vipProvided,
-		DeleteLBService: !shared && !lbProvided,
+		Current:                 observed,
+		DeleteVIP:               !vipShared && !vipProvided,
+		DeleteLBService:         !lbShared && !lbProvided,
+		AggregateVirtualServers: true,
 	})
 	return err
 }
@@ -871,6 +880,26 @@ func (r *serviceReconciler) isLBServiceShared(ctx context.Context, self *corev1.
 		// Legacy objects have no graph ownership metadata; retain the existing
 		// scalar compatibility behavior until their next successful reconcile.
 		if s.Annotations[annLBServiceID] == lbID {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *serviceReconciler) isVIPShared(ctx context.Context, self *corev1.Service, lbID, vipID string) bool {
+	if strings.TrimSpace(lbID) == "" || strings.TrimSpace(vipID) == "" {
+		return false
+	}
+	svcs := &corev1.ServiceList{}
+	if err := r.List(ctx, svcs, client.InNamespace(self.Namespace)); err != nil {
+		return false
+	}
+	for i := range svcs.Items {
+		svc := &svcs.Items[i]
+		if svc.Name == self.Name || !controllerutil.ContainsFinalizer(svc, finalizerName) {
+			continue
+		}
+		if strings.TrimSpace(svc.Annotations[annLBServiceID]) == lbID && strings.TrimSpace(svc.Annotations[annVIPPortID]) == vipID {
 			return true
 		}
 	}

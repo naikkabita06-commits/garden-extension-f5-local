@@ -42,22 +42,20 @@ func (s *stubCertificateClient) UnbindCertificate(context.Context, string, strin
 }
 
 type stubClient struct {
-	lbServices         []LBService
-	vips               []VIP
-	vsList             []VirtualServer
-	lastLBSpec         LBServiceSpec
-	lastVSSpec         VirtualServerSpec
-	createdLB          int
-	createdVIP         int
-	createdVS          int
-	createdVSResult    *VirtualServer
-	lastVIPSubnet      string
-	deletedVS          int
-	deletedVIP         int
-	deletedLB          int
-	searchedIP         []string
-	searchNetworkPorts func(string) []NetworkPort
-	computes           map[string]Compute
+	lbServices      []LBService
+	vips            []VIP
+	vsList          []VirtualServer
+	lastLBSpec      LBServiceSpec
+	lastVSSpec      VirtualServerSpec
+	createdLB       int
+	createdVIP      int
+	createdVS       int
+	createdVSResult *VirtualServer
+	lastVIPSubnet   string
+	deletedVS       int
+	deletedVIP      int
+	deletedLB       int
+	computes        map[string]Compute
 }
 
 func (s *stubClient) ListLBServices(
@@ -69,7 +67,7 @@ func (s *stubClient) ListLBServices(
 func (s *stubClient) CreateLBService(_ context.Context, spec LBServiceSpec) (LBService, error) {
 	s.createdLB++
 	s.lastLBSpec = spec
-	created := LBService{ID: "lb-1", Name: spec.Name, Status: "Active", OperatingStatus: "Ready"}
+	created := LBService{ID: "lb-1", Name: spec.Name, Status: "Active", OperatingStatus: "Ready", VPCID: spec.VPCID, VPCName: spec.VPCName, NetworkID: spec.NetworkID}
 	s.lbServices = append(s.lbServices, created)
 	return created, nil
 }
@@ -89,6 +87,9 @@ func (s *stubClient) GetLBService(
 	_ context.Context,
 	id string,
 ) (LBService, error) {
+	if s.deletedLB > 0 {
+		return LBService{}, &f5client.HTTPStatusError{StatusCode: http.StatusNotFound, Status: "404 Not Found"}
+	}
 	for _, svc := range s.lbServices {
 		if strings.TrimSpace(svc.ID) == strings.TrimSpace(id) {
 			return svc, nil
@@ -117,24 +118,34 @@ func (s *stubClient) DeleteVIP(context.Context, string, string) error {
 func (s *stubClient) ListVirtualServers(context.Context, string) ([]VirtualServer, error) {
 	return append([]VirtualServer(nil), s.vsList...), nil
 }
+func (s *stubClient) GetVirtualServer(_ context.Context, _, id string) (VirtualServer, error) {
+	for _, vs := range s.vsList {
+		if strings.TrimSpace(vs.ID) == strings.TrimSpace(id) {
+			return vs, nil
+		}
+	}
+	return VirtualServer{}, &f5client.HTTPStatusError{StatusCode: http.StatusNotFound, Status: "404 Not Found"}
+}
 func (s *stubClient) CreateVirtualServer(_ context.Context, _ string, spec VirtualServerSpec) (VirtualServer, error) {
 	s.createdVS++
 	s.lastVSSpec = spec
 	if s.createdVSResult != nil {
+		s.vsList = append(s.vsList, *s.createdVSResult)
 		return *s.createdVSResult, nil
 	}
-	return VirtualServer{ID: "vs-1", Name: spec.Name}, nil
+	created := VirtualServer{ID: "vs-1", Name: spec.Name, VIPPortID: spec.VIPPortID, Status: "Active", Protocol: spec.Protocol, Port: spec.Port}
+	s.vsList = append(s.vsList, created)
+	return created, nil
 }
-func (s *stubClient) DeleteVirtualServer(context.Context, string, string) error {
+func (s *stubClient) DeleteVirtualServer(_ context.Context, _ string, id string) error {
 	s.deletedVS++
-	return nil
-}
-func (s *stubClient) SearchNetworkPortsByIP(_ context.Context, ip string) ([]NetworkPort, error) {
-	s.searchedIP = append(s.searchedIP, ip)
-	if s.searchNetworkPorts != nil {
-		return s.searchNetworkPorts(ip), nil
+	for i := range s.vsList {
+		if strings.TrimSpace(s.vsList[i].ID) == strings.TrimSpace(id) {
+			s.vsList = append(s.vsList[:i], s.vsList[i+1:]...)
+			break
+		}
 	}
-	return []NetworkPort{{ID: len(s.searchedIP), ResourceID: "compute-" + ip, ResourceType: "compute", IP: ip}}, nil
+	return nil
 }
 
 func (s *stubClient) GetCompute(_ context.Context, id string) (Compute, error) {
@@ -143,7 +154,7 @@ func (s *stubClient) GetCompute(_ context.Context, id string) (Compute, error) {
 			return compute, nil
 		}
 	}
-	return Compute{ID: id, VPCID: "vpc-1", NetworkID: "net-1", Ports: []ComputePort{{ID: 5001, IP: "10.0.0.1", NetworkID: "net-1", DeviceID: id, DeviceType: "compute"}}}, nil
+	return Compute{ID: id, Name: "node-1", VPCID: "vpc-1", NetworkID: "net-1", Ports: []ComputePort{{ID: 5001, FixedIPs: []string{"10.0.0.1"}, NetworkID: "net-1", DeviceID: id, DeviceType: "compute"}}}, nil
 }
 
 func TestEnsureCreatesLBVIPAndVirtualServer(t *testing.T) {
@@ -159,7 +170,7 @@ func TestEnsureCreatesLBVIPAndVirtualServer(t *testing.T) {
 			RoutingAlgorithm: "round_robin",
 			Monitor:          &model.Monitor{Type: "http", Path: "/healthz", Interval: 15},
 		},
-		Backends: []model.BackendMember{{IP: "10.0.0.1", Port: 30080, Weight: 50}},
+		Backends: []model.BackendMember{{ComputeID: "compute-1", IP: "10.0.0.1", Port: 30080, Weight: 50}},
 	})
 	if err != nil {
 		t.Fatalf("Ensure: %v", err)
@@ -179,9 +190,9 @@ func TestEnsureCreatesLBVIPAndVirtualServer(t *testing.T) {
 }
 
 func TestEnsureSkipsVirtualServerWhenBackendHashMatches(t *testing.T) {
-	backends := []model.BackendMember{{IP: "10.0.0.1", Port: 30080, Weight: 50}}
+	backends := []model.BackendMember{{ComputeID: "compute-1", IP: "10.0.0.1", Port: 30080, Weight: 50}}
 	hash := DesiredBackendHash(80, 30080, backends)
-	stub := &stubClient{lbServices: []LBService{{ID: "lb-1", Name: "lb"}}, vips: []VIP{{ID: "7", Address: "10.0.0.7"}}, vsList: []VirtualServer{{ID: "vs-1", Name: "vs"}}}
+	stub := &stubClient{lbServices: []LBService{{ID: "lb-1", Name: "lb", Status: "Active"}}, vips: []VIP{{ID: "7", Address: "10.0.0.7"}}, vsList: []VirtualServer{{ID: "vs-1", Name: "vs", VIPPortID: "7", Status: "Active", Protocol: "HTTP", Port: 80}}}
 	res, err := New(stub, "").Ensure(context.Background(), EnsureRequest{
 		VirtualServer: model.VirtualServer{Name: "vs", FrontendPort: 80, BackendNodePort: 30080, Protocol: "HTTP"},
 		Backends:      backends,
@@ -197,15 +208,15 @@ func TestEnsureSkipsVirtualServerWhenBackendHashMatches(t *testing.T) {
 }
 
 func TestDesiredBackendHashIncludesBackendPort(t *testing.T) {
-	first := DesiredBackendHash(80, 30080, []model.BackendMember{{IP: "10.0.0.1", Port: 30080, Weight: 10}})
-	second := DesiredBackendHash(80, 30080, []model.BackendMember{{IP: "10.0.0.1", Port: 30081, Weight: 10}})
+	first := DesiredBackendHash(80, 30080, []model.BackendMember{{ComputeID: "compute-1", IP: "10.0.0.1", Port: 30080, Weight: 10}})
+	second := DesiredBackendHash(80, 30080, []model.BackendMember{{ComputeID: "compute-1", IP: "10.0.0.1", Port: 30081, Weight: 10}})
 	if first == second {
 		t.Fatal("backend hash must change when the CMP member port changes")
 	}
 }
 
 func TestDesiredVirtualServerHashIncludesReplacementFields(t *testing.T) {
-	backends := []model.BackendMember{{IP: "10.0.0.1", Port: 30080, Weight: 10}}
+	backends := []model.BackendMember{{ComputeID: "compute-1", IP: "10.0.0.1", Port: 30080, Weight: 10}}
 	base := model.VirtualServer{Name: "vs", FrontendPort: 80, BackendNodePort: 30080, Protocol: "HTTP", RoutingAlgorithm: "round_robin"}
 	changed := base
 	changed.PersistenceType = "source_ip"
@@ -215,10 +226,10 @@ func TestDesiredVirtualServerHashIncludesReplacementFields(t *testing.T) {
 }
 
 func TestEnsurePreservesExistingVirtualServerWhenHashIsNotManaged(t *testing.T) {
-	stub := &stubClient{lbServices: []LBService{{ID: "lb-1", Name: "lb"}}, vips: []VIP{{ID: "7", Address: "10.0.0.7"}}, vsList: []VirtualServer{{ID: "vs-1", Name: "vs"}}}
+	stub := &stubClient{lbServices: []LBService{{ID: "lb-1", Name: "lb", Status: "Active"}}, vips: []VIP{{ID: "7", Address: "10.0.0.7"}}, vsList: []VirtualServer{{ID: "vs-1", Name: "vs", VIPPortID: "7", Status: "Active", Protocol: "HTTP", Port: 80}}}
 	res, err := New(stub, "").Ensure(context.Background(), EnsureRequest{
 		VirtualServer: model.VirtualServer{Name: "vs", FrontendPort: 80, BackendNodePort: 30080, Protocol: "HTTP"},
-		Backends:      []model.BackendMember{{IP: "10.0.0.1", Port: 30080, Weight: 50}},
+		Backends:      []model.BackendMember{{ComputeID: "compute-1", IP: "10.0.0.1", Port: 30080, Weight: 50}},
 		Current:       model.ObservedState{LBServiceID: "lb-1", VIPPortID: "7", VIPAddress: "10.0.0.7", VirtualServerID: "vs-1"},
 	})
 	if err != nil {
@@ -230,36 +241,35 @@ func TestEnsurePreservesExistingVirtualServerWhenHashIsNotManaged(t *testing.T) 
 }
 
 func TestEnsureRecreatesExistingVirtualServerWhenHashIsManagedButMissing(t *testing.T) {
-	stub := &stubClient{lbServices: []LBService{{ID: "lb-1", Name: "lb"}}, vips: []VIP{{ID: "7", Address: "10.0.0.7"}}}
-	res, err := New(stub, "").Ensure(context.Background(), EnsureRequest{
+	stub := &stubClient{lbServices: []LBService{{ID: "lb-1", Name: "lb", Status: "Active"}}, vips: []VIP{{ID: "7", Address: "10.0.0.7"}}, vsList: []VirtualServer{{ID: "vs-old", Name: "vs", VIPPortID: "7", Status: "Active", Protocol: "HTTP", Port: 80}}}
+	_, err := New(stub, "").Ensure(context.Background(), EnsureRequest{
 		VirtualServer:           model.VirtualServer{Name: "vs", FrontendPort: 80, BackendNodePort: 30080, Protocol: "HTTP"},
-		Backends:                []model.BackendMember{{IP: "10.0.0.1", Port: 30080, Weight: 50}},
+		Backends:                []model.BackendMember{{ComputeID: "compute-1", IP: "10.0.0.1", Port: 30080, Weight: 50}},
 		Current:                 model.ObservedState{LBServiceID: "lb-1", VIPPortID: "7", VIPAddress: "10.0.0.7", VirtualServerID: "vs-old"},
 		RecreateWhenHashMissing: true,
 	})
-	if err != nil {
-		t.Fatalf("Ensure: %v", err)
+	if _, ok := IsProvisioningPending(err); !ok {
+		t.Fatalf("expected deletion wait, got %v", err)
 	}
-	if stub.deletedVS != 0 || stub.createdVS != 1 || !res.Changed || res.Observed.VirtualServerID != "vs-1" {
-		t.Fatalf("expected deleted VS drift to be recreated, created=%d deleted=%d changed=%t observed=%#v", stub.createdVS, stub.deletedVS, res.Changed, res.Observed)
+	if stub.deletedVS != 1 || stub.createdVS != 0 {
+		t.Fatalf("expected delete-before-recreate wait, created=%d deleted=%d", stub.createdVS, stub.deletedVS)
 	}
 }
 
-func TestEnsureFailsWhenBackendPortCannotBeResolved(t *testing.T) {
+func TestEnsureFailsWhenBackendComputeIdentityIsMissing(t *testing.T) {
 	stub := &stubClient{}
-	stub.searchNetworkPorts = func(string) []NetworkPort { return nil }
 	_, err := New(stub, "").Ensure(context.Background(), EnsureRequest{
 		VirtualServer: model.VirtualServer{Name: "vs", FrontendPort: 80, BackendNodePort: 30080, Protocol: "HTTP"},
-		Backends:      []model.BackendMember{{IP: "10.0.0.99", Port: 30080, Weight: 50}},
+		Backends:      []model.BackendMember{{IP: "10.0.0.99", Port: 30080, Weight: 1}},
 	})
-	if err == nil {
-		t.Fatal("expected missing backend port lookup to fail")
+	if err == nil || !strings.Contains(err.Error(), "no CMP compute identity") {
+		t.Fatalf("expected missing backend compute identity to fail, got %v", err)
 	}
 }
 
 func TestEnsurePassesOptionalLBServiceFields(t *testing.T) {
-	stub := &stubClient{}
-	_, err := New(stub, "fallback-vpc").Ensure(context.Background(), EnsureRequest{
+	stub := &stubClient{computes: map[string]Compute{"compute-1": {ID: "compute-1", VPCID: "vpc-explicit", NetworkID: "net-1", Ports: []ComputePort{{ID: 5001, FixedIPs: []string{"10.0.0.1"}, NetworkID: "net-1", DeviceID: "compute-1", DeviceType: "compute"}}}}}
+	_, err := New(stub, "vpc-explicit").Ensure(context.Background(), EnsureRequest{
 		LBName:        "lb",
 		LBDescription: "desc",
 		FlavorID:      42,
@@ -267,7 +277,7 @@ func TestEnsurePassesOptionalLBServiceFields(t *testing.T) {
 		VPCID:         "vpc-explicit",
 		VPCName:       "vpc-name",
 		VirtualServer: model.VirtualServer{Name: "vs", FrontendPort: 80, BackendNodePort: 30080, Protocol: "HTTP"},
-		Backends:      []model.BackendMember{{IP: "10.0.0.1", Port: 30080, Weight: 50}},
+		Backends:      []model.BackendMember{{ComputeID: "compute-1", IP: "10.0.0.1", Port: 30080, Weight: 50}},
 	})
 	if err != nil {
 		t.Fatalf("Ensure: %v", err)
@@ -410,31 +420,31 @@ func lbSpecValue(spec LBServiceSpec, key string) string {
 	}
 }
 
-func TestEnsureFailsWhenBackendPortHasNoResourceID(t *testing.T) {
-	stub := &stubClient{}
-	stub.searchNetworkPorts = func(ip string) []NetworkPort { return []NetworkPort{{ID: 99, ResourceType: "compute", IP: ip}} }
+func TestEnsureFailsWhenComputeHasNoMatchingPort(t *testing.T) {
+	stub := &stubClient{computes: map[string]Compute{"compute-1": {ID: "compute-1", VPCID: "vpc-1", NetworkID: "net-1"}}}
 	_, err := New(stub, "").Ensure(context.Background(), EnsureRequest{
 		VirtualServer: model.VirtualServer{Name: "vs", FrontendPort: 80, BackendNodePort: 30080, Protocol: "HTTP"},
-		Backends:      []model.BackendMember{{IP: "10.0.0.99", Port: 30080, Weight: 50}},
+		Backends:      []model.BackendMember{{ComputeID: "compute-1", IP: "10.0.0.99", Port: 30080, Weight: 1}},
 	})
-	if err == nil {
-		t.Fatal("expected missing CMP resource_id to fail")
+	if err == nil || !strings.Contains(err.Error(), "absent from CMP compute") {
+		t.Fatalf("expected missing compute port to fail, got %v", err)
 	}
 }
 
-func TestEnsureRejectsAmbiguousBackendNetworkPortIdentity(t *testing.T) {
-	stub := &stubClient{searchNetworkPorts: func(ip string) []NetworkPort {
-		return []NetworkPort{{ID: 1, ResourceID: "compute-a", ResourceType: "compute", IP: ip}, {ID: 2, ResourceID: "compute-b", ResourceType: "compute", IP: ip}}
-	}}
-	_, err := New(stub, "").Ensure(context.Background(), EnsureRequest{VirtualServer: model.VirtualServer{Name: "vs", FrontendPort: 80, BackendNodePort: 30080}, Backends: []model.BackendMember{{IP: "10.0.0.1", Port: 30080}}})
-	if err == nil || !strings.Contains(err.Error(), "ambiguous CMP network ports") {
+func TestEnsureRejectsAmbiguousComputePorts(t *testing.T) {
+	stub := &stubClient{computes: map[string]Compute{"compute-1": {ID: "compute-1", VPCID: "vpc-1", NetworkID: "net-1", Ports: []ComputePort{
+		{ID: 1, FixedIPs: []string{"10.0.0.1"}, NetworkID: "net-1", DeviceID: "compute-1", DeviceType: "compute"},
+		{ID: 2, FixedIPs: []string{"10.0.0.1"}, NetworkID: "net-1", DeviceID: "compute-1", DeviceType: "compute"},
+	}}}}
+	_, err := New(stub, "vpc-1").Ensure(context.Background(), EnsureRequest{NetworkID: "net-1", VirtualServer: model.VirtualServer{Name: "vs", FrontendPort: 80, BackendNodePort: 30080}, Backends: []model.BackendMember{{ComputeID: "compute-1", IP: "10.0.0.1", Port: 30080}}})
+	if err == nil || !strings.Contains(err.Error(), "multiple CMP compute ports") {
 		t.Fatalf("expected ambiguous identity error, got %v", err)
 	}
 }
 
 func TestEnsureRejectsVirtualServerCreateWithoutProviderID(t *testing.T) {
 	stub := &stubClient{createdVSResult: &VirtualServer{Name: "vs"}}
-	_, err := New(stub, "").Ensure(context.Background(), EnsureRequest{VirtualServer: model.VirtualServer{Name: "vs", FrontendPort: 80, BackendNodePort: 30080}, Backends: []model.BackendMember{{IP: "10.0.0.1", Port: 30080}}})
+	_, err := New(stub, "vpc-1").Ensure(context.Background(), EnsureRequest{NetworkID: "net-1", VirtualServer: model.VirtualServer{Name: "vs", FrontendPort: 80, BackendNodePort: 30080}, Backends: []model.BackendMember{{ComputeID: "compute-1", IP: "10.0.0.1", Port: 30080}}})
 	if err == nil || !strings.Contains(err.Error(), "without a provider id") {
 		t.Fatalf("expected missing provider ID error, got %v", err)
 	}
@@ -442,7 +452,7 @@ func TestEnsureRejectsVirtualServerCreateWithoutProviderID(t *testing.T) {
 
 func TestEnsureUsesComputeDetailsWhenBackendHasComputeID(t *testing.T) {
 	stub := &stubClient{computes: map[string]Compute{
-		"compute-1": {ID: "compute-1", VPCID: "vpc-1", NetworkID: "net-1", Ports: []ComputePort{{ID: 38135, IP: "10.10.1.145", NetworkID: "net-1", DeviceID: "compute-1", DeviceType: "compute"}}},
+		"compute-1": {ID: "compute-1", Name: "node-1", VPCID: "vpc-1", NetworkID: "net-1", Ports: []ComputePort{{ID: 38135, FixedIPs: []string{"10.10.1.145"}, NetworkID: "net-1", DeviceID: "compute-1", DeviceType: "compute"}}},
 	}}
 	_, err := New(stub, "vpc-1").Ensure(context.Background(), EnsureRequest{
 		LBName:        "lb",
@@ -456,14 +466,11 @@ func TestEnsureUsesComputeDetailsWhenBackendHasComputeID(t *testing.T) {
 	if len(stub.lastVSSpec.Nodes) != 1 || stub.lastVSSpec.Nodes[0].ResourceID != "compute-1" || stub.lastVSSpec.Nodes[0].BackendPortID != 38135 {
 		t.Fatalf("expected compute-backed node spec, got %#v", stub.lastVSSpec.Nodes)
 	}
-	if len(stub.searchedIP) != 0 {
-		t.Fatalf("expected no IP search when compute ID is available, searched=%v", stub.searchedIP)
-	}
 }
 
 func TestEnsureRejectsComputeSubnetMismatch(t *testing.T) {
 	stub := &stubClient{computes: map[string]Compute{
-		"compute-1": {ID: "compute-1", VPCID: "vpc-1", NetworkID: "other-net", Ports: []ComputePort{{ID: 38135, IP: "10.10.1.145", NetworkID: "other-net", DeviceID: "compute-1", DeviceType: "compute"}}},
+		"compute-1": {ID: "compute-1", Name: "node-1", VPCID: "vpc-1", NetworkID: "other-net", Ports: []ComputePort{{ID: 38135, FixedIPs: []string{"10.10.1.145"}, NetworkID: "other-net", DeviceID: "compute-1", DeviceType: "compute"}}},
 	}}
 	_, err := New(stub, "vpc-1").Ensure(context.Background(), EnsureRequest{
 		LBName:        "lb",
@@ -473,6 +480,19 @@ func TestEnsureRejectsComputeSubnetMismatch(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "subnet") {
 		t.Fatalf("expected subnet mismatch error, got %v", err)
+	}
+}
+
+func TestVirtualServerManagerRejectsDuplicateFrontendTuple(t *testing.T) {
+	stub := &stubClient{vsList: []VirtualServer{{ID: "vs-other", Name: "other-service", VIPPortID: "vip-1", Status: "Active", Protocol: "TCP", Port: 8080}}}
+	_, _, _, err := NewVirtualServerManager(stub, "vpc-1").Ensure(context.Background(), VirtualServerEnsureRequest{
+		LBServiceID: "lb-1",
+		VIPPortID:   "vip-1",
+		NetworkID:   "net-1",
+		Desired:     model.VirtualServer{Name: "this-service", FrontendPort: 8080, BackendNodePort: 30080, Protocol: "TCP"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "frontend tuple conflict") {
+		t.Fatalf("expected duplicate frontend tuple error, got %v", err)
 	}
 }
 
@@ -505,7 +525,7 @@ func TestEnsureStackRejectsCertificatesUntilCertificateManagerExists(t *testing.
 
 func TestEnsureStackRecoversVIPByRecoveredVirtualServerAddress(t *testing.T) {
 	stub := &stubClient{
-		lbServices: []LBService{{ID: "lb-1", Name: "lb"}},
+		lbServices: []LBService{{ID: "lb-1", Name: "lb", Status: "Active"}},
 		vips: []VIP{
 			{ID: "28684", Address: "10.1.1.128"},
 			{ID: "33672", Address: "10.1.0.17"},
@@ -514,6 +534,9 @@ func TestEnsureStackRecoversVIPByRecoveredVirtualServerAddress(t *testing.T) {
 			ID:         "vs-1",
 			Name:       "app-vs-a81",
 			VIPAddress: "10.1.1.128",
+			Status:     "Active",
+			Protocol:   "HTTP",
+			Port:       8080,
 		}},
 	}
 
