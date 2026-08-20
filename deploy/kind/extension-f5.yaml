@@ -15,12 +15,11 @@ spec:
 
       vpcId: "ff1067a7-3582-447d-a325-244d89c36cd5"
       vpcName: "vpc-27oct"
-      networkId: "86dd3898-e0c8-4bd7-a845-1de8bc41fa83"
+      networkId: "b4ca8d86-b6f2-400e-9cb4-c3be9c2d8bad"
       flavorId: 25
-
-      credentialsSecretRef:
-        name: cmp-f5-credentials
-        namespace: shoot--local--local
+      region:  "dev"
+      
+      credentialsReferenceName: cmp-f5-credentials
 
       cis:
-        bridgeImage: "registry.local.gardener.cloud:5001/extensions/f5:v0.1.0-dev-gardener-1.139.2-fix10"
+        bridgeImage: "registry.local.gardener.cloud:5001/extensions/f5:v0.1.0-dev-gardener-1.139.2-fix8"

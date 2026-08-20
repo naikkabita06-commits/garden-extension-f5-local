@@ -1,7 +1,6 @@
 package v1alpha1
 
 import (
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
@@ -39,12 +38,11 @@ type F5LoadBalancerConfigSpec struct {
 	// TenantOrPartition is the CMP tenant or BIG‑IP partition to use.
 	TenantOrPartition string `json:"tenantOrPartition"`
 
-	// CredentialsSecretRef points to a Secret with CMP/CIS credentials.
+	// CredentialsReferenceName points to a Secret with CMP/CIS credentials.
 	//
 	// It is optional because some modes (e.g. application LB disabled and CMP
 	// provisioning disabled) don't need any credentials.
-	CredentialsSecretRef *corev1.SecretReference `json:"credentialsSecretRef,omitempty"`
-
+	CredentialsReferenceName string `json:"credentialsReferenceName,omitempty"`
 	// ControlPlaneVIP is the VIP used for the Shoot's kube‑apiserver.
 	ControlPlaneVIP string `json:"controlPlaneVIP"`
 
@@ -87,6 +85,8 @@ type F5LoadBalancerConfigSpec struct {
 
 	// VPCName is the CMP VPC name for the LB Service.
 	VPCName string `json:"vpcName,omitempty"`
+
+	Region string `json:"region,omitempty"`
 
 	// RoutingAlgorithm is the load-balancing algorithm for virtual servers (e.g. "round_robin").
 	RoutingAlgorithm string `json:"routingAlgorithm,omitempty"`
@@ -200,11 +200,7 @@ func (*F5LoadBalancerConfig) Hub() {}
 // DeepCopyInto copies all fields of F5LoadBalancerConfigSpec into out.
 func (s *F5LoadBalancerConfigSpec) DeepCopyInto(out *F5LoadBalancerConfigSpec) {
 	*out = *s
-	if s.CredentialsSecretRef != nil {
-		in, outRef := &s.CredentialsSecretRef, &out.CredentialsSecretRef
-		*outRef = new(corev1.SecretReference)
-		**outRef = **in
-	}
+	
 	if s.ControlPlaneReady != nil {
 		in, outRef := &s.ControlPlaneReady, &out.ControlPlaneReady
 		*outRef = new(bool)

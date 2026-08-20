@@ -53,7 +53,10 @@ type EnsureRequest struct {
 	// must recreate a CMP virtual server. Seed and Ingress paths keep this false so
 	// annotated existing virtual servers are reused, matching their historical
 	// finalizer-safe behavior until a richer update API exists.
-	RecreateWhenHashMissing bool
+	RecreateWhenHashMissing    bool
+	StrictLBServiceID          bool
+	StrictVIPPortID            bool
+	RecoverVirtualServerByName bool
 }
 
 type EnsureResult struct {
@@ -67,7 +70,7 @@ func (d *Deployer) Ensure(ctx context.Context, req EnsureRequest) (*EnsureResult
 	result.Observed.EnsureGraph()
 	result.BackendHash = DesiredBackendHash(req.VirtualServer.FrontendPort, req.VirtualServer.BackendNodePort, req.Backends)
 
-	lbID, changed, err := d.lbServices.Ensure(ctx, req, result.Observed.LBServiceID)
+	lbID, changed, err := d.lbServices.Ensure(ctx, req, result.Observed.LBServiceID, req.StrictLBServiceID)
 	if err != nil {
 		return nil, err
 	}
@@ -75,7 +78,7 @@ func (d *Deployer) Ensure(ctx context.Context, req EnsureRequest) (*EnsureResult
 	result.Observed.Graph.LBServices[req.LBName] = model.ObservedResource{LogicalID: req.LBName, ExternalID: lbID, Name: req.LBName, Ownership: req.VirtualServer.Ownership}
 	result.Changed = result.Changed || changed
 
-	vipID, vipAddress, changed, err := d.vips.Ensure(ctx, result.Observed.LBServiceID, result.Observed.VIPPortID, result.Observed.VIPAddress)
+	vipID, vipAddress, changed, err := d.vips.Ensure(ctx, result.Observed.LBServiceID, req.NetworkID, result.Observed.VIPPortID, result.Observed.VIPAddress, req.StrictVIPPortID)
 	if err != nil {
 		return result, err
 	}
@@ -87,12 +90,14 @@ func (d *Deployer) Ensure(ctx context.Context, req EnsureRequest) (*EnsureResult
 	vsID, vsName, changed, err := d.virtualServers.Ensure(ctx, VirtualServerEnsureRequest{
 		LBServiceID:             result.Observed.LBServiceID,
 		VIPPortID:               result.Observed.VIPPortID,
+		NetworkID:               req.NetworkID,
 		Desired:                 req.VirtualServer,
 		Backends:                req.Backends,
 		CurrentID:               result.Observed.VirtualServerID,
 		CurrentHash:             req.CurrentHash,
 		DesiredHash:             result.BackendHash,
 		RecreateWhenHashMissing: req.RecreateWhenHashMissing,
+		RecoverByName:           req.RecoverVirtualServerByName,
 	})
 	if err != nil {
 		return result, err
@@ -143,8 +148,12 @@ func DesiredVirtualServerHash(vs model.VirtualServer, _ []model.BackendMember) s
 // StackEnsureRequest is the complete desired state used by the stack deployer.
 // Current is persisted provider state from the previous reconciliation.
 type StackEnsureRequest struct {
-	Stack   *model.LoadBalancerStack
-	Current model.ObservedState
+	Stack                       *model.LoadBalancerStack
+	Current                     model.ObservedState
+	StrictLBServiceID           bool
+	StrictVIPPortID             bool
+	RecoverVirtualServersByName bool
+	LBReadyHook                 func(model.ObservedState) error
 }
 
 // StackEnsureResult is the graph returned after all supported resource managers
@@ -203,14 +212,73 @@ func (d *Deployer) EnsureStack(ctx context.Context, req StackEnsureRequest) (*St
 		VPCID: req.Stack.LBService.VPCID, VPCName: req.Stack.LBService.VPCName,
 		VirtualServer: req.Stack.VirtualServers[0], Current: observed,
 	}
-	lbID, changed, err := d.lbServices.Ensure(ctx, lbReq, observed.LBServiceID)
+	lbID, changed, err := d.lbServices.Ensure(ctx, lbReq, observed.LBServiceID, req.StrictLBServiceID)
 	if err != nil {
+		if pending, ok := IsProvisioningPending(err); ok && pending.ResourceType == "LBService" && strings.TrimSpace(pending.ResourceID) != "" {
+			observed.LBServiceID = strings.TrimSpace(pending.ResourceID)
+			observed.Graph.LBServices[req.Stack.LBService.Name] = model.ObservedResource{
+				LogicalID:  req.Stack.LBService.Name,
+				ExternalID: observed.LBServiceID,
+				Name:       req.Stack.LBService.Name,
+				Ownership:  req.Stack.LBService.Ownership,
+			}
+			if req.LBReadyHook != nil {
+				if hookErr := req.LBReadyHook(observed); hookErr != nil {
+					return nil, hookErr
+				}
+			}
+		}
+		if terminal, ok := IsTerminalProvisioning(err); ok && terminal.ResourceType == "LBService" && strings.TrimSpace(terminal.ResourceID) != "" {
+			observed.LBServiceID = strings.TrimSpace(terminal.ResourceID)
+			observed.Graph.LBServices[req.Stack.LBService.Name] = model.ObservedResource{
+				LogicalID:  req.Stack.LBService.Name,
+				ExternalID: observed.LBServiceID,
+				Name:       req.Stack.LBService.Name,
+				Ownership:  req.Stack.LBService.Ownership,
+			}
+			if req.LBReadyHook != nil {
+				if hookErr := req.LBReadyHook(observed); hookErr != nil {
+					return nil, hookErr
+				}
+			}
+		}
 		return nil, err
 	}
 	observed.LBServiceID = lbID
 	observed.Graph.LBServices[req.Stack.LBService.Name] = model.ObservedResource{LogicalID: req.Stack.LBService.Name, ExternalID: lbID, Name: req.Stack.LBService.Name, Ownership: req.Stack.LBService.Ownership}
+	if req.LBReadyHook != nil {
+		if err := req.LBReadyHook(observed); err != nil {
+			return nil, err
+		}
+	}
 
-	vipID, vipAddress, vipChanged, err := d.vips.Ensure(ctx, lbID, observed.VIPPortID, observed.VIPAddress)
+	if req.RecoverVirtualServersByName && strings.TrimSpace(observed.VIPPortID) == "" {
+		found, recoveredVIPID, recoveredVIPAddress, err := d.recoverVirtualServersByName(ctx, lbID, req.Stack.LBService.NetworkID, req.Stack.VirtualServers)
+		if err != nil {
+			return nil, err
+		}
+		for _, desiredVS := range req.Stack.VirtualServers {
+			recovered, ok := found[desiredVS.Name]
+			if !ok {
+				continue
+			}
+			backends := stackBackends(req.Stack, desiredVS)
+			desiredHash := DesiredVirtualServerHash(desiredVS, backends)
+			observed.Graph.VirtualServers[desiredVS.Name] = model.ObservedResource{
+				LogicalID:   desiredVS.Name,
+				ExternalID:  recovered.ID,
+				Name:        recovered.Name,
+				DesiredHash: desiredHash,
+				Ownership:   desiredVS.Ownership,
+			}
+		}
+		if recoveredVIPID != "" {
+			observed.VIPPortID = recoveredVIPID
+			observed.VIPAddress = recoveredVIPAddress
+		}
+	}
+
+	vipID, vipAddress, vipChanged, err := d.vips.Ensure(ctx, lbID, req.Stack.LBService.NetworkID, observed.VIPPortID, observed.VIPAddress, req.StrictVIPPortID)
 	if err != nil {
 		return nil, err
 	}
@@ -226,7 +294,7 @@ func (d *Deployer) EnsureStack(ctx context.Context, req StackEnsureRequest) (*St
 		}
 		desiredHash := DesiredVirtualServerHash(vs, backends)
 		currentHash := observed.Graph.VirtualServers[vs.Name].DesiredHash
-		vsID, vsName, vsChanged, err := d.virtualServers.Ensure(ctx, VirtualServerEnsureRequest{LBServiceID: lbID, VIPPortID: vipID, Desired: vs, Backends: backends, CurrentID: currentID, CurrentHash: currentHash, DesiredHash: desiredHash, RecreateWhenHashMissing: true})
+		vsID, vsName, vsChanged, err := d.virtualServers.Ensure(ctx, VirtualServerEnsureRequest{LBServiceID: lbID, VIPPortID: vipID, NetworkID: req.Stack.LBService.NetworkID, Desired: vs, Backends: backends, CurrentID: currentID, CurrentHash: currentHash, DesiredHash: desiredHash, RecreateWhenHashMissing: true, RecoverByName: req.RecoverVirtualServersByName})
 		if err != nil {
 			return nil, err
 		}
@@ -250,7 +318,7 @@ func (d *Deployer) EnsureStack(ctx context.Context, req StackEnsureRequest) (*St
 
 		poolIDs := map[string]string{}
 		for _, pool := range poolsForVirtualServer(req.Stack, vs) {
-			memberSpecs, err := d.virtualServers.poolMemberSpecs(ctx, pool.Members)
+			memberSpecs, err := d.virtualServers.poolMemberSpecs(ctx, pool.Members, req.Stack.LBService.NetworkID)
 			if err != nil {
 				return nil, err
 			}
@@ -340,6 +408,91 @@ func (d *Deployer) EnsureStack(ctx context.Context, req StackEnsureRequest) (*St
 	}
 	changed = changed || virtualServersDeleted
 	return &StackEnsureResult{Observed: observed, Changed: changed}, nil
+}
+
+func (d *Deployer) recoverVirtualServersByName(ctx context.Context, lbID, subnetID string, desired []model.VirtualServer) (map[string]VirtualServer, string, string, error) {
+	listeners, err := d.client.ListVirtualServers(ctx, lbID)
+	if err != nil {
+		return nil, "", "", err
+	}
+	found := map[string]VirtualServer{}
+	for _, want := range desired {
+		id, err := findUniqueVirtualServerByName(listeners, want.Name)
+		if err != nil {
+			return nil, "", "", err
+		}
+		if id == "" {
+			continue
+		}
+		for _, candidate := range listeners {
+			if strings.TrimSpace(candidate.ID) == id {
+				found[want.Name] = candidate
+				break
+			}
+		}
+	}
+	if len(found) == 0 {
+		return found, "", "", nil
+	}
+
+	for _, vs := range found {
+		if strings.TrimSpace(vs.VIPPortID) != "" {
+			vipID := strings.TrimSpace(vs.VIPPortID)
+			vips, err := d.client.ListVIPs(ctx, lbID, subnetID)
+			if err != nil {
+				return nil, "", "", err
+			}
+			for _, vip := range vips {
+				if strings.TrimSpace(vip.ID) == vipID {
+					return found, vipID, strings.TrimSpace(vip.Address), nil
+				}
+			}
+			return nil, "", "", fmt.Errorf("virtual server %q references VIP %q that does not exist under LB %s", vs.Name, vipID, lbID)
+		}
+	}
+
+	// Some CMP responses expose only VS.vip (VIP address) but not VS.vip_port_id.
+	// Recover the VIP ID by matching that address against VIPs under the LB.
+	vipAddressCandidates := map[string]struct{}{}
+	for _, vs := range found {
+		if addr := strings.TrimSpace(vs.VIPAddress); addr != "" {
+			vipAddressCandidates[addr] = struct{}{}
+		}
+	}
+	if len(vipAddressCandidates) > 0 {
+		if len(vipAddressCandidates) != 1 {
+			return nil, "", "", fmt.Errorf("recovered virtual server(s) exist on LB %s but expose multiple VIP addresses; set vip-port-id annotation explicitly", lbID)
+		}
+		vips, err := d.client.ListVIPs(ctx, lbID, subnetID)
+		if err != nil {
+			return nil, "", "", err
+		}
+		for candidate := range vipAddressCandidates {
+			var matched *VIP
+			for _, vip := range vips {
+				if strings.TrimSpace(vip.Address) != candidate {
+					continue
+				}
+				if matched != nil {
+					return nil, "", "", fmt.Errorf("recovered virtual server(s) on LB %s map to VIP address %q but multiple VIP IDs share that address; set vip-port-id annotation explicitly", lbID, candidate)
+				}
+				matchedVIP := vip
+				matched = &matchedVIP
+			}
+			if matched != nil {
+				return found, strings.TrimSpace(matched.ID), strings.TrimSpace(matched.Address), nil
+			}
+		}
+	}
+
+	vips, err := d.client.ListVIPs(ctx, lbID, subnetID)
+	if err != nil {
+		return nil, "", "", err
+	}
+	if len(vips) == 1 {
+		return found, strings.TrimSpace(vips[0].ID), strings.TrimSpace(vips[0].Address), nil
+	}
+	return nil, "", "", fmt.Errorf("recovered virtual server(s) exist on LB %s but VIP could not be resolved safely; set vip-port-id annotation explicitly", lbID)
 }
 
 // deleteObsoletePools removes only graph-recorded pools which are no longer

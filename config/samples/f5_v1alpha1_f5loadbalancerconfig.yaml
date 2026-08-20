@@ -7,9 +7,8 @@ spec:
   # Optional for application-plane-only setup; used for control-plane CMP integration.
   ccpApiEndpoint: ""
   tenantOrPartition: "k8s-demo"
-  credentialsSecretRef:
-    name: cmp-f5-credentials
-    namespace: garden-f5-system
+  credentialsReferenceName: cmp-f5-credentials
+
 
   # Optional for application-plane-only setup; used for control-plane LB.
   controlPlaneVIP: ""

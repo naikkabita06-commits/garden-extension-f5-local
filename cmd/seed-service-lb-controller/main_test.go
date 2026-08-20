@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/url"
 	"testing"
 	"time"
@@ -42,11 +43,20 @@ func (s *stubCMP) DeleteLBService(_ context.Context, _ string) error {
 	s.deleteLBN++
 	return nil
 }
-func (s *stubCMP) CreateLBServiceVIP(_ context.Context, _ string) (json.RawMessage, error) {
+func (s *stubCMP) GetLBService(
+	_ context.Context,
+	id string,
+) (json.RawMessage, error) {
+	return json.RawMessage(
+		fmt.Sprintf(`{"id":%q,"name":"test-lb"}`, id),
+	), nil
+}
+
+func (s *stubCMP) CreateLBServiceVIP(_ context.Context, _, _ string) (json.RawMessage, error) {
 	s.createVIPN++
 	return json.RawMessage(`{"id":101}`), nil
 }
-func (s *stubCMP) GetLBServiceVIPs(_ context.Context, _ string) ([]json.RawMessage, error) {
+func (s *stubCMP) GetLBServiceVIPs(_ context.Context, _, _ string) ([]json.RawMessage, error) {
 	return nil, nil
 }
 func (s *stubCMP) DeleteLBServiceVIP(_ context.Context, _, _ string) error {
@@ -64,11 +74,22 @@ func (s *stubCMP) DeleteLBVirtualServer(_ context.Context, _, _ string) error {
 	s.deleteVSN++
 	return nil
 }
-func (s *stubCMP) ListLBServiceCertificates(context.Context, string) ([]json.RawMessage, error) { return nil, nil }
-func (s *stubCMP) CreateLBServiceCertificate(context.Context, string, url.Values) (json.RawMessage, error) { return nil, nil }
+func (s *stubCMP) ListLBServiceCertificates(context.Context, string) ([]json.RawMessage, error) {
+	return nil, nil
+}
+func (s *stubCMP) CreateLBServiceCertificate(context.Context, string, url.Values) (json.RawMessage, error) {
+	return nil, nil
+}
 func (s *stubCMP) DeleteLBServiceCertificate(context.Context, string, string) error { return nil }
-func (s *stubCMP) AttachLBVirtualServerCertificate(context.Context, string, string, string) error { return nil }
-func (s *stubCMP) DetachLBVirtualServerCertificate(context.Context, string, string, string) error { return nil }
+func (s *stubCMP) AttachLBVirtualServerCertificate(context.Context, string, string, string) error {
+	return nil
+}
+func (s *stubCMP) DetachLBVirtualServerCertificate(context.Context, string, string, string) error {
+	return nil
+}
+func (s *stubCMP) GetCompute(_ context.Context, id string) (json.RawMessage, error) {
+	return json.RawMessage(`{"id":"` + id + `","vpc_id":"vpc-1","network_id":"net-1","ports":[{"id":5001,"fixed_ips":[{"ip_address":"10.0.0.1"}],"network_id":"net-1","device_id":"` + id + `","device_type":"compute"}]}`), nil
+}
 func (s *stubCMP) ListLBVirtualServerPools(context.Context, string, string) ([]json.RawMessage, error) {
 	return nil, nil
 }

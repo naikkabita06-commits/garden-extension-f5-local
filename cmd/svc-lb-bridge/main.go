@@ -6,6 +6,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -35,6 +37,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
@@ -52,6 +55,10 @@ const (
 	annLBServiceID     = "f5.extensions.gardener.cloud/lb-service-id"
 	annVIPPortID       = "f5.extensions.gardener.cloud/vip-port-id"
 	annVirtualServerID = "f5.extensions.gardener.cloud/virtual-server-id"
+	annLBServiceIDMode = "f5.extensions.gardener.cloud/lb-service-id-mode"
+	annVIPPortIDMode   = "f5.extensions.gardener.cloud/vip-port-id-mode"
+	idModeProvided     = "provided"
+	idModeManaged      = "managed"
 	annVIPAddress      = "f5.extensions.gardener.cloud/vip-address"
 	annBackendHash     = "f5.extensions.gardener.cloud/backend-hash"
 	// annObservedPorts persists independent virtual-server state per Service port.
@@ -64,17 +71,10 @@ const (
 	// complete provider graph has converged. It is intentionally separate from
 	// legacy scalar IDs so status consumers can distinguish stale success.
 	annObservedGeneration = "f5.extensions.gardener.cloud/observed-generation"
+	annManagedLBRepairID  = "f5.extensions.gardener.cloud/managed-lb-repair-id"
+	annManagedLBRepairs   = "f5.extensions.gardener.cloud/managed-lb-repair-attempts"
 
-	// User-facing input annotations for per-Service LB configuration.
-	// These override global defaults from F5LoadBalancerConfig CRD.
-	annProtocol         = lbannotations.Protocol
-	annRoutingAlgorithm = lbannotations.RoutingAlgorithm
-	annHealthInterval   = lbannotations.HealthInterval
-	annHealthType       = lbannotations.HealthType
-	annHealthPath       = lbannotations.HealthPath
-	annSourceRanges     = lbannotations.SourceRanges
-	annDrainingTimeout  = lbannotations.DrainingTimeout
-	annVIPGroup         = lbannotations.VIPGroup
+	maxManagedLBRepairAttempts = 3
 )
 
 type lbServiceConfig = lbannotations.LBConfig
@@ -135,7 +135,9 @@ func run(ctx context.Context) error {
 				Name:      svcName,
 			}}}
 		})).
-		Complete(r); err != nil {
+		WithOptions(controller.Options{
+			MaxConcurrentReconciles: 1,
+		}).Complete(r); err != nil {
 		return fmt.Errorf("creating service controller: %w", err)
 	}
 
@@ -150,6 +152,9 @@ func run(ctx context.Context) error {
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
 			return listManagedIngressRequestsForSecret(ctx, mgr.GetClient(), obj.GetNamespace(), obj.GetName())
 		})).
+		WithOptions(controller.Options{
+			MaxConcurrentReconciles: 1,
+		}).
 		Complete(ingR); err != nil {
 		return fmt.Errorf("creating ingress controller: %w", err)
 	}
@@ -177,6 +182,7 @@ type serviceReconciler struct {
 	defaultVPCName    string
 	defaultNetworkID  string
 	defaultFlavorID   int32
+	shootNamespace    string
 }
 
 func newReconciler(c client.Client, scheme *runtime.Scheme) (*serviceReconciler, error) {
@@ -195,6 +201,26 @@ func newReconciler(c client.Client, scheme *runtime.Scheme) (*serviceReconciler,
 	projectID := strings.TrimSpace(os.Getenv("CMP_PROJECT_ID"))
 	if projectID == "" {
 		return nil, fmt.Errorf("CMP_PROJECT_ID must be set")
+	}
+
+	region := strings.TrimSpace(os.Getenv("CMP_REGION"))
+	if region == "" {
+		return nil, fmt.Errorf("CMP_REGION must be set")
+	}
+
+	shootNamespace := strings.TrimSpace(os.Getenv("SHOOT_NAMESPACE"))
+	if shootNamespace == "" {
+		return nil, fmt.Errorf("SHOOT_NAMESPACE must be set")
+	}
+
+	apiKeyID := strings.TrimSpace(os.Getenv("CMP_API_KEY_ID"))
+	if apiKeyID == "" {
+		return nil, fmt.Errorf("CMP_API_KEY_ID must be set")
+	}
+
+	apiSecret := strings.TrimSpace(os.Getenv("CMP_API_SECRET"))
+	if apiSecret == "" {
+		return nil, fmt.Errorf("CMP_API_SECRET must be set")
 	}
 
 	vpcID := strings.TrimSpace(os.Getenv("CMP_VPC_ID"))
@@ -226,7 +252,7 @@ func newReconciler(c client.Client, scheme *runtime.Scheme) (*serviceReconciler,
 	}
 
 	log := ctrl.Log.WithName("svc-lb-bridge")
-	cmpClient, err := f5client.NewClientWithCeAuth(log, endpoint, orgName, projectID, ceAuth)
+	cmpClient, err := f5client.NewClientWithCeAuthCredentials(log, endpoint, orgName, projectID, region, ceAuth, apiKeyID, apiSecret)
 	if err != nil {
 		return nil, fmt.Errorf("creating CMP client: %w", err)
 	}
@@ -245,6 +271,7 @@ func newReconciler(c client.Client, scheme *runtime.Scheme) (*serviceReconciler,
 		defaultVPCName:   vpcName,
 		defaultNetworkID: networkID,
 		defaultFlavorID:  int32(parsedFlavorID),
+		shootNamespace:   shootNamespace,
 	}, nil
 }
 
@@ -346,7 +373,22 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		log.Info("cannot build desired load-balancer stack", "reason", reason, "error", err)
 		return ctrl.Result{}, nil
 	}
-
+	stack.LBService.Name = r.desiredLBServiceName(svc)
+	for i := range stack.VirtualServers {
+		stack.VirtualServers[i].Name = r.desiredVirtualServerName(svc, stack.VirtualServers[i].FrontendPort)
+	}
+	if requestedVPCID := strings.TrimSpace(lbCfg.VPCID); requestedVPCID != "" && requestedVPCID != strings.TrimSpace(r.defaultVPCID) {
+		r.Recorder.Eventf(
+			svc,
+			corev1.EventTypeWarning,
+			"InvalidLoadBalancerPlacement",
+			"Service vpc-id annotation %q must match Shoot/Extension VPC %q",
+			requestedVPCID,
+			strings.TrimSpace(r.defaultVPCID),
+		)
+		log.Info("service requested a different VPC than the Shoot/Extension VPC", "requestedVPCID", requestedVPCID, "extensionVPCID", strings.TrimSpace(r.defaultVPCID))
+		return ctrl.Result{}, nil
+	}
 	stack.LBService.VPCID = r.defaultVPCID
 	stack.LBService.VPCName = r.defaultVPCName
 	// Network and flavor use Shoot-level defaults unless the Service provides
@@ -386,24 +428,180 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			shared.Graph = parent.Graph
 		}
 	}
+	strictLBServiceID, strictVIPPortID := strictProvidedResourcePolicies(svc, shared)
 	cmpStart := time.Now()
-	stackResult, err := lbaasdeploy.NewFromRaw(r.cmp, r.defaultVPCID).EnsureStack(ctx, lbaasdeploy.StackEnsureRequest{Stack: stack, Current: shared})
+	stackResult, err := lbaasdeploy.NewFromRaw(r.cmp, r.defaultVPCID).EnsureStack(ctx, lbaasdeploy.StackEnsureRequest{
+		Stack:                       stack,
+		Current:                     shared,
+		StrictLBServiceID:           strictLBServiceID,
+		StrictVIPPortID:             strictVIPPortID,
+		RecoverVirtualServersByName: true,
+		LBReadyHook: func(observed model.ObservedState) error {
+			return r.persistLBCheckpoint(ctx, svc, observed, strictLBServiceID)
+		},
+	})
 	if err != nil {
-		f5metrics.CMPAPICallDuration.WithLabelValues("svc-lb-bridge", "EnsureLB").Observe(time.Since(cmpStart).Seconds())
-		f5metrics.CMPAPICallsTotal.WithLabelValues("svc-lb-bridge", "EnsureLB", "error").Inc()
-		f5metrics.ReconcileErrorsTotal.WithLabelValues("svc-lb-bridge").Inc()
-		if rle, ok := f5client.IsRateLimited(err); ok {
-			r.Recorder.Eventf(svc, corev1.EventTypeWarning, "RateLimited", "CMP API rate limited; retrying after %s", rle.RetryAfter)
-			return ctrl.Result{RequeueAfter: rle.RetryAfter}, nil
+		f5metrics.CMPAPICallDuration.
+			WithLabelValues("svc-lb-bridge", "EnsureLB").
+			Observe(time.Since(cmpStart).Seconds())
+
+		f5metrics.CMPAPICallsTotal.
+			WithLabelValues("svc-lb-bridge", "EnsureLB", "error").
+			Inc()
+
+		f5metrics.ReconcileErrorsTotal.
+			WithLabelValues("svc-lb-bridge").
+			Inc()
+
+		if terminal, ok := lbaasdeploy.IsTerminalProvisioning(err); ok && terminal.ResourceType == "LBService" {
+			failedID := strings.TrimSpace(terminal.ResourceID)
+			if strictLBServiceID {
+				r.Recorder.Eventf(
+					svc,
+					corev1.EventTypeWarning,
+					"ProvidedLBTerminalFailed",
+					"Provided LBService %s is in terminal state (status=%s detail=%s). User action required; controller will not recreate it.",
+					failedID,
+					terminal.Status,
+					terminal.Detail,
+				)
+				log.Info(
+					"provided LBService is in terminal failed state; stopping periodic retries until spec/annotation change",
+					"lbServiceID", failedID,
+					"status", terminal.Status,
+					"detail", terminal.Detail,
+				)
+				return ctrl.Result{}, nil
+			}
+
+			repairID, repairAttempts := managedLBRepairState(svc.Annotations)
+			if failedID != "" && repairID != failedID {
+				repairAttempts = 0
+			}
+			if repairAttempts >= maxManagedLBRepairAttempts {
+				r.Recorder.Eventf(
+					svc,
+					corev1.EventTypeWarning,
+					"ManagedLBTerminalFailed",
+					"Managed LBService %s remains in terminal state after %d repair attempts (status=%s detail=%s). User action required.",
+					failedID,
+					repairAttempts,
+					terminal.Status,
+					terminal.Detail,
+				)
+				log.Info(
+					"managed LBService reached terminal failure retry limit; stopping periodic retries until change",
+					"lbServiceID", failedID,
+					"attempts", repairAttempts,
+				)
+				return ctrl.Result{}, nil
+			}
+
+			if err := r.bumpManagedLBRepairState(ctx, svc, failedID, repairAttempts+1); err != nil {
+				return ctrl.Result{}, err
+			}
+
+			const retryAfter = 45 * time.Second
+			r.Recorder.Eventf(
+				svc,
+				corev1.EventTypeWarning,
+				"ManagedLBRepairRetry",
+				"Managed LBService %s is terminal (status=%s detail=%s). Auto-repair attempt %d/%d; retrying after %s.",
+				failedID,
+				terminal.Status,
+				terminal.Detail,
+				repairAttempts+1,
+				maxManagedLBRepairAttempts,
+				retryAfter,
+			)
+			return ctrl.Result{RequeueAfter: retryAfter}, nil
 		}
-		r.Recorder.Eventf(svc, corev1.EventTypeWarning, "SyncLoadBalancerFailed", "Error ensuring CMP LBaaS resource graph: %v", err)
-		return ctrl.Result{}, err
+
+		// CMP explicitly returned 429. Honour Retry-After.
+		if rle, ok := f5client.IsRateLimited(err); ok {
+			retryAfter := rle.RetryAfter
+
+			if retryAfter <= 0 {
+				retryAfter = 2 * time.Minute
+			}
+
+			r.Recorder.Eventf(
+				svc,
+				corev1.EventTypeWarning,
+				"RateLimited",
+				"CMP API rate limited; retrying after %s",
+				retryAfter,
+			)
+
+			log.Error(
+				err,
+				"CMP API rate limited",
+				"retryAfter",
+				retryAfter,
+			)
+
+			return ctrl.Result{
+				RequeueAfter: retryAfter,
+			}, nil
+		}
+
+		if pending, ok := lbaasdeploy.IsProvisioningPending(err); ok {
+			const retryAfter = 15 * time.Second
+
+			r.Recorder.Eventf(
+				svc,
+				corev1.EventTypeNormal,
+				"ProvisioningPending",
+				"%s %s still provisioning (status=%s detail=%s); retrying after %s",
+				pending.ResourceType,
+				pending.ResourceID,
+				pending.Status,
+				pending.Detail,
+				retryAfter,
+			)
+
+			log.Info(
+				"CMP resource still provisioning",
+				"resourceType", pending.ResourceType,
+				"resourceID", pending.ResourceID,
+				"status", pending.Status,
+				"detail", pending.Detail,
+				"retryAfter", retryAfter,
+			)
+
+			return ctrl.Result{RequeueAfter: retryAfter}, nil
+		}
+
+		// For other CMP failures, avoid returning the raw error because that lets
+		// controller-runtime schedule repeated error retries. Retry at a controlled
+		// interval instead.
+		const retryAfter = 2 * time.Minute
+
+		r.Recorder.Eventf(
+			svc,
+			corev1.EventTypeWarning,
+			"SyncLoadBalancerFailed",
+			"Error ensuring CMP LBaaS resource graph; retrying after %s: %v",
+			retryAfter,
+			err,
+		)
+
+		log.Error(
+			err,
+			"CMP LBaaS reconciliation failed",
+			"retryAfter",
+			retryAfter,
+		)
+
+		return ctrl.Result{
+			RequeueAfter: retryAfter,
+		}, nil
 	}
 	shared = stackResult.Observed
 	vip := shared.VIPAddress
 	portObserved := make(map[string]servicePortObserved, len(stack.Ports))
 	for _, port := range stack.Ports {
-		vs := shared.Graph.VirtualServers[desiredVirtualServerName(svc, port.FrontendPort)]
+		vs := shared.Graph.VirtualServers[r.desiredVirtualServerName(svc, port.FrontendPort)]
 		portObserved[servicePortKey(port)] = servicePortObserved{
 			VirtualServerID: vs.ExternalID, VirtualServerName: vs.Name,
 			BackendHash: lbaasdeploy.DesiredBackendHash(port.FrontendPort, port.NodePort, port.Backends),
@@ -427,10 +625,26 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if svc.Annotations == nil {
 		svc.Annotations = map[string]string{}
 	}
+	delete(svc.Annotations, annManagedLBRepairID)
+	delete(svc.Annotations, annManagedLBRepairs)
 	svc.Annotations[annLBServiceID] = lastIDs.LBServiceID
 	svc.Annotations[annVIPPortID] = lastIDs.VIPPortID
 	// Preserve legacy values for existing consumers while persisting every listener.
 	svc.Annotations[annVirtualServerID] = lastIDs.VirtualServerID
+	if strings.TrimSpace(svc.Annotations[annLBServiceIDMode]) == "" {
+		if strictLBServiceID {
+			svc.Annotations[annLBServiceIDMode] = idModeProvided
+		} else if strings.TrimSpace(lastIDs.LBServiceID) != "" {
+			svc.Annotations[annLBServiceIDMode] = idModeManaged
+		}
+	}
+	if strings.TrimSpace(svc.Annotations[annVIPPortIDMode]) == "" {
+		if strictVIPPortID {
+			svc.Annotations[annVIPPortIDMode] = idModeProvided
+		} else if strings.TrimSpace(lastIDs.VIPPortID) != "" {
+			svc.Annotations[annVIPPortIDMode] = idModeManaged
+		}
+	}
 	if vip != "" {
 		svc.Annotations[annVIPAddress] = vip
 	}
@@ -463,45 +677,6 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	return ctrl.Result{}, nil
-}
-
-func (r *serviceReconciler) ensureCMPResourcesWithCurrent(ctx context.Context, svc *corev1.Service, frontendPort, nodePort int32, backends []backendNode, protocol string, cfg lbServiceConfig, current model.ObservedState, currentHash string) (*f5client.CMPResourceIDs, model.ObservedState, string, error) {
-
-	members := make([]model.BackendMember, 0, len(backends))
-	for _, backend := range backends {
-		members = append(members, model.BackendMember{IP: backend.IP, Port: nodePort, Weight: backend.Weight})
-	}
-
-	vs := model.VirtualServer{
-		Name:             desiredVirtualServerName(svc, frontendPort),
-		FrontendPort:     frontendPort,
-		BackendNodePort:  nodePort,
-		Protocol:         protocol,
-		RoutingAlgorithm: cfg.RoutingAlgorithm,
-		PersistenceType:  cfg.PersistenceType,
-		DrainingTimeout:  cfg.DrainingTimeout,
-		SourceRanges:     append([]string(nil), cfg.SourceRanges...),
-		Monitor:          &model.Monitor{Type: cfg.HealthType, Path: cfg.HealthPath, Interval: cfg.HealthInterval},
-	}
-	result, err := lbaasdeploy.NewFromRaw(r.cmp, r.defaultVPCID).Ensure(ctx, lbaasdeploy.EnsureRequest{
-		LBName:                  desiredLBServiceName(svc),
-		LBDescription:           fmt.Sprintf("App LB for %s/%s", svc.Namespace, svc.Name),
-		VirtualServer:           vs,
-		Backends:                members,
-		Current:                 current,
-		CurrentHash:             currentHash,
-		RecreateWhenHashMissing: true,
-	})
-	if err != nil {
-		return nil, current, "", err
-	}
-	ids := &f5client.CMPResourceIDs{
-		LBServiceID:       result.Observed.LBServiceID,
-		VIPPortID:         result.Observed.VIPPortID,
-		VirtualServerID:   result.Observed.VirtualServerID,
-		VirtualServerName: result.Observed.VirtualServerName,
-	}
-	return ids, result.Observed, result.BackendHash, nil
 }
 
 type servicePortObserved struct {
@@ -557,24 +732,37 @@ func writeObservedGraph(annotations map[string]string, graph model.ObservedGraph
 	return nil
 }
 
-func desiredLBServiceName(svc *corev1.Service) string {
-	var name string
+func (r *serviceReconciler) desiredLBServiceName(svc *corev1.Service) string {
+	raw := fmt.Sprintf(
+		"%s/%s/%s",
+		r.shootNamespace,
+		svc.Namespace,
+		svc.Name,
+	)
 
-	if g := strings.TrimSpace(svc.Annotations[annVIPGroup]); g != "" {
-		name = sanitizeKey(fmt.Sprintf("app-group-%s-%s", svc.Namespace, g))
-	} else {
-		name = sanitizeKey(fmt.Sprintf("app-%s-%s", svc.Namespace, svc.Name))
-	}
-
-	if len(name) > 20 {
-		name = name[:20]
-	}
-
-	return name
+	return deterministicLBName(raw)
 }
 
-func desiredVirtualServerName(svc *corev1.Service, frontendPort int32) string {
-	return sanitizeKey(fmt.Sprintf("app-vs-%s-%s-%d", svc.Namespace, svc.Name, frontendPort))
+func (r *serviceReconciler) desiredVirtualServerName(svc *corev1.Service, frontendPort int32) string {
+	raw := fmt.Sprintf(
+		"%s/%s/%s/%d",
+		r.shootNamespace,
+		svc.Namespace,
+		svc.Name,
+		frontendPort,
+	)
+
+	return deterministicVSName(raw)
+}
+
+func deterministicLBName(identity string) string {
+	sum := sha256.Sum256([]byte(identity))
+	return "app-" + hex.EncodeToString(sum[:])[:12]
+}
+
+func deterministicVSName(identity string) string {
+	sum := sha256.Sum256([]byte(identity))
+	return "app-vs-" + hex.EncodeToString(sum[:])[:12]
 }
 
 func listManagedServiceRequests(ctx context.Context, c client.Client) []reconcile.Request {
@@ -607,8 +795,12 @@ func (r *serviceReconciler) cleanupCMPResources(ctx context.Context, svc *corev1
 	// its recorded scalar resources; it never falls back to names or all VIPs.
 	observed.EnsureGraph()
 	shared := r.isLBServiceShared(ctx, svc, observed.LBServiceID)
+	lbProvided := strings.EqualFold(strings.TrimSpace(svc.Annotations[annLBServiceIDMode]), idModeProvided)
+	vipProvided := strings.EqualFold(strings.TrimSpace(svc.Annotations[annVIPPortIDMode]), idModeProvided)
 	_, err := lbaasdeploy.NewFromRaw(r.cmp, r.defaultVPCID).CleanupStack(ctx, lbaasdeploy.CleanupRequest{
-		Current: observed, DeleteVIP: !shared, DeleteLBService: !shared,
+		Current:         observed,
+		DeleteVIP:       !shared && !vipProvided,
+		DeleteLBService: !shared && !lbProvided,
 	})
 	return err
 }
@@ -720,4 +912,103 @@ func envOrDefault(key, def string) string {
 		return def
 	}
 	return v
+}
+
+func managedLBRepairState(annotations map[string]string) (string, int) {
+	if annotations == nil {
+		return "", 0
+	}
+	repairID := strings.TrimSpace(annotations[annManagedLBRepairID])
+	raw := strings.TrimSpace(annotations[annManagedLBRepairs])
+	if raw == "" {
+		return repairID, 0
+	}
+	parsed, err := strconv.Atoi(raw)
+	if err != nil || parsed < 0 {
+		return repairID, 0
+	}
+	return repairID, parsed
+}
+
+func (r *serviceReconciler) bumpManagedLBRepairState(ctx context.Context, svc *corev1.Service, lbID string, attempts int) error {
+	base := svc.DeepCopy()
+	if svc.Annotations == nil {
+		svc.Annotations = map[string]string{}
+	}
+	svc.Annotations[annManagedLBRepairID] = strings.TrimSpace(lbID)
+	svc.Annotations[annManagedLBRepairs] = strconv.Itoa(attempts)
+	return r.Patch(ctx, svc, client.MergeFrom(base))
+}
+
+func (r *serviceReconciler) persistLBCheckpoint(ctx context.Context, svc *corev1.Service, observed model.ObservedState, strictLBServiceID bool) error {
+	lbID := strings.TrimSpace(observed.LBServiceID)
+	if lbID == "" {
+		return nil
+	}
+
+	base := svc.DeepCopy()
+	if svc.Annotations == nil {
+		svc.Annotations = map[string]string{}
+	}
+	svc.Annotations[annLBServiceID] = lbID
+	if strings.TrimSpace(svc.Annotations[annLBServiceIDMode]) == "" {
+		if strictLBServiceID {
+			svc.Annotations[annLBServiceIDMode] = idModeProvided
+		} else {
+			svc.Annotations[annLBServiceIDMode] = idModeManaged
+		}
+	}
+	if err := writeObservedGraph(svc.Annotations, observed.Graph); err != nil {
+		return err
+	}
+	return r.Patch(ctx, svc, client.MergeFrom(base))
+}
+
+func strictProvidedResourcePolicies(svc *corev1.Service, observed model.ObservedState) (bool, bool) {
+	if svc == nil {
+		return false, false
+	}
+	lbMode := strings.ToLower(strings.TrimSpace(svc.Annotations[annLBServiceIDMode]))
+	vipMode := strings.ToLower(strings.TrimSpace(svc.Annotations[annVIPPortIDMode]))
+	if lbMode == idModeProvided && vipMode == idModeProvided {
+		return true, true
+	}
+	if lbMode == idModeProvided && vipMode != idModeProvided {
+		return true, false
+	}
+	if vipMode == idModeProvided && lbMode != idModeProvided {
+		return false, true
+	}
+	hasLBID := strings.TrimSpace(svc.Annotations[annLBServiceID]) != ""
+	hasVIPID := strings.TrimSpace(svc.Annotations[annVIPPortID]) != ""
+	if !hasLBID && !hasVIPID {
+		return false, false
+	}
+
+	ownedLB := false
+	ownedVIP := false
+	for _, lb := range observed.Graph.LBServices {
+		if resourceOwnedByService(lb, svc) {
+			ownedLB = true
+			break
+		}
+	}
+	for _, vip := range observed.Graph.VIPs {
+		if resourceOwnedByService(vip, svc) {
+			ownedVIP = true
+			break
+		}
+	}
+	return hasLBID && !ownedLB, hasVIPID && !ownedVIP
+}
+
+func resourceOwnedByService(resource model.ObservedResource, svc *corev1.Service) bool {
+	own := resource.Ownership
+	if own.SourceKind != "Service" || own.SourceNamespace != svc.Namespace || own.SourceName != svc.Name {
+		return false
+	}
+	if own.SourceUID != "" && own.SourceUID != string(svc.UID) {
+		return false
+	}
+	return true
 }

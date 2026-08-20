@@ -50,16 +50,24 @@ spec:
                   type: integer
                   format: int32
                   minimum: 1
-                credentialsSecretRef:
-                  type: object
-                  required:
-                    - name
-                    - namespace
-                  properties:
-                    name:
-                      type: string
-                    namespace:
-                      type: string
+                enablePerShootControlPlaneVIP:
+                  type: boolean
+
+                region:
+                  type: string
+                  minLength: 1
+
+                routingAlgorithm:
+                  type: string
+
+                monitorInterval:
+                  type: integer
+                  format: int32
+                  minimum: 1
+
+                credentialsReferenceName:
+                  type: string
+                  minLength: 1
                 controlPlaneVIP:
                   type: string
                 controlPlaneReady:

@@ -3,12 +3,16 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/url"
 	"strings"
 	"testing"
 	"time"
 
+	lbannotations "github.com/gardener/gardener-extension-f5/pkg/annotations"
 	f5client "github.com/gardener/gardener-extension-f5/pkg/f5"
+	"github.com/gardener/gardener-extension-f5/pkg/model"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -24,21 +28,24 @@ import (
 )
 
 type stubCMP struct {
-	createLBN      int
-	listLBN        int
-	createVN       int
-	listVIPN       int
-	createVSN      int
-	listVSN        int
-	deleteVSN      int
-	deleteVN       int
-	deleteLBN      int
-	searchN        int
-	lastVSQ        url.Values
-	createCertN    int
-	lastCertQ      url.Values
-	attachCertN    int
-	attachedCertID string
+	createLBN           int
+	listLBN             int
+	createVN            int
+	listVIPN            int
+	createVSN           int
+	listVSN             int
+	deleteVSN           int
+	deleteVN            int
+	deleteLBN           int
+	searchN             int
+	lastVSQ             url.Values
+	createCertN         int
+	lastCertQ           url.Values
+	attachCertN         int
+	attachedCertID      string
+	lastVIPListSubnet   string
+	lastVIPCreateSubnet string
+	vipCreateErr        error
 
 	// Optional canned responses for list calls.
 	lbServices []json.RawMessage
@@ -61,14 +68,29 @@ func (s *stubCMP) DeleteLBService(_ context.Context, _ string) error {
 	s.deleteLBN++
 	return nil
 }
-func (s *stubCMP) CreateLBServiceVIP(_ context.Context, _ string) (json.RawMessage, error) {
+
+func (s *stubCMP) GetLBService(
+	_ context.Context,
+	id string,
+) (json.RawMessage, error) {
+	return json.RawMessage(
+		fmt.Sprintf(`{"id":%q,"name":"test-lb"}`, id),
+	), nil
+}
+
+func (s *stubCMP) CreateLBServiceVIP(_ context.Context, _, subnetID string) (json.RawMessage, error) {
+	if s.vipCreateErr != nil {
+		return nil, s.vipCreateErr
+	}
 	s.createVN++
+	s.lastVIPCreateSubnet = strings.TrimSpace(subnetID)
 	created := json.RawMessage(`{"id":101,"ip_address":"10.0.0.10"}`)
 	s.vips = append(s.vips, created)
 	return created, nil
 }
-func (s *stubCMP) GetLBServiceVIPs(_ context.Context, _ string) ([]json.RawMessage, error) {
+func (s *stubCMP) GetLBServiceVIPs(_ context.Context, _, subnetID string) ([]json.RawMessage, error) {
 	s.listVIPN++
+	s.lastVIPListSubnet = strings.TrimSpace(subnetID)
 	return append([]json.RawMessage(nil), s.vips...), nil
 }
 func (s *stubCMP) DeleteLBServiceVIP(_ context.Context, _, _ string) error {
@@ -115,6 +137,9 @@ func (s *stubCMP) AttachLBVirtualServerCertificate(_ context.Context, _, _, cert
 }
 func (s *stubCMP) DetachLBVirtualServerCertificate(context.Context, string, string, string) error {
 	return nil
+}
+func (s *stubCMP) GetCompute(_ context.Context, id string) (json.RawMessage, error) {
+	return json.RawMessage(`{"id":"` + id + `","vpc_id":"vpc-1","network_id":"subnet-service","ports":[{"id":5001,"fixed_ips":[{"ip_address":"172.18.0.10"}],"network_id":"subnet-service","device_id":"` + id + `","device_type":"compute"}]}`), nil
 }
 func (s *stubCMP) ListLBVirtualServerPools(_ context.Context, _, _ string) ([]json.RawMessage, error) {
 	return nil, nil
@@ -163,6 +188,7 @@ func newTestReconciler(t *testing.T, objs ...client.Object) (*serviceReconciler,
 		cmp:               stub,
 		loadBalancerClass: defaultLBClass,
 		Recorder:          record.NewFakeRecorder(10),
+		shootNamespace:    "shoot-test",
 	}
 	return r, c, stub
 }
@@ -170,7 +196,13 @@ func newTestReconciler(t *testing.T, objs ...client.Object) (*serviceReconciler,
 func TestReconcile_AllocatesVIPAndProgramsCMPVirtualServer(t *testing.T) {
 	ctx := context.Background()
 
-	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "web", Namespace: "ns"}}
+	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{
+		Name:      "web",
+		Namespace: "ns",
+		Annotations: map[string]string{
+			lbannotations.SubnetID: "subnet-service",
+		},
+	}}
 	svc.Spec.Type = corev1.ServiceTypeLoadBalancer
 	svc.Spec.Ports = []corev1.ServicePort{{Port: 8080, NodePort: 30080}}
 	svc.Spec.LoadBalancerClass = ptr.To(defaultLBClass)
@@ -189,20 +221,23 @@ func TestReconcile_AllocatesVIPAndProgramsCMPVirtualServer(t *testing.T) {
 		t.Fatalf("Reconcile: %v", err)
 	}
 
-	if stub.listLBN != 1 {
-		t.Fatalf("expected ListLBServices called once, got %d", stub.listLBN)
+	if stub.listLBN != 0 {
+		t.Fatalf("expected no ListLBServices call on initial create, got %d", stub.listLBN)
 	}
 	if stub.createLBN != 1 {
 		t.Fatalf("expected CreateLBService called once, got %d", stub.createLBN)
 	}
-	if stub.listVIPN != 1 {
-		t.Fatalf("expected GetLBServiceVIPs called once, got %d", stub.listVIPN)
+	if stub.listVIPN != 0 {
+		t.Fatalf("expected no GetLBServiceVIPs call before fresh VIP create, got %d", stub.listVIPN)
 	}
 	if stub.createVN != 1 {
 		t.Fatalf("expected CreateLBServiceVIP called once, got %d", stub.createVN)
 	}
-	if stub.listVSN != 1 {
-		t.Fatalf("expected ListLBVirtualServers called once, got %d", stub.listVSN)
+	if stub.lastVIPCreateSubnet != "subnet-service" {
+		t.Fatalf("expected VIP create subnet %q, got %q", "subnet-service", stub.lastVIPCreateSubnet)
+	}
+	if stub.listVSN != 2 {
+		t.Fatalf("expected ListLBVirtualServers called twice (recovery + ensure), got %d", stub.listVSN)
 	}
 	if stub.createVSN != 1 {
 		t.Fatalf("expected CreateLBVirtualServer called once, got %d", stub.createVSN)
@@ -249,8 +284,18 @@ func TestReconcile_AllocatesVIPAndProgramsCMPVirtualServer(t *testing.T) {
 		t.Fatalf("expected lb-service-id annotation, got %q", gotSvc.Annotations[annLBServiceID])
 	}
 	graph, ok := readObservedGraph(gotSvc.Annotations)
-	if !ok || graph.LBServices["app-ns-web"].ExternalID != "lb-001" || graph.VirtualServers["app-vs-ns-web-8080"].ExternalID != "vs-001" {
+	lbFound := false
+	for _, lb := range graph.LBServices {
+		if lb.ExternalID == "lb-001" {
+			lbFound = true
+			break
+		}
+	}
+	if !ok || !lbFound || graph.VirtualServers[r.desiredVirtualServerName(svc, 8080)].ExternalID != "vs-001" {
 		t.Fatalf("expected complete observed graph annotation, got %#v", graph)
+	}
+	if got := strings.TrimSpace(stub.lastVSQ.Get("name")); got != r.desiredVirtualServerName(svc, 8080) {
+		t.Fatalf("expected shoot-aware VS name %q, got %q", r.desiredVirtualServerName(svc, 8080), got)
 	}
 	if gotSvc.Annotations[annVIPAddress] != "10.0.0.10" {
 		t.Fatalf("expected vip-address annotation, got %q", gotSvc.Annotations[annVIPAddress])
@@ -263,6 +308,48 @@ func TestReconcile_AllocatesVIPAndProgramsCMPVirtualServer(t *testing.T) {
 	}
 	if len(gotSvc.Status.LoadBalancer.Ingress) != 1 || gotSvc.Status.LoadBalancer.Ingress[0].IP != "10.0.0.10" {
 		t.Fatalf("expected service status vip, got %#v", gotSvc.Status.LoadBalancer.Ingress)
+	}
+}
+
+func TestStrictProvidedResourcePolicies_StickyProvidedModes(t *testing.T) {
+	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{
+		Name:      "web",
+		Namespace: "ns",
+		UID:       "uid-1",
+		Annotations: map[string]string{
+			annLBServiceID:     "lb-1",
+			annVIPPortID:       "vip-1",
+			annLBServiceIDMode: idModeProvided,
+			annVIPPortIDMode:   idModeProvided,
+		},
+	}}
+	observed := model.ObservedState{Graph: model.NewObservedGraph()}
+	observed.Graph.LBServices["lb"] = model.ObservedResource{ExternalID: "lb-1", Ownership: model.Ownership{SourceKind: "Service", SourceNamespace: "ns", SourceName: "web", SourceUID: "uid-1"}}
+	observed.Graph.VIPs["vip"] = model.ObservedResource{ExternalID: "vip-1", Ownership: model.Ownership{SourceKind: "Service", SourceNamespace: "ns", SourceName: "web", SourceUID: "uid-1"}}
+
+	strictLB, strictVIP := strictProvidedResourcePolicies(svc, observed)
+	if !strictLB || !strictVIP {
+		t.Fatalf("expected sticky strict mode for provided IDs, got lb=%t vip=%t", strictLB, strictVIP)
+	}
+}
+
+func TestStrictProvidedResourcePolicies_LegacyFallbackWhenOwned(t *testing.T) {
+	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{
+		Name:      "web",
+		Namespace: "ns",
+		UID:       "uid-1",
+		Annotations: map[string]string{
+			annLBServiceID: "lb-1",
+			annVIPPortID:   "vip-1",
+		},
+	}}
+	observed := model.ObservedState{Graph: model.NewObservedGraph()}
+	observed.Graph.LBServices["lb"] = model.ObservedResource{ExternalID: "lb-1", Ownership: model.Ownership{SourceKind: "Service", SourceNamespace: "ns", SourceName: "web", SourceUID: "uid-1"}}
+	observed.Graph.VIPs["vip"] = model.ObservedResource{ExternalID: "vip-1", Ownership: model.Ownership{SourceKind: "Service", SourceNamespace: "ns", SourceName: "web", SourceUID: "uid-1"}}
+
+	strictLB, strictVIP := strictProvidedResourcePolicies(svc, observed)
+	if strictLB || strictVIP {
+		t.Fatalf("expected managed fallback mode when ownership is ours, got lb=%t vip=%t", strictLB, strictVIP)
 	}
 }
 
@@ -433,6 +520,87 @@ func TestReconcile_DeleteCleansCMPResources(t *testing.T) {
 	}
 }
 
+func TestReconcile_DeleteDoesNotDeleteProvidedLBAndVIP(t *testing.T) {
+	ctx := context.Background()
+	now := metav1.NewTime(time.Now())
+	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{
+		Name:              "web",
+		Namespace:         "ns",
+		Finalizers:        []string{finalizerName},
+		DeletionTimestamp: &now,
+		Annotations: map[string]string{
+			annLBServiceID:     "lb-001",
+			annVIPPortID:       "vip-001",
+			annVirtualServerID: "vs-001",
+			annLBServiceIDMode: idModeProvided,
+			annVIPPortIDMode:   idModeProvided,
+		},
+	}}
+
+	r, _, stub := newTestReconciler(t, svc)
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(svc)}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if stub.deleteVSN != 1 || stub.deleteVN != 0 || stub.deleteLBN != 0 {
+		t.Fatalf("expected only VS delete for provided LB/VIP, got vs=%d vip=%d lb=%d", stub.deleteVSN, stub.deleteVN, stub.deleteLBN)
+	}
+}
+
+func TestReconcile_DeleteKeepsProvidedLBDeletesManagedVIP(t *testing.T) {
+	ctx := context.Background()
+	now := metav1.NewTime(time.Now())
+	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{
+		Name:              "web",
+		Namespace:         "ns",
+		Finalizers:        []string{finalizerName},
+		DeletionTimestamp: &now,
+		Annotations: map[string]string{
+			annLBServiceID:     "lb-001",
+			annVIPPortID:       "vip-001",
+			annVirtualServerID: "vs-001",
+			annLBServiceIDMode: idModeProvided,
+			annVIPPortIDMode:   idModeManaged,
+		},
+	}}
+
+	r, _, stub := newTestReconciler(t, svc)
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(svc)}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if stub.deleteVSN != 1 || stub.deleteVN != 1 || stub.deleteLBN != 0 {
+		t.Fatalf("expected VS+VIP delete and LB preserve for provided LB, got vs=%d vip=%d lb=%d", stub.deleteVSN, stub.deleteVN, stub.deleteLBN)
+	}
+}
+
+func TestReconcile_PersistsLBCheckpointBeforeVIPAndVS(t *testing.T) {
+	ctx := context.Background()
+	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "web", Namespace: "ns"}}
+	svc.Spec.Type = corev1.ServiceTypeLoadBalancer
+	svc.Spec.Ports = []corev1.ServicePort{{Port: 8080, NodePort: 30080}}
+	svc.Spec.LoadBalancerClass = ptr.To(defaultLBClass)
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n1"}}
+	node.Status.Addresses = []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "172.18.0.10"}}
+	node.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}
+
+	r, c, stub := newTestReconciler(t, svc, node)
+	stub.vipCreateErr = errors.New("vip create failed")
+
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(svc)}); err != nil {
+		t.Fatalf("Reconcile should requeue on ensure error without returning error, got: %v", err)
+	}
+
+	got := &corev1.Service{}
+	if err := c.Get(ctx, client.ObjectKeyFromObject(svc), got); err != nil {
+		t.Fatalf("get svc: %v", err)
+	}
+	if got.Annotations[annLBServiceID] != "lb-001" {
+		t.Fatalf("expected LB checkpoint annotation to be persisted, got %q", got.Annotations[annLBServiceID])
+	}
+	if graph, ok := readObservedGraph(got.Annotations); !ok || len(graph.LBServices) == 0 {
+		t.Fatalf("expected observed graph with LB checkpoint, got %#v", graph)
+	}
+}
+
 // Ensure we don't use the f5client import only in non-test code.
 var _ = f5client.CMPResourceIDs{}
 
@@ -476,7 +644,7 @@ func TestReconcile_VIPGroupBootstrapsSharedParentWithoutSibling(t *testing.T) {
 		Name:      "grouped",
 		Namespace: "ns",
 		Annotations: map[string]string{
-			annVIPGroup: "shared-apps",
+			lbannotations.VIPGroup: "shared-apps",
 		},
 	}}
 	svc.Spec.Type = corev1.ServiceTypeLoadBalancer

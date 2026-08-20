@@ -37,16 +37,9 @@ spec:
                   type: string
                 tenantOrPartition:
                   type: string
-                credentialsSecretRef:
-                  type: object
-                  required:
-                    - name
-                    - namespace
-                  properties:
-                    name:
-                      type: string
-                    namespace:
-                      type: string
+                credentialsReferenceName:
+                  type: string
+                  minLength: 1
                 controlPlaneVIP:
                   type: string
                 controlPlaneReady:

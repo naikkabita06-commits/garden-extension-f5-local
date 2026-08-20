@@ -3,10 +3,12 @@ package lbaas
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"strconv"
 	"strings"
 	"testing"
 
+	f5client "github.com/gardener/gardener-extension-f5/pkg/f5"
 	"github.com/gardener/gardener-extension-f5/pkg/model"
 )
 
@@ -35,7 +37,9 @@ func (s *stubCertificateClient) BindCertificate(_ context.Context, _ string, vir
 	s.bindings = append(s.bindings, certificateBinding{virtualServerID: virtualServerID, certificateID: certificateID})
 	return nil
 }
-func (s *stubCertificateClient) UnbindCertificate(context.Context, string, string, string) error { return nil }
+func (s *stubCertificateClient) UnbindCertificate(context.Context, string, string, string) error {
+	return nil
+}
 
 type stubClient struct {
 	lbServices         []LBService
@@ -47,30 +51,63 @@ type stubClient struct {
 	createdVIP         int
 	createdVS          int
 	createdVSResult    *VirtualServer
+	lastVIPSubnet      string
 	deletedVS          int
 	deletedVIP         int
 	deletedLB          int
 	searchedIP         []string
 	searchNetworkPorts func(string) []NetworkPort
+	computes           map[string]Compute
 }
 
-func (s *stubClient) ListLBServices(context.Context) ([]LBService, error) {
+func (s *stubClient) ListLBServices(
+	_ context.Context,
+	_ *f5client.ListLoadBalancersOptions,
+) ([]LBService, error) {
 	return append([]LBService(nil), s.lbServices...), nil
 }
 func (s *stubClient) CreateLBService(_ context.Context, spec LBServiceSpec) (LBService, error) {
 	s.createdLB++
 	s.lastLBSpec = spec
-	return LBService{ID: "lb-1", Name: spec.Name}, nil
+	created := LBService{ID: "lb-1", Name: spec.Name, Status: "Active", OperatingStatus: "Ready"}
+	s.lbServices = append(s.lbServices, created)
+	return created, nil
 }
-func (s *stubClient) DeleteLBService(context.Context, string) error {
+func (s *stubClient) DeleteLBService(_ context.Context, id string) error {
 	s.deletedLB++
+	id = strings.TrimSpace(id)
+	for i := range s.lbServices {
+		if strings.TrimSpace(s.lbServices[i].ID) == id {
+			s.lbServices = append(s.lbServices[:i], s.lbServices[i+1:]...)
+			break
+		}
+	}
 	return nil
 }
-func (s *stubClient) ListVIPs(context.Context, string) ([]VIP, error) {
+
+func (s *stubClient) GetLBService(
+	_ context.Context,
+	id string,
+) (LBService, error) {
+	for _, svc := range s.lbServices {
+		if strings.TrimSpace(svc.ID) == strings.TrimSpace(id) {
+			return svc, nil
+		}
+	}
+
+	return LBService{}, &f5client.HTTPStatusError{
+		StatusCode: http.StatusNotFound,
+		Status:     "404 Not Found",
+	}
+}
+
+func (s *stubClient) ListVIPs(_ context.Context, _, subnetID string) ([]VIP, error) {
+	s.lastVIPSubnet = strings.TrimSpace(subnetID)
 	return append([]VIP(nil), s.vips...), nil
 }
-func (s *stubClient) CreateVIP(context.Context, string) (VIP, error) {
+func (s *stubClient) CreateVIP(_ context.Context, _, subnetID string) (VIP, error) {
 	s.createdVIP++
+	s.lastVIPSubnet = strings.TrimSpace(subnetID)
 	return VIP{ID: "7", Address: "10.0.0.7"}, nil
 }
 func (s *stubClient) DeleteVIP(context.Context, string, string) error {
@@ -98,6 +135,15 @@ func (s *stubClient) SearchNetworkPortsByIP(_ context.Context, ip string) ([]Net
 		return s.searchNetworkPorts(ip), nil
 	}
 	return []NetworkPort{{ID: len(s.searchedIP), ResourceID: "compute-" + ip, ResourceType: "compute", IP: ip}}, nil
+}
+
+func (s *stubClient) GetCompute(_ context.Context, id string) (Compute, error) {
+	if s.computes != nil {
+		if compute, ok := s.computes[id]; ok {
+			return compute, nil
+		}
+	}
+	return Compute{ID: id, VPCID: "vpc-1", NetworkID: "net-1", Ports: []ComputePort{{ID: 5001, IP: "10.0.0.1", NetworkID: "net-1", DeviceID: id, DeviceType: "compute"}}}, nil
 }
 
 func TestEnsureCreatesLBVIPAndVirtualServer(t *testing.T) {
@@ -394,12 +440,48 @@ func TestEnsureRejectsVirtualServerCreateWithoutProviderID(t *testing.T) {
 	}
 }
 
+func TestEnsureUsesComputeDetailsWhenBackendHasComputeID(t *testing.T) {
+	stub := &stubClient{computes: map[string]Compute{
+		"compute-1": {ID: "compute-1", VPCID: "vpc-1", NetworkID: "net-1", Ports: []ComputePort{{ID: 38135, IP: "10.10.1.145", NetworkID: "net-1", DeviceID: "compute-1", DeviceType: "compute"}}},
+	}}
+	_, err := New(stub, "vpc-1").Ensure(context.Background(), EnsureRequest{
+		LBName:        "lb",
+		NetworkID:     "net-1",
+		VirtualServer: model.VirtualServer{Name: "vs", FrontendPort: 80, BackendNodePort: 30080, Protocol: "HTTP", RoutingAlgorithm: "round_robin"},
+		Backends:      []model.BackendMember{{ComputeID: "compute-1", IP: "10.10.1.145", Port: 30080, Weight: 1}},
+	})
+	if err != nil {
+		t.Fatalf("Ensure failed: %v", err)
+	}
+	if len(stub.lastVSSpec.Nodes) != 1 || stub.lastVSSpec.Nodes[0].ResourceID != "compute-1" || stub.lastVSSpec.Nodes[0].BackendPortID != 38135 {
+		t.Fatalf("expected compute-backed node spec, got %#v", stub.lastVSSpec.Nodes)
+	}
+	if len(stub.searchedIP) != 0 {
+		t.Fatalf("expected no IP search when compute ID is available, searched=%v", stub.searchedIP)
+	}
+}
+
+func TestEnsureRejectsComputeSubnetMismatch(t *testing.T) {
+	stub := &stubClient{computes: map[string]Compute{
+		"compute-1": {ID: "compute-1", VPCID: "vpc-1", NetworkID: "other-net", Ports: []ComputePort{{ID: 38135, IP: "10.10.1.145", NetworkID: "other-net", DeviceID: "compute-1", DeviceType: "compute"}}},
+	}}
+	_, err := New(stub, "vpc-1").Ensure(context.Background(), EnsureRequest{
+		LBName:        "lb",
+		NetworkID:     "net-1",
+		VirtualServer: model.VirtualServer{Name: "vs", FrontendPort: 80, BackendNodePort: 30080, Protocol: "HTTP", RoutingAlgorithm: "round_robin"},
+		Backends:      []model.BackendMember{{ComputeID: "compute-1", IP: "10.10.1.145", Port: 30080, Weight: 1}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "subnet") {
+		t.Fatalf("expected subnet mismatch error, got %v", err)
+	}
+}
+
 func TestEnsureStackBindsCertificatesToHTTPSVirtualServers(t *testing.T) {
 	certClient := &stubCertificateClient{}
 	deployer := NewWithResourceManagers(&stubClient{}, "", nil, nil, nil, certClient)
 	_, err := deployer.EnsureStack(context.Background(), StackEnsureRequest{Stack: &model.LoadBalancerStack{
-		LBService: model.LBService{Name: "lb"},
-		VIP:       model.VIP{Name: "vip"},
+		LBService:      model.LBService{Name: "lb"},
+		VIP:            model.VIP{Name: "vip"},
 		VirtualServers: []model.VirtualServer{{Name: "https-vs", FrontendPort: 443, BackendNodePort: 30443, Protocol: "HTTPS"}},
 		Certificates:   []model.Certificate{{Name: "tls", SecretName: "tls-secret"}},
 	}})
@@ -418,5 +500,46 @@ func TestEnsureStackRejectsCertificatesUntilCertificateManagerExists(t *testing.
 	_, err := New(&stubClient{}, "").EnsureStack(context.Background(), StackEnsureRequest{Stack: &model.LoadBalancerStack{VirtualServers: []model.VirtualServer{{Name: "vs"}}, Certificates: []model.Certificate{{Name: "tls"}}}})
 	if err == nil || !strings.Contains(err.Error(), "CertificateManager") {
 		t.Fatalf("expected certificate manager error, got %v", err)
+	}
+}
+
+func TestEnsureStackRecoversVIPByRecoveredVirtualServerAddress(t *testing.T) {
+	stub := &stubClient{
+		lbServices: []LBService{{ID: "lb-1", Name: "lb"}},
+		vips: []VIP{
+			{ID: "28684", Address: "10.1.1.128"},
+			{ID: "33672", Address: "10.1.0.17"},
+		},
+		vsList: []VirtualServer{{
+			ID:         "vs-1",
+			Name:       "app-vs-a81",
+			VIPAddress: "10.1.1.128",
+		}},
+	}
+
+	stack := &model.LoadBalancerStack{
+		LBService: model.LBService{Name: "lb"},
+		VIP:       model.VIP{Name: "vip"},
+		VirtualServers: []model.VirtualServer{{
+			Name:            "app-vs-a81",
+			FrontendPort:    8080,
+			BackendNodePort: 30080,
+			Protocol:        "HTTP",
+		}},
+	}
+
+	result, err := New(stub, "").EnsureStack(context.Background(), StackEnsureRequest{
+		Stack:                       stack,
+		Current:                     model.ObservedState{LBServiceID: "lb-1"},
+		RecoverVirtualServersByName: true,
+	})
+	if err != nil {
+		t.Fatalf("EnsureStack: %v", err)
+	}
+	if result.Observed.VIPPortID != "28684" || result.Observed.VIPAddress != "10.1.1.128" {
+		t.Fatalf("expected recovered VIP from VS address, got id=%q ip=%q", result.Observed.VIPPortID, result.Observed.VIPAddress)
+	}
+	if stub.createdVIP != 0 {
+		t.Fatalf("expected no VIP create when resolved by recovered VS address, got %d", stub.createdVIP)
 	}
 }

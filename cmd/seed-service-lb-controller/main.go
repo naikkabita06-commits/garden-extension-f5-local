@@ -153,6 +153,7 @@ type config struct {
 	CMPEndpoint       string
 	OrganisationName  string
 	ProjectID         string
+	Region            string
 	CeAuth            string
 	LoadBalancerClass string
 	FlavorID          int32
@@ -179,6 +180,11 @@ func loadConfigFromEnv() (*config, error) {
 		return nil, fmt.Errorf("CMP_PROJECT_ID must be set")
 	}
 
+	region := strings.TrimSpace(os.Getenv("CMP_REGION"))
+	if region == "" {
+		return nil, fmt.Errorf("CMP_REGION must be set")
+	}
+
 	lbClass := strings.TrimSpace(os.Getenv("F5_SEED_LB_LOADBALANCER_CLASS"))
 	if lbClass == "" {
 		lbClass = defaultLBClass
@@ -196,6 +202,7 @@ func loadConfigFromEnv() (*config, error) {
 		CMPEndpoint:       endpoint,
 		OrganisationName:  orgName,
 		ProjectID:         projectID,
+		Region:            region,
 		CeAuth:            ceAuth,
 		LoadBalancerClass: lbClass,
 		FlavorID:          flavorID,
@@ -212,7 +219,7 @@ func newReconciler(c client.Client, scheme *runtime.Scheme) (*serviceReconciler,
 	}
 
 	log := ctrl.Log.WithName("seed-service-lb")
-	cmpClient, err := f5client.NewClientWithCeAuth(log, cfg.CMPEndpoint, cfg.OrganisationName, cfg.ProjectID, cfg.CeAuth)
+	cmpClient, err := f5client.NewClientWithCeAuth(log, cfg.CMPEndpoint, cfg.OrganisationName, cfg.ProjectID, cfg.Region, cfg.CeAuth)
 	if err != nil {
 		return nil, fmt.Errorf("creating CMP client: %w", err)
 	}

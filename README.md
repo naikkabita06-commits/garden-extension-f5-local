@@ -37,6 +37,9 @@ It covers:
 
 ## Configure a Shoot (extension resource)
 
+make IMAGE_PREFIX=registry.local.gardener.cloud:5001/extensions \
+     EFFECTIVE_VERSION=v0.1.0-dev-711344dc170c20fb732f3db79a44f5d331187c8a \
+     gen-controllerdeployment
 Example extension resource:
 
 ```yaml

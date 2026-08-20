@@ -1,24 +1,45 @@
-# Service type=LoadBalancer demo runbook
+# Service type=LoadBalancer demo runbook (Cases 1-3)
 
-This demo uses four Deployments and four `type: LoadBalancer` Services. It does not create any Ingress resources.
+This runbook demonstrates only the finalized provisioning cases:
 
-## What the current code can demonstrate
+- Case 1: no LB ID, no VIP ID (controller creates/reconciles all resources).
+- Case 2: LB ID supplied, VIP ID not supplied (controller must use that LB, then create/recover VIP/VS).
+- Case 3: LB ID and VIP ID supplied (controller must use exactly those resources).
 
-| Comparison | LBService | VIP | Virtual Server |
-|---|---|---|---|
-| `app-a-svc` vs `app-b-svc` | Different | Different | Different |
-| `app-c-svc` vs `app-d-svc` | Same | Same | Different |
+Old vip-group sharing scenarios were removed from this demo on purpose.
 
-The requested case **same LBService, different VIP, different VS** is not available through the current Service annotations/code. The existing `vip-group` mechanism reuses both `LBServiceID` and `VIPPortID`. Supporting that case requires a separate LB-sharing concept, such as `lb-group`, which shares only the LBService ID while allowing each Service to allocate its own VIP.
+echo $IMAGE_TAG                                                                                
+v0.1.0-dev-gardener-1.139.2-fix1
+ docker build  -t europe-docker.pkg.dev/gardener-project/public/gardener/extensions/f5:${IMAGE_TAG} . 
 
-## 0. Set the Shoot kubeconfig
+docker tag \
+europe-docker.pkg.dev/gardener-project/public/gardener/extensions/f5:${IMAGE_TAG} \
+  registry.local.gardener.cloud:5001/extensions/f5:${IMAGE_TAG}
+
+docker push registry.local.gardener.cloud:5001/extensions/f5:${IMAGE_TAG}
+
+IMAGE_REPOSITORY=registry.local.gardener.cloud:5001/extensions/f5 IMAGE_TAG="${IMAGE_TAG}" OUTPUT=deploy/garden/controllerdeployment-f5.yaml bash scripts/generate-controllerdeployment-f5.sh
+
+ControllerDeployment     ← you apply
+ControllerRegistration   ← you apply
+        ↓
+Gardener controller-manager
+        ↓
+ControllerInstallation   ← Gardener manages this
+        ↓
+extension deployed into Seed
+
+
+./hack/usage/generate-admin-kubeconf.sh > /tmp/shoot-local.kubeconfig
+export SHOOT_KC=/tmp/shoot-local.kubeconfig
+## 0. Environment
 
 ```bash
 export SHOOT_KC=/tmp/shoot-local.kubeconfig
 export NS=demo-svc-lb
 ```
 
-## 1. Pre-check the bridge and configuration
+## 1. Pre-check bridge and CMP defaults
 
 ```bash
 kubectl --kubeconfig "$SHOOT_KC" -n f5-cis-system get pod
@@ -28,196 +49,170 @@ kubectl --kubeconfig "$SHOOT_KC" -n f5-cis-system get deploy f5-svc-lb-bridge \
   | grep -E '^CMP_(ENDPOINT|VPC_ID|VPC_NAME|NETWORK_ID|LB_FLAVOR_ID)='
 ```
 
-Confirm the five CMP values are non-empty.
-
-Confirm the Shoot worker node InternalIP values:
+Confirm worker InternalIP values are visible and routable in CMP:
 
 ```bash
 kubectl --kubeconfig "$SHOOT_KC" get nodes \
   -o 'custom-columns=NAME:.metadata.name,INTERNAL-IP:.status.addresses[?(@.type=="InternalIP")].address'
-  ```
+```
 
-CMP must be able to resolve these node IPs to compute/network ports. Otherwise LBService/VIP creation may succeed but VS backend creation will fail.
-
-## 2. Save the manifest locally
+## 2. Apply base resources (namespace, deployments, Case 1 service)
 
 Use `demo-svc-lb-current-code.yaml`.
 
-## 3. Create the namespace and four applications only
-
 ```bash
-kubectl --kubeconfig "$SHOOT_KC" apply -f demo-svc-lb-current-code.yaml \
-  --prune=false \
-  --selector='!demo-step'
-```
-
-Because Kubernetes selectors on a multi-document file can be easy to misread, verify what was created:
-
-```bash
-kubectl --kubeconfig "$SHOOT_KC" -n "$NS" get deploy,pod
+kubectl --kubeconfig "$SHOOT_KC" apply -f demo-svc-lb-current-code.yaml
 kubectl --kubeconfig "$SHOOT_KC" -n "$NS" wait \
-  --for=condition=Available deploy/app-a deploy/app-b deploy/app-c deploy/app-d \
+  --for=condition=Available deploy/app-a deploy/app-b deploy/app-c \
   --timeout=180s
-```
+``` /dc.
 
-If the namespace was skipped by your `kubectl` version, create it once and rerun:
+## 3. Case 1 verification (no supplied IDs)
 
-```bash
-kubectl --kubeconfig "$SHOOT_KC" create namespace "$NS"
-```
-
-## 4. Scenario 1 — different LB, different VIP, different VS
-
-Apply the two standalone Services:
+Watch Case 1 service:
 
 ```bash
-kubectl --kubeconfig "$SHOOT_KC" apply -f demo-svc-lb-current-code.yaml \
-  --selector='demo-step=standalone'
+kubectl --kubeconfig "$SHOOT_KC" -n "$NS" get svc app-a-svc -w
 ```
 
-Watch both Services:
+Expected:
+
+- Service leaves `<pending>`.
+- Controller annotations are populated:
+  - `f5.extensions.gardener.cloud/lb-service-id`
+  - `f5.extensions.gardener.cloud/vip-port-id`
+  - `f5.extensions.gardener.cloud/observed-graph`
+
+Capture IDs for Cases 2 and 3:
+
+```bash
+export CASE1_LB_ID=$(kubectl --kubeconfig "$SHOOT_KC" -n "$NS" get svc app-a-svc -o jsonpath='{.metadata.annotations.f5\.extensions\.gardener\.cloud/lb-service-id}')
+export CASE1_VIP_ID=$(kubectl --kubeconfig "$SHOOT_KC" -n "$NS" get svc app-a-svc -o jsonpath='{.metadata.annotations.f5\.extensions\.gardener\.cloud/vip-port-id}')
+export CASE1_VIP_IP=$(kubectl --kubeconfig "$SHOOT_KC" -n "$NS" get svc app-a-svc -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+
+echo "LB=$CASE1_LB_ID VIP_ID=$CASE1_VIP_ID VIP_IP=$CASE1_VIP_IP"
+```
+
+## 4. Case 2 (supplied LB, no supplied VIP)
+
+Create `app-b-svc` with only supplied LB ID. This enforces strict LB identity and allows VIP allocation under that LB.
+
+```bash
+cat <<EOF | kubectl --kubeconfig "$SHOOT_KC" apply -f -
+apiVersion: v1
+kind: Service
+metadata:
+  name: app-b-svc
+  namespace: ${NS}
+  annotations:
+    f5.extensions.gardener.cloud/lb-service-id: "${CASE1_LB_ID}"
+    f5.extensions.gardener.cloud/lb-service-id-mode: "provided"
+spec:
+  type: LoadBalancer
+  loadBalancerClass: f5.extensions.gardener.cloud/bigip
+  selector:
+    app: app-b
+  ports:
+    - name: http
+      protocol: TCP
+      port: 8081
+      targetPort: 5678
+EOF
+```
+
+Watch and verify:
 
 ```bash
 kubectl --kubeconfig "$SHOOT_KC" -n "$NS" get svc app-a-svc app-b-svc -w
+kubectl --kubeconfig "$SHOOT_KC" -n "$NS" get svc app-b-svc -o yaml
 ```
 
 Expected:
 
-- Both Services leave `<pending>`.
-- Their external IPs are different.
-- CMP shows two LBServices and two VS objects.
+- `app-b-svc` succeeds using supplied LB.
+- `app-b-svc` gets its own VIP (typically different from `app-a-svc`).
 
-Inspect the bridge:
+## 5. Case 3 (supplied LB and supplied VIP)
+
+Create `app-c-svc` with both LB ID and VIP ID from Case 1.
 
 ```bash
-kubectl --kubeconfig "$SHOOT_KC" -n f5-cis-system \
-  logs deploy/f5-svc-lb-bridge -f
+cat <<EOF | kubectl --kubeconfig "$SHOOT_KC" apply -f -
+apiVersion: v1
+kind: Service
+metadata:
+  name: app-c-svc
+  namespace: ${NS}
+  annotations:
+    f5.extensions.gardener.cloud/lb-service-id: "${CASE1_LB_ID}"
+    f5.extensions.gardener.cloud/lb-service-id-mode: "provided"
+    f5.extensions.gardener.cloud/vip-port-id: "${CASE1_VIP_ID}"
+    f5.extensions.gardener.cloud/vip-port-id-mode: "provided"
+spec:
+  type: LoadBalancer
+  loadBalancerClass: f5.extensions.gardener.cloud/bigip
+  selector:
+    app: app-c
+  ports:
+    - name: http
+      protocol: TCP
+      port: 9090
+      targetPort: 5678
+EOF
 ```
 
-Inspect Service state and controller annotations:
+Watch and verify:
 
 ```bash
-kubectl --kubeconfig "$SHOOT_KC" -n "$NS" get svc app-a-svc app-b-svc -o yaml
-```
-
-Quick VIP comparison:
-
-```bash
-kubectl --kubeconfig "$SHOOT_KC" -n "$NS" get svc app-a-svc app-b-svc \
-  -o custom-columns=NAME:.metadata.name,VIP:.status.loadBalancer.ingress[0].ip,PORT:.spec.ports[0].port,NODEPORT:.spec.ports[0].nodePort
-```
-
-## 5. Scenario 3 parent — create the shared LB/VIP first
-
-Apply only `app-c-svc`:
-
-```bash
-kubectl --kubeconfig "$SHOOT_KC" apply -f demo-svc-lb-current-code.yaml \
-  --selector='demo-step=shared-parent'
-```
-
-Wait until it has an external IP:
-
-```bash
-kubectl --kubeconfig "$SHOOT_KC" -n "$NS" get svc app-c-svc -w
-```
-
-Do not create `app-d-svc` until `app-c-svc` has:
-
-- an external IP, and
-- the bridge's observed-state annotation.
-
-Check:
-
-```bash
-kubectl --kubeconfig "$SHOOT_KC" -n "$NS" get svc app-c-svc \
-  -o jsonpath='{.metadata.annotations.f5\.extensions\.gardener\.cloud/observed-graph}{"\n"}'
-```
-
-## 6. Scenario 3 child — same LB, same VIP, different VS
-
-Apply `app-d-svc`:
-
-```bash
-kubectl --kubeconfig "$SHOOT_KC" apply -f demo-svc-lb-current-code.yaml \
-  --selector='demo-step=shared-child'
-```
-
-Watch both shared Services:
-
-```bash
-kubectl --kubeconfig "$SHOOT_KC" -n "$NS" get svc app-c-svc app-d-svc -w
-```
-
-Expected:
-
-- `app-c-svc` and `app-d-svc` show the same external IP.
-- They use different frontend ports: `9090` and `7070`.
-- CMP shows one shared LBService, one shared VIP, and two different VS listeners.
-
-Show all four:
-
-```bash
+kubectl --kubeconfig "$SHOOT_KC" -n "$NS" get svc app-a-svc app-c-svc -w
 kubectl --kubeconfig "$SHOOT_KC" -n "$NS" get svc \
   -o custom-columns=NAME:.metadata.name,VIP:.status.loadBalancer.ingress[0].ip,PORT:.spec.ports[0].port,NODEPORT:.spec.ports[0].nodePort
 ```
 
-## 7. Functional traffic test
+Expected:
+
+- `app-c-svc` uses the supplied LB and supplied VIP.
+- `app-c-svc` VIP equals `app-a-svc` VIP (`CASE1_VIP_IP`).
+- Frontend ports differ (`8080` vs `9090`), so VS listeners are distinct.
+
+## 6. Functional traffic test
 
 ```bash
 VIP_A=$(kubectl --kubeconfig "$SHOOT_KC" -n "$NS" get svc app-a-svc -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
 VIP_B=$(kubectl --kubeconfig "$SHOOT_KC" -n "$NS" get svc app-b-svc -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
-VIP_SHARED=$(kubectl --kubeconfig "$SHOOT_KC" -n "$NS" get svc app-c-svc -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+VIP_C=$(kubectl --kubeconfig "$SHOOT_KC" -n "$NS" get svc app-c-svc -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
 
 curl -v --connect-timeout 10 "http://${VIP_A}:8080/"
 curl -v --connect-timeout 10 "http://${VIP_B}:8081/"
-curl -v --connect-timeout 10 "http://${VIP_SHARED}:9090/"
-curl -v --connect-timeout 10 "http://${VIP_SHARED}:7070/"
+curl -v --connect-timeout 10 "http://${VIP_C}:9090/"
 ```
 
-Each response should identify the corresponding `whoami` pod.
+Expected:
 
-## 8. Failure diagnosis
+- Responses come from app-a/app-b/app-c respectively.
+- `VIP_A == VIP_C` for Case 3.
 
-Events:
+## 7. Failure diagnosis
 
 ```bash
-kubectl --kubeconfig "$SHOOT_KC" -n "$NS" describe svc app-a-svc
 kubectl --kubeconfig "$SHOOT_KC" -n "$NS" get events --sort-by=.lastTimestamp
-```
-
-Bridge errors:
-
-```bash
-kubectl --kubeconfig "$SHOOT_KC" -n f5-cis-system \
-  logs deploy/f5-svc-lb-bridge --since=10m | grep -iE 'error|fail|forbidden|401|400|network port|backend'
+kubectl --kubeconfig "$SHOOT_KC" -n f5-cis-system logs deploy/f5-svc-lb-bridge --since=10m \
+  | grep -iE 'error|fail|forbidden|401|403|400|network port|backend|BackendNodePortRequired'
 ```
 
 Common interpretation:
 
-- `no CMP network port found for backend IP`: worker node is not registered/mappable in CMP.
-- `401` or `403`: CMP credential/token problem.
-- `400`: inspect CMP response; typically a missing or rejected VPC/network/flavor field.
-- `BackendNodePortRequired`: wait for Kubernetes to allocate the NodePort and let reconciliation retry.
-- Service remains `<pending>`: inspect Service events and the bridge log together.
+- `no CMP network port found for backend IP`: node/network mapping issue in CMP.
+- `401` or `403`: CMP credential/token issue.
+- `400`: invalid or rejected CMP request field.
+- `BackendNodePortRequired`: wait for NodePort assignment and retry.
 
-## 9. Cleanup
+## 8. Cleanup
 
-Delete the Services first so the bridge finalizers can remove CMP objects:
-
-```bash
-kubectl --kubeconfig "$SHOOT_KC" -n "$NS" delete svc \
-  app-d-svc app-c-svc app-b-svc app-a-svc
-```
-
-Wait until all Services are gone:
+Delete services first, then namespace:
 
 ```bash
+kubectl --kubeconfig "$SHOOT_KC" -n "$NS" delete svc app-c-svc app-b-svc app-a-svc
 kubectl --kubeconfig "$SHOOT_KC" -n "$NS" get svc
-```
-
-Then delete the namespace:
-
-```bash
 kubectl --kubeconfig "$SHOOT_KC" delete namespace "$NS"
 ```

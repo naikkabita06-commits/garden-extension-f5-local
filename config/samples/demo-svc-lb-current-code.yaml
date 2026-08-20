@@ -1,12 +1,12 @@
-# Service type=LoadBalancer demo for the CURRENT svc-lb-bridge implementation.
+# Service type=LoadBalancer demo for CURRENT svc-lb-bridge behavior.
 #
-# IMPORTANT:
-# - This manifest contains four applications.
-# - Apply the Service objects in the order documented in the runbook.
-# - Current code supports:
-#     A/B: separate LBService + separate VIP + separate VS
-#     C/D: same LBService + same VIP + separate VS
-# - Current code does NOT support same LBService + different VIPs for different Services.
+# This manifest intentionally includes only stable base resources:
+# - namespace
+# - app-a/app-b/app-c deployments
+# - case 1 service (no provided IDs)
+#
+# Cases 2 and 3 require runtime-provided annotations (LB/VIP IDs), so they are
+# created in the runbook using kubectl apply -f - with shell variables.
 
 apiVersion: v1
 kind: Namespace
@@ -82,37 +82,46 @@ spec:
             - name: http
               containerPort: 5678
 ---
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: app-d
-  namespace: demo-svc-lb
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: app-d
-  template:
-    metadata:
-      labels:
-        app: app-d
-    spec:
-      containers:
-        - name: whoami
-          image: traefik/whoami:v1.10.2
-          args: ["--port=5678"]
-          ports:
-            - name: http
-              containerPort: 5678
----
-# Scenario 1, service A: dedicated LBService, VIP and VS.
+# Case 1 baseline service:
+# - no lb-service-id annotation
+# - no vip-port-id annotation
+# Expected: create/recover LB -> VIP -> VS via normal reconcile flow.
+# apiVersion: v1
+# kind: Service
+# metadata:
+#   name: app-a-svc
+#   namespace: demo-svc-lb
+#   labels:
+#     demo-step: case1
+# spec:
+#   type: LoadBalancer
+#   loadBalancerClass: f5.extensions.gardener.cloud/bigip
+#   selector:
+#     app: app-a
+#   ports:
+#     - name: http
+#       protocol: TCP
+#       port: 8080
+#       targetPort: 5678
+
+# Case 2 baseline service:
+# - existing lb-service-id annotation
+# - existing vip-port-id annotation
+# Expected: create/recover LB -> VIP -> VS via normal reconcile flow.
+
+
 apiVersion: v1
 kind: Service
 metadata:
-  name: app-a-svc
+  name: app-a-existing-lb-svc
   namespace: demo-svc-lb
   labels:
-    demo-step: standalone
+    demo-step: case-2
+  annotations:
+    f5.extensions.gardener.cloud/lb-service-id: "1aad8686-6588-40f9-9586-7801fa5302ef"
+    f5.extensions.gardener.cloud/lb-service-id-mode: "provided"
+    f5.extensions.gardener.cloud/vip-port-id: "36944"
+    f5.extensions.gardener.cloud/vip-port-id-mode: "provided"
 spec:
   type: LoadBalancer
   loadBalancerClass: f5.extensions.gardener.cloud/bigip
@@ -122,68 +131,4 @@ spec:
     - name: http
       protocol: TCP
       port: 8080
-      targetPort: 5678
----
-# Scenario 1, service B: another dedicated LBService, VIP and VS.
-# Comparing A and B demonstrates different LB, different VIP and different VS.
-apiVersion: v1
-kind: Service
-metadata:
-  name: app-b-svc
-  namespace: demo-svc-lb
-  labels:
-    demo-step: standalone
-spec:
-  type: LoadBalancer
-  loadBalancerClass: f5.extensions.gardener.cloud/bigip
-  selector:
-    app: app-b
-  ports:
-    - name: http
-      protocol: TCP
-      port: 8081
-      targetPort: 5678
----
-# Scenario 3 parent: first member of demo-blue.
-# It creates the group's LBService, VIP and its own VS.
-apiVersion: v1
-kind: Service
-metadata:
-  name: app-c-svc
-  namespace: demo-svc-lb
-  labels:
-    demo-step: shared-parent
-  annotations:
-    f5.extensions.gardener.cloud/vip-group: demo-blue
-spec:
-  type: LoadBalancer
-  loadBalancerClass: f5.extensions.gardener.cloud/bigip
-  selector:
-    app: app-c
-  ports:
-    - name: http
-      protocol: TCP
-      port: 9090
-      targetPort: 5678
----
-# Scenario 3 child: same vip-group as app-c.
-# It reuses the group's LBService and VIP, but creates a different VS.
-apiVersion: v1
-kind: Service
-metadata:
-  name: app-d-svc
-  namespace: demo-svc-lb
-  labels:
-    demo-step: shared-child
-  annotations:
-    f5.extensions.gardener.cloud/vip-group: demo-blue
-spec:
-  type: LoadBalancer
-  loadBalancerClass: f5.extensions.gardener.cloud/bigip
-  selector:
-    app: app-d
-  ports:
-    - name: http
-      protocol: TCP
-      port: 7070
       targetPort: 5678
