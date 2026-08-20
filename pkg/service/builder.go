@@ -70,7 +70,7 @@ func BuildLoadBalancerStackWithPortBackends(svc *corev1.Service, cfg lbannotatio
 			PersistenceType:  cfg.PersistenceType,
 			DrainingTimeout:  cfg.DrainingTimeout,
 			SourceRanges:     append([]string(nil), cfg.SourceRanges...),
-			Monitor:          &model.Monitor{Name: safeName("mon-" + PoolName(svc, p.Port)), Type: cfg.HealthType, Path: cfg.HealthPath, Interval: cfg.HealthInterval, Port: cfg.HealthPort, Timeout: cfg.HealthTimeout},
+			Monitor:          &model.Monitor{Name: MonitorName(svc, p.Port), Type: cfg.HealthType, Path: cfg.HealthPath, Interval: cfg.HealthInterval, Port: cfg.HealthPort, Timeout: cfg.HealthTimeout},
 			Ownership:        model.OwnershipFor(owner, "", "virtual-server", ""),
 		}
 		pool := model.Pool{Name: PoolName(svc, p.Port), Monitor: vs.Monitor, Ownership: model.OwnershipFor(owner, "", "pool", VIPGroup(svc))}
@@ -103,13 +103,13 @@ func VIPName(svc *corev1.Service) string {
 	if group := VIPGroup(svc); group != "" {
 		return limitedSafeName(
 			fmt.Sprintf("app-vip-group-%s-%s", svc.Namespace, group),
-			maxLBServiceNameLength,
+			maxCMPResourceNameLength,
 		)
 	}
 
 	return limitedSafeName(
 		fmt.Sprintf("app-vip-%s-%s", svc.Namespace, svc.Name),
-		maxLBServiceNameLength,
+		maxCMPResourceNameLength,
 	)
 }
 
@@ -117,17 +117,36 @@ func VirtualServerName(svc *corev1.Service, frontendPort int32) string {
 	if svc == nil {
 		return ""
 	}
-	return safeName(fmt.Sprintf("app-vs-%s-%s-%d", svc.Namespace, svc.Name, frontendPort))
+	return limitedSafeName(
+		fmt.Sprintf("app-vs-%s-%s-%d", svc.Namespace, svc.Name, frontendPort),
+		maxCMPResourceNameLength,
+	)
 }
 
 func PoolName(svc *corev1.Service, frontendPort int32) string {
 	if svc == nil {
 		return ""
 	}
-	return safeName(fmt.Sprintf("app-pool-%s-%s-%d", svc.Namespace, svc.Name, frontendPort))
+	return limitedSafeName(
+		fmt.Sprintf("app-pool-%s-%s-%d", svc.Namespace, svc.Name, frontendPort),
+		maxCMPResourceNameLength,
+	)
 }
 
-const maxLBServiceNameLength = 20
+func MonitorName(svc *corev1.Service, frontendPort int32) string {
+	if svc == nil {
+		return ""
+	}
+	return limitedSafeName(
+		fmt.Sprintf("mon-app-pool-%s-%s-%d", svc.Namespace, svc.Name, frontendPort),
+		maxCMPResourceNameLength,
+	)
+}
+
+// CMP rejects resource names longer than 20 characters. Every generated CMP
+// resource name uses the same limit and the same deterministic hash suffix so
+// truncation never silently collapses distinct Kubernetes resources.
+const maxCMPResourceNameLength = 20
 
 // LBServiceName deterministically identifies the parent LBService. Services in
 // the same VIP group deliberately share this parent, while all child resources
@@ -156,7 +175,7 @@ func LBServiceName(svc *corev1.Service) string {
 		)
 	}
 
-	return limitedSafeName(name, maxLBServiceNameLength)
+	return limitedSafeName(name, maxCMPResourceNameLength)
 }
 
 func limitedSafeName(name string, maxLength int) string {

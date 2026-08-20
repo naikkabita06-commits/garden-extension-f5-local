@@ -87,3 +87,67 @@ func TestBuildLoadBalancerStackRequiresNodePort(t *testing.T) {
 		t.Fatalf("expected BackendNodePortRequired, got %v", err)
 	}
 }
+
+func TestGeneratedCMPResourceNamesRespectLimitAndRemainUnique(t *testing.T) {
+	serviceA := &corev1.Service{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "customer-namespace-with-a-long-name",
+		Name:      "application-service-with-a-long-name-a",
+	}}
+	serviceB := serviceA.DeepCopy()
+	serviceB.Name = "application-service-with-a-long-name-b"
+
+	namesA := []string{
+		LBServiceName(serviceA),
+		VIPName(serviceA),
+		VirtualServerName(serviceA, 8080),
+		PoolName(serviceA, 8080),
+		MonitorName(serviceA, 8080),
+	}
+	namesB := []string{
+		LBServiceName(serviceB),
+		VIPName(serviceB),
+		VirtualServerName(serviceB, 8080),
+		PoolName(serviceB, 8080),
+		MonitorName(serviceB, 8080),
+	}
+
+	for i := range namesA {
+		if len(namesA[i]) > maxCMPResourceNameLength {
+			t.Fatalf("generated name %q exceeds CMP limit %d", namesA[i], maxCMPResourceNameLength)
+		}
+		if namesA[i] == namesB[i] {
+			t.Fatalf("distinct Services produced the same truncated name %q at index %d", namesA[i], i)
+		}
+		if namesA[i] != []string{
+			LBServiceName(serviceA),
+			VIPName(serviceA),
+			VirtualServerName(serviceA, 8080),
+			PoolName(serviceA, 8080),
+			MonitorName(serviceA, 8080),
+		}[i] {
+			t.Fatalf("name generation is not deterministic at index %d", i)
+		}
+	}
+}
+
+func TestGeneratedCMPResourceNamesDifferentPortsRemainUnique(t *testing.T) {
+	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "customer-namespace-with-a-long-name",
+		Name:      "application-service-with-a-long-name",
+	}}
+
+	for _, nameForPort := range []func(*corev1.Service, int32) string{
+		VirtualServerName,
+		PoolName,
+		MonitorName,
+	} {
+		name8080 := nameForPort(svc, 8080)
+		name8443 := nameForPort(svc, 8443)
+		if len(name8080) > maxCMPResourceNameLength || len(name8443) > maxCMPResourceNameLength {
+			t.Fatalf("port-derived names exceed CMP limit: %q %q", name8080, name8443)
+		}
+		if name8080 == name8443 {
+			t.Fatalf("different frontend ports produced the same name %q", name8080)
+		}
+	}
+}
