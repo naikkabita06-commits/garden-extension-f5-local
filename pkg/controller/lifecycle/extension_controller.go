@@ -2,12 +2,16 @@ package lifecycle
 
 import (
 	"context"
+	"reflect"
+	"strings"
 
 	"github.com/go-logr/logr"
 
 	extensioncontroller "github.com/gardener/gardener/extensions/pkg/controller/extension"
 	extensionsv1alpha1 "github.com/gardener/gardener/pkg/apis/extensions/v1alpha1"
 
+	controller "github.com/gardener/gardener/extensions/pkg/controller"
+	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	f5v1alpha1 "github.com/gardener/gardener-extension-f5/pkg/apis/f5/v1alpha1"
 
 	corev1 "k8s.io/api/core/v1"
@@ -17,9 +21,12 @@ import (
 	"k8s.io/client-go/tools/record"
 
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
@@ -29,6 +36,7 @@ const (
 	finalizerName                  = "extensions.gardener.cloud/f5"
 	controllerName                 = "f5-extension-controller"
 	gardenerOperationAnnotationKey = "gardener.cloud/operation"
+	gardenerTimestampAnnotationKey = "gardener.cloud/timestamp"
 )
 
 func clearGardenerOperationAnnotation(ann map[string]string) bool {
@@ -69,9 +77,69 @@ func AddToManager(mgr ctrl.Manager, log logr.Logger) error {
 	}
 
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&extensionsv1alpha1.Extension{}).
+		// Extension status updates are produced by this controller. Do not feed those
+		// updates back into Reconcile. Gardener operations are annotation driven, so
+		// operation annotation changes must still pass the filter even though they do
+		// not increment metadata.generation.
+		For(
+			&extensionsv1alpha1.Extension{},
+			builder.WithPredicates(extensionReconcilePredicate()),
+		).
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.mapSecretToExtensions)).
 		Complete(r)
+}
+
+// extensionReconcilePredicate accepts changes which can alter desired state and
+// rejects status-only/resourceVersion-only updates. Without this filter,
+// updateExtensionOutput updates Extension.status, which immediately re-enqueues
+// the same Extension and creates a hot reconciliation loop.
+func extensionReconcilePredicate() predicate.Predicate {
+	return predicate.Funcs{
+		CreateFunc: func(event.CreateEvent) bool { return true },
+		DeleteFunc: func(event.DeleteEvent) bool { return true },
+		GenericFunc: func(event.GenericEvent) bool { return true },
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldEx, oldOK := e.ObjectOld.(*extensionsv1alpha1.Extension)
+			newEx, newOK := e.ObjectNew.(*extensionsv1alpha1.Extension)
+			if !oldOK || !newOK {
+				return false
+			}
+
+			if oldEx.Generation != newEx.Generation {
+				return true
+			}
+			if !reflect.DeepEqual(oldEx.Finalizers, newEx.Finalizers) {
+				return true
+			}
+			if !reflect.DeepEqual(oldEx.DeletionTimestamp, newEx.DeletionTimestamp) {
+				return true
+			}
+
+			// A non-empty operation annotation is an explicit Gardener request.
+			// Do not accept the reverse transition: this controller clears the
+			// annotation after handling it, and reconciling that update would run
+			// the same operation twice.
+			if oldOperation, newOperation := operationAnnotation(oldEx), operationAnnotation(newEx); oldOperation != newOperation && newOperation != "" {
+				return true
+			}
+
+			// Gardenlet can request reconciliation by advancing only this
+			// timestamp. It does not necessarily change spec.generation or add an
+			// operation annotation, so it must be treated as desired-state input.
+			return annotationValue(oldEx, gardenerTimestampAnnotationKey) != annotationValue(newEx, gardenerTimestampAnnotationKey)
+		},
+	}
+}
+
+func operationAnnotation(ex *extensionsv1alpha1.Extension) string {
+	return annotationValue(ex, gardenerOperationAnnotationKey)
+}
+
+func annotationValue(ex *extensionsv1alpha1.Extension, key string) string {
+	if ex == nil || ex.Annotations == nil {
+		return ""
+	}
+	return ex.Annotations[key]
 }
 
 // mapSecretToExtensions maps a Secret change to the Extensions that reference it via their
@@ -93,9 +161,30 @@ func (r *ExtensionReconciler) mapSecretToExtensions(ctx context.Context, obj cli
 	var requests []reconcile.Request
 	for i := range cfgList.Items {
 		cfg := &cfgList.Items[i]
-		if cfg.Spec.CredentialsSecretRef != nil &&
-			cfg.Spec.CredentialsSecretRef.Name == secret.Name &&
-			(cfg.Spec.CredentialsSecretRef.Namespace == "" || cfg.Spec.CredentialsSecretRef.Namespace == secret.Namespace) {
+		 
+		referenceName := strings.TrimSpace(cfg.Spec.CredentialsReferenceName)
+		if referenceName == "" {
+	        continue
+       	}
+
+       ref := &autoscalingv1.CrossVersionObjectReference{
+	    APIVersion: "v1",
+	    Kind:       "Secret",
+	    Name:       referenceName,
+     	} 
+
+		resolved := &corev1.Secret{}
+		if err := controller.GetObjectByReference(
+			ctx,
+			r.Client,
+			ref,
+			cfg.Namespace,
+			resolved,
+		); err != nil {
+			continue
+		}
+
+		if resolved.Namespace == secret.Namespace && resolved.Name == secret.Name {
 			requests = append(requests, reconcile.Request{
 				NamespacedName: types.NamespacedName{
 					Namespace: cfg.Namespace,

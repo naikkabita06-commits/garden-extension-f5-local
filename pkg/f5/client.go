@@ -17,6 +17,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -133,8 +134,8 @@ type Client interface {
 	DeleteLBService(ctx context.Context, id string) error
 
 	// CMP LBaaS VIP (v2.1: /load-balancers/lb_service/{id}/vip)
-	CreateLBServiceVIP(ctx context.Context, lbServiceID string) (json.RawMessage, error)
-	GetLBServiceVIPs(ctx context.Context, lbServiceID string) ([]json.RawMessage, error)
+	CreateLBServiceVIP(ctx context.Context, lbServiceID, subnetID string) (json.RawMessage, error)
+	GetLBServiceVIPs(ctx context.Context, lbServiceID, subnetID string) ([]json.RawMessage, error)
 	DeleteLBServiceVIP(ctx context.Context, lbServiceID, vipID string) error
 
 	// CMP LBaaS Virtual Server (v2.1: /load-balancers/{lb_service_id}/virtual-servers)
@@ -150,7 +151,8 @@ type Client interface {
 	AttachLBVirtualServerCertificate(ctx context.Context, lbServiceID, virtualServerID, certificateID string) error
 	DetachLBVirtualServerCertificate(ctx context.Context, lbServiceID, virtualServerID, certificateID string) error
 
-	// CMP Network API (v2.1: /networks/ports/search-by-ip/)
+	// CMP Compute and Network API (v2.1)
+	GetCompute(ctx context.Context, id string) (json.RawMessage, error)
 	SearchNetworkPortsByIP(ctx context.Context, ip string) ([]json.RawMessage, error)
 
 	// CMP LBaaS Virtual Server Pools/Members (v2.1)
@@ -229,8 +231,13 @@ type client struct {
 
 	organisationName string
 	projectID        string
+	region           string
 	ceAuth           string
+	ceAuthAPIKeyID   string
+	ceAuthAPISecret  string
+	ceAuthValidity   time.Duration
 	extraHeaders     http.Header
+	ceAuthMutex      sync.RWMutex
 
 	// CMP LBaaS provisioning parameters (set via SetCMPLBaaSConfig).
 	cpFlavorID         int32
@@ -247,7 +254,8 @@ type client struct {
 	// rateLimiter caps the outbound CMP API request rate to avoid triggering
 	// HTTP 429 responses when many Shoots are reconciled simultaneously.
 	// Default: 10 requests/second with a burst of 20.
-	rateLimiter *rate.Limiter
+	rateLimiter  *rate.Limiter
+	requestSlots chan struct{}
 }
 
 func newHTTPClientFromEnv() *http.Client {
@@ -280,6 +288,33 @@ func newHTTPClientFromEnv() *http.Client {
 			return http.ErrUseLastResponse
 		},
 	}
+}
+
+func newCMPRequestSlots() chan struct{} {
+	return make(chan struct{}, 1)
+}
+
+func newCMPRateLimiter() *rate.Limiter {
+	return rate.NewLimiter(
+		rate.Every(5*time.Second),
+		1,
+	)
+}
+
+func (c *client) acquireRequestSlot(ctx context.Context) error {
+	select {
+	case c.requestSlots <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf(
+			"waiting for CMP request slot: %w",
+			ctx.Err(),
+		)
+	}
+}
+
+func (c *client) releaseRequestSlot() {
+	<-c.requestSlots
 }
 
 func parseEnvBool(key string) bool {
@@ -340,8 +375,12 @@ func (c *client) Probe(ctx context.Context) (*ProbeResult, error) {
 	}
 
 	req.Header.Set("Accept", "application/json")
-	if c.ceAuth != "" {
-		req.Header.Set("Ce-Auth", c.ceAuth)
+	if token := c.currentCeAuthToken(); token != "" {
+		req.Header.Set("Ce-Auth", token)
+	}
+
+	if c.region != "" {
+		req.Header.Set("ce-region", c.region)
 	}
 	if c.organisationName != "" {
 		req.Header.Set("organisation-name", c.organisationName)
@@ -384,6 +423,7 @@ func (c *client) Probe(ctx context.Context) (*ProbeResult, error) {
 //
 // This matches the Python implementation in scripts/cmp-ceauth.py.
 // The default validity is 299 seconds (~5 minutes).
+
 func GenerateCeAuthToken(apiKeyID, secretKey string, validity time.Duration) string {
 	if validity <= 0 {
 		validity = 299 * time.Second
@@ -394,6 +434,36 @@ func GenerateCeAuthToken(apiKeyID, secretKey string, validity time.Duration) str
 	mac.Write([]byte(input))
 	signature := hex.EncodeToString(mac.Sum(nil))
 	return fmt.Sprintf("%s.%d.%s", apiKeyID, expiryTimestamp, signature)
+}
+
+func (c *client) currentCeAuthToken() string {
+	c.ceAuthMutex.RLock()
+	defer c.ceAuthMutex.RUnlock()
+
+	return strings.TrimSpace(c.ceAuth)
+}
+
+func (c *client) refreshCeAuthToken() (string, error) {
+	apiKeyID := strings.TrimSpace(c.ceAuthAPIKeyID)
+	apiSecret := strings.TrimSpace(c.ceAuthAPISecret)
+
+	if apiKeyID == "" || apiSecret == "" {
+		return "", fmt.Errorf(
+			"cannot refresh Ce-Auth token: CMP API key ID or API secret is empty",
+		)
+	}
+
+	token := GenerateCeAuthToken(
+		apiKeyID,
+		apiSecret,
+		c.ceAuthValidity,
+	)
+
+	c.ceAuthMutex.Lock()
+	c.ceAuth = token
+	c.ceAuthMutex.Unlock()
+
+	return token, nil
 }
 
 // NewClient creates a new F5 client with the given connection details.
@@ -409,13 +479,14 @@ func NewClient(log logr.Logger, endpoint, partition string) (Client, error) {
 	endpoint = strings.TrimRight(endpoint, "/")
 
 	c := &client{
-		log:         log.WithValues("f5Endpoint", endpoint, "f5Partition", partition),
-		endpoint:    endpoint,
-		partition:   partition,
-		httpClient:  newHTTPClientFromEnv(),
-		username:    os.Getenv("F5_USERNAME"),
-		password:    os.Getenv("F5_PASSWORD"),
-		rateLimiter: rate.NewLimiter(rate.Limit(10), 20),
+		log:          log.WithValues("f5Endpoint", endpoint, "f5Partition", partition),
+		endpoint:     endpoint,
+		partition:    partition,
+		httpClient:   newHTTPClientFromEnv(),
+		username:     os.Getenv("F5_USERNAME"),
+		password:     os.Getenv("F5_PASSWORD"),
+		rateLimiter:  newCMPRateLimiter(),
+		requestSlots: newCMPRequestSlots(),
 	}
 	c.initPathConfigFromEnv()
 
@@ -439,13 +510,14 @@ func NewClientWithBasicAuth(log logr.Logger, endpoint, partition, username, pass
 	endpoint = strings.TrimRight(endpoint, "/")
 
 	c := &client{
-		log:         log.WithValues("f5Endpoint", endpoint, "f5Partition", partition),
-		endpoint:    endpoint,
-		partition:   partition,
-		httpClient:  newHTTPClientFromEnv(),
-		username:    username,
-		password:    password,
-		rateLimiter: rate.NewLimiter(rate.Limit(10), 20),
+		log:          log.WithValues("f5Endpoint", endpoint, "f5Partition", partition),
+		endpoint:     endpoint,
+		partition:    partition,
+		httpClient:   newHTTPClientFromEnv(),
+		username:     username,
+		password:     password,
+		rateLimiter:  newCMPRateLimiter(),
+		requestSlots: newCMPRequestSlots(),
 	}
 	c.initPathConfigFromEnv()
 
@@ -462,7 +534,7 @@ func NewClientWithBasicAuth(log logr.Logger, endpoint, partition, username, pass
 //	-H 'Ce-Auth: <token>'
 //	-H 'organisation-name: <tenant>'
 //	-H 'project-id: <id>'
-func NewClientWithCeAuth(log logr.Logger, endpoint, organisationName, projectID, ceAuth string) (Client, error) {
+func NewClientWithCeAuth(log logr.Logger, endpoint, organisationName, projectID, region string, ceAuth string) (Client, error) {
 	if endpoint == "" {
 		return nil, fmt.Errorf("f5 endpoint must not be empty")
 	}
@@ -472,6 +544,10 @@ func NewClientWithCeAuth(log logr.Logger, endpoint, organisationName, projectID,
 	if projectID == "" {
 		return nil, fmt.Errorf("project id must not be empty")
 	}
+	region = strings.TrimSpace(region)
+	if region == "" {
+		return nil, fmt.Errorf("CMP region must not be empty")
+	}
 	if ceAuth == "" {
 		return nil, fmt.Errorf("Ce-Auth token must not be empty")
 	}
@@ -479,16 +555,87 @@ func NewClientWithCeAuth(log logr.Logger, endpoint, organisationName, projectID,
 	endpoint = strings.TrimRight(endpoint, "/")
 
 	c := &client{
-		log:              log.WithValues("f5Endpoint", endpoint, "organisationName", organisationName, "projectID", projectID),
+		log:              log.WithValues("f5Endpoint", endpoint, "organisationName", organisationName, "projectID", projectID, "region", region),
 		endpoint:         endpoint,
 		partition:        organisationName,
 		organisationName: organisationName,
 		projectID:        projectID,
+		region:           region,
 		ceAuth:           ceAuth,
 		httpClient:       newHTTPClientFromEnv(),
 		extraHeaders:     make(http.Header),
-		rateLimiter:      rate.NewLimiter(rate.Limit(10), 20),
+		rateLimiter:      newCMPRateLimiter(),
+		requestSlots:     newCMPRequestSlots(),
 	}
+	c.initPathConfigFromEnv()
+
+	return c, nil
+}
+
+func NewClientWithCeAuthCredentials(
+	log logr.Logger,
+	endpoint string,
+	organisationName string,
+	projectID string,
+	region string,
+	ceAuth string,
+	apiKeyID string,
+	apiSecret string,
+) (Client, error) {
+	endpoint = strings.TrimRight(strings.TrimSpace(endpoint), "/")
+	organisationName = strings.TrimSpace(organisationName)
+	projectID = strings.TrimSpace(projectID)
+	region = strings.TrimSpace(region)
+	ceAuth = strings.TrimSpace(ceAuth)
+	apiKeyID = strings.TrimSpace(apiKeyID)
+	apiSecret = strings.TrimSpace(apiSecret)
+
+	if endpoint == "" {
+		return nil, fmt.Errorf("f5 endpoint must not be empty")
+	}
+	if organisationName == "" {
+		return nil, fmt.Errorf("organisation name must not be empty")
+	}
+	if projectID == "" {
+		return nil, fmt.Errorf("project id must not be empty")
+	}
+	if region == "" {
+		return nil, fmt.Errorf("CMP region must not be empty")
+	}
+	if ceAuth == "" {
+		return nil, fmt.Errorf("initial Ce-Auth token must not be empty")
+	}
+	if apiKeyID == "" {
+		return nil, fmt.Errorf("CMP API key ID must not be empty")
+	}
+	if apiSecret == "" {
+		return nil, fmt.Errorf("CMP API secret must not be empty")
+	}
+
+	c := &client{
+		log: log.WithValues(
+			"f5Endpoint", endpoint,
+			"organisationName", organisationName,
+			"projectID", projectID,
+			"region", region,
+		),
+		endpoint:         endpoint,
+		partition:        organisationName,
+		organisationName: organisationName,
+		projectID:        projectID,
+		region:           region,
+		// Use the token supplied at startup until CMP rejects it.
+		ceAuth:          ceAuth,
+		ceAuthAPIKeyID:  apiKeyID,
+		ceAuthAPISecret: apiSecret,
+		ceAuthValidity:  299 * time.Second,
+
+		httpClient:   newHTTPClientFromEnv(),
+		extraHeaders: make(http.Header),
+		rateLimiter:  newCMPRateLimiter(),
+		requestSlots: newCMPRequestSlots(),
+	}
+
 	c.initPathConfigFromEnv()
 
 	return c, nil
@@ -631,7 +778,7 @@ func (c *client) ensureOrFindLBService(ctx context.Context) (string, error) {
 
 func (c *client) ensureOrFindVIP(ctx context.Context, lbServiceID string) (string, error) {
 	// Check if a VIP already exists.
-	vips, err := c.GetLBServiceVIPs(ctx, lbServiceID)
+	vips, err := c.GetLBServiceVIPs(ctx, lbServiceID, "")
 	if err != nil {
 		// Avoid creating duplicates when listing fails (e.g. transient 5xx). Let the caller retry.
 		return "", err
@@ -657,7 +804,7 @@ func (c *client) ensureOrFindVIP(ctx context.Context, lbServiceID string) (strin
 	}
 
 	// Create a new VIP port.
-	raw, err := c.CreateLBServiceVIP(ctx, lbServiceID)
+	raw, err := c.CreateLBServiceVIP(ctx, lbServiceID, "")
 	if err != nil {
 		return "", err
 	}
@@ -917,7 +1064,7 @@ func (c *client) GetLBService(ctx context.Context, id string) (json.RawMessage, 
 	}
 
 	var out json.RawMessage
-	if err := c.doRequest(ctx, http.MethodGet, c.lbPath("/lb_service/"+strings.TrimSpace(id)+"/"), nil, &out); err != nil {
+	if err := c.doRequest(ctx, http.MethodGet, c.lbPath("/lb_service/"+strings.TrimSpace(id)), nil, &out); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -928,7 +1075,7 @@ func (c *client) DeleteLBService(ctx context.Context, id string) error {
 	if strings.TrimSpace(id) == "" {
 		return fmt.Errorf("lb service id must not be empty")
 	}
-	err := c.doRequest(ctx, http.MethodDelete, c.lbPath("/lb_service/"+strings.TrimSpace(id)+"/"), nil, nil)
+	err := c.doRequest(ctx, http.MethodDelete, c.lbPath("/lb_service/"+strings.TrimSpace(id)), nil, nil)
 	if IsNotFound(err) {
 		return nil
 	}
@@ -1003,29 +1150,141 @@ func (c *client) OptionsLoadBalancers(ctx context.Context) ([]string, error) {
 }
 
 // CreateLBServiceVIP calls POST /load-balancers/lb_service/{id}/vip.
-func (c *client) CreateLBServiceVIP(ctx context.Context, lbServiceID string) (json.RawMessage, error) {
+func (c *client) CreateLBServiceVIP(ctx context.Context, lbServiceID, subnetID string) (json.RawMessage, error) {
 	lbServiceID = strings.TrimSpace(lbServiceID)
 	if lbServiceID == "" {
 		return nil, fmt.Errorf("lb service id must not be empty")
 	}
+	subnetID = c.effectiveSubnetID(subnetID)
+	headers := subnetHeader(subnetID)
 	var out json.RawMessage
-	if err := c.doRequest(ctx, http.MethodPost, c.lbPath("/lb_service/"+lbServiceID+"/vip"), nil, &out); err != nil {
+	if _, err := c.doRequestWithBodyAndHeaders(ctx, http.MethodPost, c.lbPath("/lb_service/"+lbServiceID+"/vip"), nil, "", headers, &out); err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
 // GetLBServiceVIPs calls GET /load-balancers/lb_service/{id}/vip.
-func (c *client) GetLBServiceVIPs(ctx context.Context, lbServiceID string) ([]json.RawMessage, error) {
+func (c *client) GetLBServiceVIPs(ctx context.Context, lbServiceID, subnetID string) ([]json.RawMessage, error) {
 	lbServiceID = strings.TrimSpace(lbServiceID)
 	if lbServiceID == "" {
 		return nil, fmt.Errorf("lb service id must not be empty")
 	}
+
+	const (
+		pageLimit      = 100
+		maxPageFetches = 1000
+	)
+
+	subnetID = c.effectiveSubnetID(subnetID)
+	all := make([]json.RawMessage, 0, pageLimit)
+
+	for page := 0; page < maxPageFetches; page++ {
+		offset := page * pageLimit
+		items, err := c.getLBServiceVIPPage(ctx, lbServiceID, pageLimit, offset, subnetID)
+		if err != nil {
+			if subnetID == "" {
+				resolvedSubnetID, resolveErr := c.resolveLBServiceSubnetID(ctx, lbServiceID)
+				if resolveErr == nil && resolvedSubnetID != "" {
+					subnetID = resolvedSubnetID
+					items, err = c.getLBServiceVIPPage(ctx, lbServiceID, pageLimit, offset, subnetID)
+				}
+			}
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		all = append(all, items...)
+		if len(items) < pageLimit {
+			return all, nil
+		}
+	}
+
+	return nil, fmt.Errorf("listing VIPs for LB service %q exceeded %d pages", lbServiceID, maxPageFetches)
+}
+
+func (c *client) getLBServiceVIPPage(ctx context.Context, lbServiceID string, limit, offset int, subnetID string) ([]json.RawMessage, error) {
+	q := url.Values{}
+	q.Set("limit", strconv.Itoa(limit))
+	q.Set("offset", strconv.Itoa(offset))
+	q.Set("field", "created")
+	q.Set("order", "desc")
+
+	path := c.lbPath("/lb_service/" + lbServiceID + "/vip?" + q.Encode())
+
 	var out []json.RawMessage
-	if err := c.doRequest(ctx, http.MethodGet, c.lbPath("/lb_service/"+lbServiceID+"/vip"), nil, &out); err != nil {
+	if _, err := c.doRequestWithBodyAndHeaders(ctx, http.MethodGet, path, nil, "", subnetHeader(subnetID), &out); err != nil {
 		return nil, err
 	}
 	return out, nil
+}
+
+func (c *client) effectiveSubnetID(subnetID string) string {
+	if subnetID = strings.TrimSpace(subnetID); subnetID != "" {
+		return subnetID
+	}
+	return strings.TrimSpace(c.cpNetworkID)
+}
+
+func subnetHeader(subnetID string) http.Header {
+	if subnetID = strings.TrimSpace(subnetID); subnetID == "" {
+		return nil
+	}
+	headers := make(http.Header)
+	headers.Set("subnet-id", subnetID)
+	return headers
+}
+
+func (c *client) resolveLBServiceSubnetID(ctx context.Context, lbServiceID string) (string, error) {
+	raw, err := c.GetLBService(ctx, lbServiceID)
+	if err != nil {
+		return "", err
+	}
+	return extractLBSubnetID(raw), nil
+}
+
+func extractLBSubnetID(raw json.RawMessage) string {
+	var obj map[string]any
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return ""
+	}
+
+	if v := stringValue(obj["network_id"]); v != "" {
+		return v
+	}
+	if v := stringValue(obj["subnet_id"]); v != "" {
+		return v
+	}
+	if nested, ok := obj["network"].(map[string]any); ok {
+		if v := stringValue(nested["id"]); v != "" {
+			return v
+		}
+	}
+	if nested, ok := obj["subnet"].(map[string]any); ok {
+		if v := stringValue(nested["id"]); v != "" {
+			return v
+		}
+	}
+
+	return ""
+}
+
+func stringValue(v any) string {
+	switch typed := v.(type) {
+	case string:
+		return strings.TrimSpace(typed)
+	case float64:
+		return strings.TrimSpace(strconv.FormatInt(int64(typed), 10))
+	case int:
+		return strings.TrimSpace(strconv.Itoa(typed))
+	case int32:
+		return strings.TrimSpace(strconv.FormatInt(int64(typed), 10))
+	case int64:
+		return strings.TrimSpace(strconv.FormatInt(typed, 10))
+	default:
+		return ""
+	}
 }
 
 // DeleteLBServiceVIP calls DELETE /load-balancers/lb_service/{id}/vip/{vipID}/.
@@ -1340,6 +1599,19 @@ func (c *client) virtualServerPoolMemberPath(lbServiceID, vsID, poolID, memberID
 	return path + "/members/" + memberID, nil
 }
 
+// GetCompute calls GET /computes/{id}/.
+func (c *client) GetCompute(ctx context.Context, id string) (json.RawMessage, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil, fmt.Errorf("compute id must not be empty")
+	}
+	var out json.RawMessage
+	if err := c.doRequest(ctx, http.MethodGet, c.computePath("/"+url.PathEscape(id)+"/"), nil, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // SearchNetworkPortsByIP calls GET /networks/ports/search-by-ip/?fixed_ip={ip}.
 func (c *client) SearchNetworkPortsByIP(ctx context.Context, ip string) ([]json.RawMessage, error) {
 	ip = strings.TrimSpace(ip)
@@ -1396,6 +1668,16 @@ func (c *client) networkPath(subPath string) string {
 	return c.withPrefix("/networks" + subPath)
 }
 
+func (c *client) computePath(subPath string) string {
+	if c.organisationName != "" && c.projectID != "" {
+		return fmt.Sprintf("/api/v2.1/computes/domain/%s/project/%s/computes%s",
+			url.PathEscape(c.organisationName),
+			url.PathEscape(c.projectID),
+			subPath)
+	}
+	return c.withPrefix("/computes" + subPath)
+}
+
 // doRequest is a small helper for JSON-based HTTP requests.
 func (c *client) doRequest(ctx context.Context, method, path string, body any, result any) error {
 	var reader io.Reader
@@ -1409,7 +1691,7 @@ func (c *client) doRequest(ctx context.Context, method, path string, body any, r
 		contentType = "application/json"
 	}
 
-	_, err := c.doRequestWithBody(ctx, method, path, reader, contentType, result)
+	_, err := c.doRequestWithBodyAndHeaders(ctx, method, path, reader, contentType, nil, result)
 	return err
 }
 
@@ -1420,43 +1702,85 @@ func (c *client) doFormRequest(ctx context.Context, method, path string, form ur
 	} else {
 		reader = strings.NewReader("")
 	}
-	_, err := c.doRequestWithBody(ctx, method, path, reader, "application/x-www-form-urlencoded", result)
+	_, err := c.doRequestWithBodyAndHeaders(ctx, method, path, reader, "application/x-www-form-urlencoded", nil, result)
 	return err
 }
 
-func (c *client) doRequestWithBody(ctx context.Context, method, path string, body io.Reader, contentType string, result any) (http.Header, error) {
+func (c *client) doRequestWithBody(
+	ctx context.Context,
+	method string,
+	path string,
+	body io.Reader,
+	contentType string,
+	result any,
+) (http.Header, error) {
+	return c.doRequestWithBodyAndHeaders(ctx, method, path, body, contentType, nil, result)
+}
+
+func (c *client) doRequestWithBodyAndHeaders(
+	ctx context.Context,
+	method string,
+	path string,
+	body io.Reader,
+	contentType string,
+	extraHeaders http.Header,
+	result any,
+) (http.Header, error) {
+
+	if err := c.acquireRequestSlot(ctx); err != nil {
+		return nil, err
+	}
+	defer c.releaseRequestSlot()
+
 	// Client-side rate limiting: wait for a token before sending the request.
-	// This prevents bursting all Shoot reconciliations at once hitting CMP's rate limit.
 	if err := c.rateLimiter.Wait(ctx); err != nil {
 		return nil, fmt.Errorf("rate limiter wait cancelled: %w", err)
 	}
 
-	url := c.endpoint + "/" + strings.TrimLeft(path, "/")
+	requestURL := c.endpoint + "/" + strings.TrimLeft(path, "/")
 
-	req, err := http.NewRequestWithContext(ctx, method, url, body)
+	req, err := http.NewRequestWithContext(ctx, method, requestURL, body)
 	if err != nil {
-		return nil, fmt.Errorf("creating %s %s request: %w", method, url, err)
+		return nil, fmt.Errorf(
+			"creating %s %s request: %w",
+			method,
+			requestURL,
+			err,
+		)
 	}
 
-	// Default headers
 	req.Header.Set("Accept", "application/json")
 
-	// Optional extra headers (debug only / non-standard CMP requirements)
-	for k, vs := range c.extraHeaders {
-		for _, v := range vs {
-			if strings.TrimSpace(k) != "" && v != "" {
-				req.Header.Add(k, v)
+	for key, values := range c.extraHeaders {
+		for _, value := range values {
+			if strings.TrimSpace(key) != "" && value != "" {
+				req.Header.Add(key, value)
 			}
 		}
 	}
-	if c.ceAuth != "" {
-		req.Header.Set("Ce-Auth", c.ceAuth)
+
+	for key, values := range extraHeaders {
+		for _, value := range values {
+			if strings.TrimSpace(key) != "" && value != "" {
+				req.Header.Add(key, value)
+			}
+		}
 	}
+
+	// Use the currently stored token. Do not regenerate here.
+	if token := c.currentCeAuthToken(); token != "" {
+		req.Header.Set("Ce-Auth", token)
+	}
+
+	if c.region != "" {
+		req.Header.Set("ce-region", c.region)
+	}
+
 	if c.organisationName != "" {
-		// Some environments use US spelling; set both for compatibility.
 		req.Header.Set("organisation-name", c.organisationName)
 		req.Header.Set("organization-name", c.organisationName)
 	}
+
 	if c.projectID != "" {
 		req.Header.Set("project-id", c.projectID)
 	}
@@ -1464,58 +1788,137 @@ func (c *client) doRequestWithBody(ctx context.Context, method, path string, bod
 	if strings.TrimSpace(contentType) != "" {
 		req.Header.Set("Content-Type", contentType)
 	}
+
 	if c.username != "" && c.password != "" {
 		req.SetBasicAuth(c.username, c.password)
 	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("performing %s %s: %w", method, url, err)
+		return nil, fmt.Errorf(
+			"performing %s %s: %w",
+			method,
+			requestURL,
+			err,
+		)
 	}
+
+	// Refresh and retry exactly once, and only for HTTP 401.
+	if resp.StatusCode == http.StatusUnauthorized &&
+		strings.TrimSpace(c.ceAuthAPIKeyID) != "" &&
+		strings.TrimSpace(c.ceAuthAPISecret) != "" {
+
+		resp.Body.Close()
+
+		// Re-create the request body for POST, PUT, PATCH, and form requests.
+		if req.GetBody != nil {
+			retryBody, getBodyErr := req.GetBody()
+			if getBodyErr != nil {
+				return nil, fmt.Errorf(
+					"recreating body for authorized retry %s %s: %w",
+					method,
+					requestURL,
+					getBodyErr,
+				)
+			}
+
+			req.Body = retryBody
+		} else if req.Body != nil {
+			return nil, fmt.Errorf(
+				"cannot retry %s %s after HTTP 401: request body cannot be recreated",
+				method,
+				requestURL,
+			)
+		}
+
+		freshToken, refreshErr := c.refreshCeAuthToken()
+		if refreshErr != nil {
+			return nil, fmt.Errorf(
+				"refreshing Ce-Auth token after HTTP 401: %w",
+				refreshErr,
+			)
+		}
+
+		req.Header.Set("Ce-Auth", freshToken)
+
+		c.log.Info(
+			"CMP returned HTTP 401; refreshed Ce-Auth token and retrying once",
+			"method", method,
+			"url", requestURL,
+		)
+
+		resp, err = c.httpClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"performing authorized retry %s %s: %w",
+				method,
+				requestURL,
+				err,
+			)
+		}
+	}
+
 	defer resp.Body.Close()
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+	if resp.StatusCode < http.StatusOK ||
+		resp.StatusCode >= http.StatusMultipleChoices {
 
-		// Include a few helpful headers (non-sensitive) to ease debugging 401/403 issues.
-		reqID := resp.Header.Get("X-Request-Id")
-		if reqID == "" {
-			reqID = resp.Header.Get("X-Request-ID")
-		}
-		wwwAuth := resp.Header.Get("Www-Authenticate")
-		if wwwAuth == "" {
-			wwwAuth = resp.Header.Get("WWW-Authenticate")
+		responseBody, _ := io.ReadAll(
+			io.LimitReader(resp.Body, 4<<10),
+		)
+
+		requestID := resp.Header.Get("X-Request-Id")
+		if requestID == "" {
+			requestID = resp.Header.Get("X-Request-ID")
 		}
 
-		// Handle 429 Too Many Requests: parse Retry-After and return a typed error
-		// so callers (controller-runtime reconcilers) can requeue after the correct delay.
+		wwwAuthenticate := resp.Header.Get("Www-Authenticate")
+		if wwwAuthenticate == "" {
+			wwwAuthenticate = resp.Header.Get("WWW-Authenticate")
+		}
+
 		if resp.StatusCode == http.StatusTooManyRequests {
-			retryAfter := 30 * time.Second // default retry delay
-			if ra := resp.Header.Get("Retry-After"); ra != "" {
-				if secs, err := strconv.Atoi(ra); err == nil && secs > 0 {
-					retryAfter = time.Duration(secs) * time.Second
+			retryAfter := 30 * time.Second
+
+			if value := resp.Header.Get("Retry-After"); value != "" {
+				if seconds, parseErr := strconv.Atoi(value); parseErr == nil &&
+					seconds > 0 {
+					retryAfter = time.Duration(seconds) * time.Second
 				}
 			}
+
 			return nil, &RateLimitedError{
 				RetryAfter: retryAfter,
-				Message:    fmt.Sprintf("%s %s: %s (reqID=%s)", method, url, string(b), reqID),
+				Message: fmt.Sprintf(
+					"%s %s: %s (reqID=%s)",
+					method,
+					requestURL,
+					string(responseBody),
+					requestID,
+				),
 			}
 		}
 
 		return nil, &HTTPStatusError{
 			Method:          method,
-			URL:             url,
+			URL:             requestURL,
 			StatusCode:      resp.StatusCode,
 			Status:          resp.Status,
-			RequestID:       reqID,
-			WWWAuthenticate: wwwAuth,
-			BodySnippet:     string(b),
+			RequestID:       requestID,
+			WWWAuthenticate: wwwAuthenticate,
+			BodySnippet:     string(responseBody),
 		}
 	}
 
 	if result != nil {
-		if err := json.NewDecoder(resp.Body).Decode(result); err != nil && err != io.EOF {
-			return nil, fmt.Errorf("decoding response from %s %s: %w", method, url, err)
+		if err := json.NewDecoder(resp.Body).Decode(result); err != nil &&
+			err != io.EOF {
+			return nil, fmt.Errorf(
+				"decoding response from %s %s: %w",
+				method,
+				requestURL,
+				err,
+			)
 		}
 	}
 

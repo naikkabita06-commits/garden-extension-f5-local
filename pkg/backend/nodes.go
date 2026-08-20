@@ -2,7 +2,10 @@ package backend
 
 import (
 	"context"
+	"fmt"
 	"strings"
+
+	lbannotations "github.com/gardener/gardener-extension-f5/pkg/annotations"
 
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
@@ -12,8 +15,11 @@ import (
 
 // Node is an eligible load-balancer backend node.
 type Node struct {
-	IP     string
-	Weight int
+	NodeName   string
+	ProviderID string
+	ComputeID  string
+	IP         string
+	Weight     int
 }
 
 // ListReadyNodeBackends returns Ready node InternalIPs, optionally narrowed to
@@ -48,15 +54,15 @@ func ListReadyNodeBackends(ctx context.Context, c client.Client, svc *corev1.Ser
 		} else if localOnly {
 			continue
 		}
-		if ip := InternalIP(n); ip != "" {
+		if ip := backendIP(n); ip != "" {
 			weight := 50
 			if epCount > 0 {
 				weight = epCount * 50
 			}
-			out = append(out, Node{IP: ip, Weight: weight})
+			out = append(out, Node{NodeName: n.Name, ProviderID: strings.TrimSpace(n.Spec.ProviderID), ComputeID: ComputeID(n), IP: ip, Weight: weight})
 		}
 	}
-	return out, nil
+	return deduplicateNodes(out), nil
 }
 
 // ListNodeInternalIPs returns all node InternalIPs without readiness filtering.
@@ -150,11 +156,46 @@ func ListReadyNodeBackendsForPort(ctx context.Context, c client.Client, svc *cor
 		if !ok {
 			continue
 		}
-		if ip := InternalIP(n); ip != "" {
-			out = append(out, Node{IP: ip, Weight: count * 50})
+		if ip := backendIP(n); ip != "" {
+			out = append(out, Node{NodeName: n.Name, ProviderID: strings.TrimSpace(n.Spec.ProviderID), ComputeID: ComputeID(n), IP: ip, Weight: count * 50})
 		}
 	}
-	return out, nil
+	return deduplicateNodes(out), nil
+}
+
+func ComputeID(node *corev1.Node) string {
+	if node == nil {
+		return ""
+	}
+	providerID := strings.TrimSpace(node.Spec.ProviderID)
+	if strings.HasPrefix(providerID, "cmp://") {
+		return strings.TrimSpace(strings.TrimPrefix(providerID, "cmp://"))
+	}
+	return strings.TrimSpace(node.Annotations[lbannotations.CMPComputeID])
+}
+
+func backendIP(node *corev1.Node) string {
+	if node == nil {
+		return ""
+	}
+	if annotated := strings.TrimSpace(node.Annotations[lbannotations.BackendIP]); annotated != "" {
+		return annotated
+	}
+	return InternalIP(node)
+}
+
+func deduplicateNodes(nodes []Node) []Node {
+	seen := map[string]struct{}{}
+	out := make([]Node, 0, len(nodes))
+	for _, node := range nodes {
+		key := fmt.Sprintf("%s|%s", strings.TrimSpace(node.ComputeID), strings.TrimSpace(node.IP))
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, node)
+	}
+	return out
 }
 
 func nodesWithReadyEndpointsForPort(ctx context.Context, c client.Client, svc *corev1.Service, servicePort corev1.ServicePort) map[string]int {

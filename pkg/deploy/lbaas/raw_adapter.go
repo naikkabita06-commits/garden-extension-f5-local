@@ -14,8 +14,9 @@ type RawClient interface {
 	ListLBServices(ctx context.Context, opts *f5client.ListLoadBalancersOptions) ([]json.RawMessage, error)
 	CreateLBService(ctx context.Context, form url.Values) (json.RawMessage, error)
 	DeleteLBService(ctx context.Context, id string) error
-	CreateLBServiceVIP(ctx context.Context, lbServiceID string) (json.RawMessage, error)
-	GetLBServiceVIPs(ctx context.Context, lbServiceID string) ([]json.RawMessage, error)
+	GetLBService(ctx context.Context, id string) (json.RawMessage, error)
+	CreateLBServiceVIP(ctx context.Context, lbServiceID, subnetID string) (json.RawMessage, error)
+	GetLBServiceVIPs(ctx context.Context, lbServiceID, subnetID string) ([]json.RawMessage, error)
 	DeleteLBServiceVIP(ctx context.Context, lbServiceID, vipID string) error
 	ListLBVirtualServers(ctx context.Context, lbServiceID string) ([]json.RawMessage, error)
 	CreateLBVirtualServer(ctx context.Context, lbServiceID string, query url.Values) (json.RawMessage, error)
@@ -25,6 +26,7 @@ type RawClient interface {
 	DeleteLBServiceCertificate(ctx context.Context, lbServiceID, certificateID string) error
 	AttachLBVirtualServerCertificate(ctx context.Context, lbServiceID, virtualServerID, certificateID string) error
 	DetachLBVirtualServerCertificate(ctx context.Context, lbServiceID, virtualServerID, certificateID string) error
+	GetCompute(ctx context.Context, id string) (json.RawMessage, error)
 	SearchNetworkPortsByIP(ctx context.Context, ip string) ([]json.RawMessage, error)
 }
 
@@ -57,18 +59,34 @@ func NewFromRaw(raw RawClient, vpcID string) *Deployer {
 	return d
 }
 
-func (a rawAdapter) ListLBServices(ctx context.Context) ([]LBService, error) {
-	items, err := a.raw.ListLBServices(ctx, nil)
+func (a rawAdapter) ListLBServices(
+	ctx context.Context,
+	opts *f5client.ListLoadBalancersOptions,
+) ([]LBService, error) {
+
+	items, err := a.raw.ListLBServices(ctx, opts)
 	if err != nil {
 		return nil, err
 	}
+
 	out := make([]LBService, 0, len(items))
 	for _, raw := range items {
-		var svc struct{ ID, Name string }
+		var svc struct {
+			ID              string `json:"id"`
+			Name            string `json:"name"`
+			Status          string `json:"status"`
+			OperatingStatus string `json:"operating_status"`
+		}
 		if json.Unmarshal(raw, &svc) == nil {
-			out = append(out, LBService{ID: strings.TrimSpace(svc.ID), Name: strings.TrimSpace(svc.Name)})
+			out = append(out, LBService{
+				ID:              strings.TrimSpace(svc.ID),
+				Name:            strings.TrimSpace(svc.Name),
+				Status:          strings.TrimSpace(svc.Status),
+				OperatingStatus: strings.TrimSpace(svc.OperatingStatus),
+			})
 		}
 	}
+
 	return out, nil
 }
 
@@ -88,12 +106,6 @@ func (a rawAdapter) CreateLBService(ctx context.Context, spec LBServiceSpec) (LB
 	if spec.VPCName != "" {
 		form.Set("vpc_name", spec.VPCName)
 	}
-	fmt.Printf(
-		"CMP CreateLBService name=%q len=%d form=%v\n",
-		spec.Name,
-		len(spec.Name),
-		form,
-	)
 	raw, err := a.raw.CreateLBService(ctx, form)
 	if err != nil {
 		return LBService{}, err
@@ -108,8 +120,53 @@ func (a rawAdapter) DeleteLBService(ctx context.Context, id string) error {
 	return a.raw.DeleteLBService(ctx, id)
 }
 
-func (a rawAdapter) ListVIPs(ctx context.Context, lbServiceID string) ([]VIP, error) {
-	items, err := a.raw.GetLBServiceVIPs(ctx, lbServiceID)
+func (a rawAdapter) GetLBService(
+	ctx context.Context, id string) (LBService, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return LBService{}, fmt.Errorf("LBService ID must not be empty")
+	}
+
+	raw, err := a.raw.GetLBService(ctx, id)
+	if err != nil {
+		return LBService{}, err
+	}
+
+	var svc struct {
+		ID              string `json:"id"`
+		Name            string `json:"name"`
+		Status          string `json:"status"`
+		OperatingStatus string `json:"operating_status"`
+	}
+
+	if err := json.Unmarshal(raw, &svc); err != nil {
+		return LBService{}, fmt.Errorf(
+			"parsing LBService %q response: %w",
+			id,
+			err,
+		)
+	}
+
+	svc.ID = strings.TrimSpace(svc.ID)
+	svc.Name = strings.TrimSpace(svc.Name)
+
+	if svc.ID == "" {
+		return LBService{}, fmt.Errorf(
+			"CMP returned LBService %q without an ID",
+			id,
+		)
+	}
+
+	return LBService{
+		ID:              svc.ID,
+		Name:            svc.Name,
+		Status:          strings.TrimSpace(svc.Status),
+		OperatingStatus: strings.TrimSpace(svc.OperatingStatus),
+	}, nil
+}
+
+func (a rawAdapter) ListVIPs(ctx context.Context, lbServiceID, subnetID string) ([]VIP, error) {
+	items, err := a.raw.GetLBServiceVIPs(ctx, lbServiceID, subnetID)
 	if err != nil {
 		return nil, err
 	}
@@ -121,8 +178,8 @@ func (a rawAdapter) ListVIPs(ctx context.Context, lbServiceID string) ([]VIP, er
 	}
 	return out, nil
 }
-func (a rawAdapter) CreateVIP(ctx context.Context, lbServiceID string) (VIP, error) {
-	raw, err := a.raw.CreateLBServiceVIP(ctx, lbServiceID)
+func (a rawAdapter) CreateVIP(ctx context.Context, lbServiceID, subnetID string) (VIP, error) {
+	raw, err := a.raw.CreateLBServiceVIP(ctx, lbServiceID, subnetID)
 	if err != nil {
 		return VIP{}, err
 	}
@@ -143,9 +200,8 @@ func (a rawAdapter) ListVirtualServers(ctx context.Context, lbServiceID string) 
 	}
 	out := make([]VirtualServer, 0, len(items))
 	for _, raw := range items {
-		var vs struct{ ID, Name string }
-		if json.Unmarshal(raw, &vs) == nil {
-			out = append(out, VirtualServer{ID: strings.TrimSpace(vs.ID), Name: strings.TrimSpace(vs.Name)})
+		if vs := parseVirtualServer(raw); vs.ID != "" {
+			out = append(out, vs)
 		}
 	}
 	return out, nil
@@ -205,6 +261,21 @@ func (a rawAdapter) CreateVirtualServer(ctx context.Context, lbServiceID string,
 }
 func (a rawAdapter) DeleteVirtualServer(ctx context.Context, lbServiceID, vsID string) error {
 	return a.raw.DeleteLBVirtualServer(ctx, lbServiceID, vsID)
+}
+
+func (a rawAdapter) GetCompute(ctx context.Context, id string) (Compute, error) {
+	raw, err := a.raw.GetCompute(ctx, id)
+	if err != nil {
+		return Compute{}, err
+	}
+	compute := parseCompute(raw)
+	if compute.ID == "" {
+		compute.ID = strings.TrimSpace(id)
+	}
+	if compute.ID == "" {
+		return Compute{}, fmt.Errorf("CMP returned compute %q without an ID", id)
+	}
+	return compute, nil
 }
 
 func (a rawAdapter) SearchNetworkPortsByIP(ctx context.Context, ip string) ([]NetworkPort, error) {
@@ -491,6 +562,41 @@ func parseVIP(raw json.RawMessage) VIP {
 	return VIP{}
 }
 
+func parseVirtualServer(raw json.RawMessage) VirtualServer {
+	var vs struct {
+		ID         string `json:"id"`
+		Name       string `json:"name"`
+		VIPPortID  string `json:"vip_port_id"`
+		VIPAddress string `json:"vip"`
+	}
+	if json.Unmarshal(raw, &vs) == nil {
+		id := strings.TrimSpace(vs.ID)
+		if id != "" {
+			return VirtualServer{
+				ID:         id,
+				Name:       strings.TrimSpace(vs.Name),
+				VIPPortID:  strings.TrimSpace(vs.VIPPortID),
+				VIPAddress: strings.TrimSpace(vs.VIPAddress),
+			}
+		}
+	}
+
+	var numeric struct {
+		ID        int    `json:"id"`
+		VIPPortID int    `json:"vip_port_id"`
+		Name      string `json:"name"`
+	}
+	if json.Unmarshal(raw, &numeric) == nil && numeric.ID != 0 {
+		vipPortID := ""
+		if numeric.VIPPortID != 0 {
+			vipPortID = fmt.Sprintf("%d", numeric.VIPPortID)
+		}
+		return VirtualServer{ID: fmt.Sprintf("%d", numeric.ID), Name: strings.TrimSpace(numeric.Name), VIPPortID: vipPortID}
+	}
+
+	return VirtualServer{}
+}
+
 func parseNetworkPort(raw json.RawMessage) NetworkPort {
 	var port struct {
 		ID           int    `json:"id"`
@@ -526,7 +632,144 @@ func parseNetworkPort(raw json.RawMessage) NetworkPort {
 	if ip == "" && len(port.FixedIPs) > 0 {
 		ip = strings.TrimSpace(port.FixedIPs[0].IPAddress)
 	}
-	return NetworkPort{ID: id, ResourceID: resourceID, ResourceType: resourceType, IP: ip}
+	networkID := firstNonEmpty(portNetworkID(raw), "")
+	return NetworkPort{ID: id, ResourceID: resourceID, ResourceType: resourceType, IP: ip, NetworkID: networkID, DeviceID: strings.TrimSpace(port.DeviceID), DeviceType: resourceType}
+}
+
+func parseCompute(raw json.RawMessage) Compute {
+	var obj map[string]any
+	if json.Unmarshal(raw, &obj) != nil {
+		return Compute{}
+	}
+	return Compute{
+		ID:        firstString(obj, "id", "uuid", "compute_id"),
+		VPCID:     firstString(obj, "vpc_id", "vpc"),
+		NetworkID: firstString(obj, "network_id", "subnet_id"),
+		Status:    firstString(obj, "status", "operating_status"),
+		Ports:     parseComputePorts(obj["ports"]),
+	}
+}
+
+func parseComputePorts(value any) []ComputePort {
+	switch typed := value.(type) {
+	case []any:
+		out := make([]ComputePort, 0, len(typed))
+		for _, item := range typed {
+			if port := parseComputePort(item); port.ID != 0 || port.IP != "" {
+				out = append(out, port)
+			}
+		}
+		return out
+	case map[string]any:
+		out := make([]ComputePort, 0, len(typed))
+		for _, item := range typed {
+			if port := parseComputePort(item); port.ID != 0 || port.IP != "" {
+				out = append(out, port)
+			}
+		}
+		return out
+	case string:
+		var decoded any
+		if json.Unmarshal([]byte(typed), &decoded) == nil {
+			return parseComputePorts(decoded)
+		}
+	}
+	return nil
+}
+
+func parseComputePort(value any) ComputePort {
+	obj, ok := value.(map[string]any)
+	if !ok {
+		return ComputePort{}
+	}
+	return ComputePort{
+		ID:         intFromAny(firstAny(obj, "id", "id_str", "port_id", "provider_port_id")),
+		IP:         firstPortIP(obj),
+		NetworkID:  firstString(obj, "network_id", "subnet_id"),
+		DeviceID:   firstString(obj, "device_id", "resource_id", "compute_id"),
+		DeviceType: inferResourceType(firstString(obj, "device_type", "device_owner", "resource_type")),
+	}
+}
+
+func firstPortIP(obj map[string]any) string {
+	if ip := firstString(obj, "fixed_ip", "ip_address", "ip"); ip != "" {
+		return ip
+	}
+	switch fixed := obj["fixed_ips"].(type) {
+	case string:
+		var decoded any
+		if json.Unmarshal([]byte(fixed), &decoded) == nil {
+			if list, ok := decoded.([]any); ok && len(list) > 0 {
+				if first, ok := list[0].(map[string]any); ok {
+					return firstString(first, "ip_address", "ip", "fixed_ip")
+				}
+			}
+		}
+		return strings.TrimSpace(fixed)
+	case []any:
+		if len(fixed) > 0 {
+			if first, ok := fixed[0].(map[string]any); ok {
+				return firstString(first, "ip_address", "ip", "fixed_ip")
+			}
+		}
+	}
+	return ""
+}
+
+func firstString(obj map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value := stringFromAny(obj[key]); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func firstAny(obj map[string]any, keys ...string) any {
+	for _, key := range keys {
+		if value, ok := obj[key]; ok {
+			return value
+		}
+	}
+	return nil
+}
+
+func stringFromAny(value any) string {
+	switch typed := value.(type) {
+	case string:
+		return strings.TrimSpace(typed)
+	case float64:
+		return strings.TrimSpace(fmt.Sprintf("%.0f", typed))
+	case int:
+		return fmt.Sprintf("%d", typed)
+	case json.Number:
+		return strings.TrimSpace(typed.String())
+	default:
+		return ""
+	}
+}
+
+func intFromAny(value any) int {
+	switch typed := value.(type) {
+	case float64:
+		return int(typed)
+	case int:
+		return typed
+	case string:
+		var out int
+		if _, err := fmt.Sscanf(strings.TrimSpace(typed), "%d", &out); err == nil {
+			return out
+		}
+	}
+	return 0
+}
+
+func portNetworkID(raw json.RawMessage) string {
+	var obj map[string]any
+	if json.Unmarshal(raw, &obj) != nil {
+		return ""
+	}
+	return firstString(obj, "network_id", "subnet_id")
 }
 
 func firstNonEmpty(values ...string) string {

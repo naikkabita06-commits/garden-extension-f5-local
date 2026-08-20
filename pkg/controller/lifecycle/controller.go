@@ -18,10 +18,11 @@ import (
 	extensioncontroller "github.com/gardener/gardener/extensions/pkg/controller/extension"
 	extensionsutil "github.com/gardener/gardener/extensions/pkg/util"
 	extensionsv1alpha1 "github.com/gardener/gardener/pkg/apis/extensions/v1alpha1"
+	controller "github.com/gardener/gardener/extensions/pkg/controller"
+	autoscalingv1 "k8s.io/api/autoscaling/v1"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	discoveryv1 "k8s.io/api/discovery/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -285,6 +286,15 @@ func (a *actuator) updateExtensionOutput(
 		return err
 	}
 
+	// LastUpdateTime must describe a real status transition. Writing a fresh
+	// timestamp for an otherwise identical result causes a new watch event on
+	// every reconciliation and can turn the controller into an API-server hot
+	// loop. Skip the patch when the meaningful status is already current.
+	if extensionOutputIsCurrent(ex, raw, state, description) {
+		log.V(1).Info("Extension status is already current; skipping status patch")
+		return nil
+	}
+
 	patch := client.MergeFrom(ex.DeepCopy())
 	ex.Status.ProviderStatus = &runtime.RawExtension{Raw: raw}
 	ex.Status.ObservedGeneration = ex.Generation
@@ -301,6 +311,40 @@ func (a *actuator) updateExtensionOutput(
 		return err
 	}
 	return nil
+}
+
+func extensionOutputIsCurrent(
+	ex *extensionsv1alpha1.Extension,
+	providerStatus []byte,
+	state gardencorev1beta1.LastOperationState,
+	description string,
+) bool {
+	if ex.Status.ObservedGeneration != ex.Generation || ex.Status.LastError != nil {
+		return false
+	}
+	if ex.Status.ProviderStatus == nil || !reflect.DeepEqual(ex.Status.ProviderStatus.Raw, providerStatus) {
+		return false
+	}
+	if ex.Status.LastOperation == nil {
+		return false
+	}
+
+	// Gardenlet considers a request handled only when LastUpdateTime is at
+	// least as new as gardener.cloud/timestamp. The provider output may be
+	// identical to the previous reconciliation, but the newer request still
+	// requires one status write as its acknowledgement.
+	if requestedAtValue := annotationValue(ex, gardenerTimestampAnnotationKey); requestedAtValue != "" {
+		requestedAt, err := time.Parse(time.RFC3339Nano, requestedAtValue)
+		if err == nil && ex.Status.LastOperation.LastUpdateTime.Time.Before(requestedAt) {
+			return false
+		}
+	}
+
+	lastOperation := ex.Status.LastOperation
+	return lastOperation.Type == gardencorev1beta1.LastOperationTypeReconcile &&
+		lastOperation.State == state &&
+		lastOperation.Progress == progressForState(state) &&
+		lastOperation.Description == description
 }
 
 // progressForState maps a LastOperationState (Processing/Succeeded/Error) to a progress percentage (0-100).
@@ -504,28 +548,27 @@ func (a *actuator) provisionControlPlaneViaCMP(ctx context.Context, log logr.Log
 		return permanent(fmt.Errorf("spec.tenantOrPartition must not be empty"))
 	}
 
-	if cfg.Spec.CredentialsSecretRef == nil || cfg.Spec.CredentialsSecretRef.Name == "" || cfg.Spec.CredentialsSecretRef.Namespace == "" {
+	if strings.TrimSpace(cfg.Spec.CredentialsReferenceName) == "" {
 		meta.SetStatusCondition(&cfg.Status.Conditions, metav1.Condition{
 			Type:               "ControlPlaneLoadBalancerReady",
 			Status:             metav1.ConditionFalse,
 			Reason:             "ConfigError",
-			Message:            "spec.credentialsSecretRef.name and spec.credentialsSecretRef.namespace must be set when spec.ccpApiEndpoint is set",
+			Message:            "spec.credentialsReferenceName must be set when spec.ccpApiEndpoint is set",
 			LastTransitionTime: metav1.Now(),
 		})
-		return permanent(fmt.Errorf("spec.credentialsSecretRef must be set when spec.ccpApiEndpoint is set"))
+		return permanent(fmt.Errorf("spec.credentialsReferenceName must be set when spec.ccpApiEndpoint is set"))
 	}
 
-	seedSecretRef := *cfg.Spec.CredentialsSecretRef
-	seedSecret := &corev1.Secret{}
-	if err := a.client.Get(ctx, types.NamespacedName{Namespace: seedSecretRef.Namespace, Name: seedSecretRef.Name}, seedSecret); err != nil {
+	seedSecret, err := a.getReferencedCredentialsSecret(ctx, ex, cfg)
+	if err != nil {
 		meta.SetStatusCondition(&cfg.Status.Conditions, metav1.Condition{
 			Type:               "ControlPlaneLoadBalancerReady",
 			Status:             metav1.ConditionFalse,
 			Reason:             "ConfigError",
-			Message:            fmt.Sprintf("getting credentials secret %s/%s failed", seedSecretRef.Namespace, seedSecretRef.Name),
+			Message:            fmt.Sprintf("resolving referenced credentials secret failed: %v", err),
 			LastTransitionTime: metav1.Now(),
 		})
-		return permanent(fmt.Errorf("getting credentials secret %s/%s: %w", seedSecretRef.Namespace, seedSecretRef.Name, err))
+		return err
 	}
 
 	username, userErr := readSecretKey(seedSecret, "username", "F5_USERNAME")
@@ -561,7 +604,7 @@ func (a *actuator) provisionControlPlaneViaCMP(ctx context.Context, log logr.Log
 
 	var cmp f5client.Client
 	if ceErr == nil && projErr == nil {
-		cmp, err = f5client.NewClientWithCeAuth(log, cfg.Spec.CcpApiEndpoint, orgName, projectID, ceAuth)
+		cmp, err = f5client.NewClientWithCeAuth(log, cfg.Spec.CcpApiEndpoint, orgName, projectID,strings.TrimSpace(cfg.Spec.Region), ceAuth)
 	} else {
 		if userErr != nil || passErr != nil {
 			// Preserve the original secret-key error message if basic auth is attempted.
@@ -727,7 +770,7 @@ func (a *actuator) Delete(ctx context.Context, log logr.Logger, ex *extensionsv1
 	}
 
 	// Best-effort control-plane cleanup via CMP/CCP (do not block deletion).
-	if err := a.cleanupControlPlaneViaCMP(ctx, log, cfg); err != nil {
+	if err := a.cleanupControlPlaneViaCMP(ctx, log, ex, cfg); err != nil {
 		log.Error(err, "CMP/CCP control-plane cleanup failed (best-effort)")
 	}
 
@@ -746,7 +789,12 @@ func (a *actuator) ForceDelete(ctx context.Context, log logr.Logger, ex *extensi
 
 // cleanupControlPlaneViaCMP deletes CMP LBaaS resources (VirtualServer → VIP → LBService) in reverse order on Shoot deletion.
 // Input: ctx, log, cfg (F5LoadBalancerConfig with CMP resource IDs in status). Output: error — nil on success or if no CMP endpoint configured.
-func (a *actuator) cleanupControlPlaneViaCMP(ctx context.Context, log logr.Logger, cfg *f5v1alpha1.F5LoadBalancerConfig) error {
+func (a *actuator) cleanupControlPlaneViaCMP(
+	ctx context.Context,
+	log logr.Logger,
+	ex *extensionsv1alpha1.Extension,
+	cfg *f5v1alpha1.F5LoadBalancerConfig,
+) error {
 	if !cfg.Spec.EnablePerShootControlPlaneVIP {
 		// Per-shoot VIP was never provisioned; nothing to clean up on F5/CMP.
 		return nil
@@ -757,17 +805,13 @@ func (a *actuator) cleanupControlPlaneViaCMP(ctx context.Context, log logr.Logge
 	if cfg.Spec.TenantOrPartition == "" {
 		return nil
 	}
-	if cfg.Spec.CredentialsSecretRef == nil {
-		return nil
-	}
-	seedSecretRef := *cfg.Spec.CredentialsSecretRef
-	if seedSecretRef.Name == "" || seedSecretRef.Namespace == "" {
+	if strings.TrimSpace(cfg.Spec.CredentialsReferenceName) == "" {
 		return nil
 	}
 
-	seedSecret := &corev1.Secret{}
-	if err := a.client.Get(ctx, types.NamespacedName{Namespace: seedSecretRef.Namespace, Name: seedSecretRef.Name}, seedSecret); err != nil {
-		return fmt.Errorf("getting credentials secret %s/%s: %w", seedSecretRef.Namespace, seedSecretRef.Name, err)
+	seedSecret, err := a.getReferencedCredentialsSecret(ctx, ex, cfg)
+	if err != nil {
+		return fmt.Errorf("resolving referenced credentials secret during cleanup: %w", err)
 	}
 
 	username, userErr := readSecretKey(seedSecret, "username", "F5_USERNAME")
@@ -785,9 +829,8 @@ func (a *actuator) cleanupControlPlaneViaCMP(ctx context.Context, log logr.Logge
 	}
 
 	var cmp f5client.Client
-	var err error
 	if ceErr == nil && projErr == nil {
-		cmp, err = f5client.NewClientWithCeAuth(log, cfg.Spec.CcpApiEndpoint, orgName, projectID, ceAuth)
+		cmp, err = f5client.NewClientWithCeAuth(log, cfg.Spec.CcpApiEndpoint, orgName, projectID,strings.TrimSpace(cfg.Spec.Region), ceAuth)
 	} else if userErr == nil && passErr == nil {
 		cmp, err = f5client.NewClientWithBasicAuth(log, cfg.Spec.CcpApiEndpoint, orgName, username, password)
 	} else {
@@ -1047,8 +1090,8 @@ func (a *actuator) reconcileCISInShoot(ctx context.Context, log logr.Logger, ex 
 	if cfg.Spec.TenantOrPartition == "" {
 		return permanent(fmt.Errorf("spec.tenantOrPartition must not be empty when enableApplicationLB=true"))
 	}
-	if cfg.Spec.CredentialsSecretRef == nil || cfg.Spec.CredentialsSecretRef.Name == "" || cfg.Spec.CredentialsSecretRef.Namespace == "" {
-		return permanent(fmt.Errorf("spec.credentialsSecretRef.name and spec.credentialsSecretRef.namespace must be set when enableApplicationLB=true"))
+	if strings.TrimSpace(cfg.Spec.CredentialsReferenceName) == "" {
+		return permanent(fmt.Errorf("spec.credentialsReferenceName must be set when enableApplicationLB=true"))
 	}
 	if strings.TrimSpace(cfg.Spec.VPCID) == "" {
 		return permanent(fmt.Errorf("spec.vpcId must not be empty when enableApplicationLB=true"))
@@ -1072,10 +1115,9 @@ func (a *actuator) reconcileCISInShoot(ctx context.Context, log logr.Logger, ex 
 	}
 
 	// Read credentials from the referenced seed secret (we will copy them into the shoot).
-	seedSecretRef := *cfg.Spec.CredentialsSecretRef
-	seedSecret := &corev1.Secret{}
-	if err := a.client.Get(ctx, types.NamespacedName{Namespace: seedSecretRef.Namespace, Name: seedSecretRef.Name}, seedSecret); err != nil {
-		return permanent(fmt.Errorf("getting credentials secret %s/%s: %w", seedSecretRef.Namespace, seedSecretRef.Name, err))
+	seedSecret, err := a.getReferencedCredentialsSecret(ctx, ex, cfg)
+	if err != nil {
+		return err
 	}
 
 	ceAuth, err := readSecretKey(seedSecret, "Ce-Auth", "ce-auth", "ceAuth", "ce_auth")
@@ -1091,6 +1133,17 @@ func (a *actuator) reconcileCISInShoot(ctx context.Context, log logr.Logger, ex 
 	if err != nil {
 		return permanent(err)
 	}
+
+	apiKeyID, err := readSecretKey(seedSecret, "api-key-id", "api_key_id", "apiKeyId", "CMP_API_KEY_ID")
+	if err != nil {
+		return permanent(err)
+	}
+
+	apiSecret, err := readSecretKey(seedSecret, "api-secret", "api_secret", "apiSecret", "CMP_API_SECRET")
+	if err != nil {
+		return permanent(err)
+	}
+
 	orgName := cfg.Spec.TenantOrPartition
 	if orgFromSecret, orgErr := readSecretKey(seedSecret, "organisation-name", "organisationName", "organisation_name"); orgErr == nil && orgFromSecret != "" {
 		orgName = orgFromSecret
@@ -1154,13 +1207,18 @@ func (a *actuator) reconcileCISInShoot(ctx context.Context, log logr.Logger, ex 
 				Env: []corev1.EnvVar{
 					{Name: "CMP_ENDPOINT", Value: strings.TrimRight(cfg.Spec.CcpApiEndpoint, "/")},
 					{Name: "CMP_CE_AUTH", Value: ceAuth},
+					{Name: "CMP_API_KEY_ID", Value: apiKeyID},
+					{Name: "CMP_API_SECRET", Value: apiSecret},
 					{Name: "CMP_ORGANISATION_NAME", Value: orgName},
 					{Name: "CMP_PROJECT_ID", Value: projectID},
 					{Name: "CMP_VPC_ID", Value: strings.TrimSpace(cfg.Spec.VPCID)},
 					{Name: "CMP_VPC_NAME", Value: strings.TrimSpace(cfg.Spec.VPCName)},
 					{Name: "CMP_NETWORK_ID", Value: strings.TrimSpace(cfg.Spec.NetworkID)},
 					{Name: "CMP_LB_FLAVOR_ID", Value: strconv.FormatInt(int64(cfg.Spec.FlavorID), 10)},
+					{Name: "CMP_REGION", Value: strings.TrimSpace(cfg.Spec.Region)},
+					{Name: "SHOOT_NAMESPACE", Value: ex.Namespace},
 					{Name: "F5_SVC_LB_LOADBALANCER_CLASS", Value: "f5.extensions.gardener.cloud/bigip"},
+					{Name: "F5_INSECURE_SKIP_TLS_VERIFY", Value: "true"},
 				},
 			},
 		}
@@ -1171,14 +1229,7 @@ func (a *actuator) reconcileCISInShoot(ctx context.Context, log logr.Logger, ex 
 
 	// Non-blocking readiness check: if the bridge is not yet available, return a
 	// transient error so the reconciler requeues rather than blocking this worker thread.
-	dep := &appsv1.Deployment{}
-	if err := shootClient.Get(ctx, types.NamespacedName{Namespace: cisNamespace, Name: bridgeName}, dep); err != nil {
-		return fmt.Errorf("getting svc-lb-bridge deployment %s/%s: %w", cisNamespace, bridgeName, err)
-	}
-	if dep.Status.AvailableReplicas < 1 {
-		log.Info("svc-lb-bridge not yet ready; will recheck on next reconcile", "namespace", cisNamespace, "deployment", bridgeName)
-		return fmt.Errorf("svc-lb-bridge deployment %s/%s not yet ready (0 available replicas)", cisNamespace, bridgeName)
-	}
+
 
 	log.Info("Reconciled svc-lb-bridge in Shoot", "namespace", cisNamespace, "deployment", bridgeName, "cmpEndpoint", cfg.Spec.CcpApiEndpoint, "organisationName", orgName)
 	return nil
@@ -1229,16 +1280,6 @@ func (a *actuator) refreshCeAuthIfNeeded(ctx context.Context, log logr.Logger, s
 		"validity", defaultCeAuthTokenValidity.String(),
 	)
 
-	// Update the Secret with the fresh token so downstream consumers
-	// (svc-lb-bridge Deployment env vars) automatically get the new value.
-	if secret.Data == nil {
-		secret.Data = make(map[string][]byte)
-	}
-	secret.Data["Ce-Auth"] = []byte(freshToken)
-	if err := a.client.Update(ctx, secret); err != nil {
-		log.Error(err, "failed to update Secret with refreshed Ce-Auth token; using token in-memory only")
-		// Non-fatal: we still have the fresh token for this reconcile cycle.
-	}
 
 	return freshToken, nil
 }
@@ -1387,6 +1428,42 @@ func isConditionTrue(conditions []metav1.Condition, condType string) bool {
 	return cond != nil && cond.Status == metav1.ConditionTrue
 }
 
+func (a *actuator) getReferencedCredentialsSecret(
+	ctx context.Context,
+	ex *extensionsv1alpha1.Extension,
+	cfg *f5v1alpha1.F5LoadBalancerConfig,
+) (*corev1.Secret, error) {
+	referenceName := strings.TrimSpace(cfg.Spec.CredentialsReferenceName)
+	if referenceName == "" {
+		return nil, permanent(fmt.Errorf("spec.credentialsReferenceName must not be empty"))
+	}
+
+	ref := &autoscalingv1.CrossVersionObjectReference{
+		APIVersion: "v1",
+		Kind:       "Secret",
+		Name:       referenceName,
+	}
+
+	secret := &corev1.Secret{}
+
+	if err := controller.GetObjectByReference(
+		ctx,
+		a.client,
+		ref,
+		ex.Namespace,
+		secret,
+	); err != nil {
+		return nil, fmt.Errorf(
+			"resolving referenced credentials secret %q in shoot namespace %s: %w",
+			referenceName,
+			ex.Namespace,
+			err,
+		)
+	}
+
+	return secret, nil
+}
+
 // discoverKubeAPIServerBackends reads the kube-apiserver Service Endpoints in the Shoot's Seed namespace to find apiserver pod IPs and ports.
 // Input: ctx, log, ex (Extension — its namespace is the Shoot technical namespace on Seed). Output: []Backend (IP:Port pairs), error if no endpoints found.
 // These backends become pool members in the CMP VirtualServer for control-plane LB.
@@ -1405,24 +1482,19 @@ func (a *actuator) discoverKubeAPIServerBackends(
 		return nil, fmt.Errorf("getting kube-apiserver Service %s/%s: %w", svcNamespace, svcName, err)
 	}
 
-	sliceList := &discoveryv1.EndpointSliceList{}
-	if err := a.client.List(ctx, sliceList, client.InNamespace(svcNamespace), client.MatchingLabels{"kubernetes.io/service-name": svcName}); err != nil {
-		return nil, fmt.Errorf("listing kube-apiserver EndpointSlices %s/%s: %w", svcNamespace, svcName, err)
+	eps := &corev1.Endpoints{}
+	if err := a.client.Get(ctx, types.NamespacedName{Namespace: svcNamespace, Name: svcName}, eps); err != nil {
+		return nil, fmt.Errorf("getting kube-apiserver Endpoints %s/%s: %w", svcNamespace, svcName, err)
 	}
 
 	var backends []f5client.Backend
-	for _, slice := range sliceList.Items {
-		for _, endpoint := range slice.Endpoints {
-			if endpoint.Addresses == nil || len(endpoint.Addresses) == 0 {
-				continue
-			}
-			for _, port := range slice.Ports {
-				for _, addr := range endpoint.Addresses {
-					backends = append(backends, f5client.Backend{
-						IP:   addr,
-						Port: *port.Port,
-					})
-				}
+	for _, subset := range eps.Subsets {
+		for _, addr := range subset.Addresses {
+			for _, port := range subset.Ports {
+				backends = append(backends, f5client.Backend{
+					IP:   addr.IP,
+					Port: port.Port,
+				})
 			}
 		}
 	}

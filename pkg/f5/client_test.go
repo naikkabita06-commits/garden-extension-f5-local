@@ -2,6 +2,7 @@ package f5
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -35,7 +36,7 @@ func TestClientWithCeAuth_SetsHeaders(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c, err := NewClientWithCeAuth(logr.Discard(), srv.URL, "tenant", "proj", "token")
+	c, err := NewClientWithCeAuth(logr.Discard(), srv.URL, "tenant", "proj", "dev", "token")
 	if err != nil {
 		t.Fatalf("creating client: %v", err)
 	}
@@ -59,7 +60,7 @@ func TestDeleteLBService_IgnoresNotFound(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c, err := NewClientWithCeAuth(logr.Discard(), srv.URL, "tenant", "proj", "token")
+	c, err := NewClientWithCeAuth(logr.Discard(), srv.URL, "tenant", "proj", "dev", "token")
 	if err != nil {
 		t.Fatalf("creating client: %v", err)
 	}
@@ -81,7 +82,7 @@ func TestIsUnauthorized_MatchesWrappedHTTPStatusError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c, err := NewClientWithCeAuth(logr.Discard(), srv.URL, "tenant", "proj", "token")
+	c, err := NewClientWithCeAuth(logr.Discard(), srv.URL, "tenant", "proj", "dev", "token")
 	if err != nil {
 		t.Fatalf("creating client: %v", err)
 	}
@@ -142,7 +143,7 @@ func TestEnsureControlPlaneVirtualServer_CMPLBaaSFlow(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c, err := NewClientWithCeAuth(logr.Discard(), srv.URL, "tenant", "proj", "token")
+	c, err := NewClientWithCeAuth(logr.Discard(), srv.URL, "tenant", "proj", "dev", "token")
 	if err != nil {
 		t.Fatalf("creating client: %v", err)
 	}
@@ -238,7 +239,7 @@ func TestEnsureControlPlaneVirtualServer_IsIdempotentOnRetry(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c, err := NewClientWithCeAuth(logr.Discard(), srv.URL, "tenant", "proj", "token")
+	c, err := NewClientWithCeAuth(logr.Discard(), srv.URL, "tenant", "proj", "dev", "token")
 	if err != nil {
 		t.Fatalf("creating client: %v", err)
 	}
@@ -297,7 +298,7 @@ func TestEnsureControlPlaneVirtualServer_DoesNotCreateOnListError(t *testing.T) 
 	}))
 	defer srv.Close()
 
-	c, err := NewClientWithCeAuth(logr.Discard(), srv.URL, "tenant", "proj", "token")
+	c, err := NewClientWithCeAuth(logr.Discard(), srv.URL, "tenant", "proj", "dev", "token")
 	if err != nil {
 		t.Fatalf("creating client: %v", err)
 	}
@@ -320,7 +321,7 @@ func TestClient_DoesNotFollowRedirects(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c, err := NewClientWithCeAuth(logr.Discard(), srv.URL, "tenant", "proj", "token")
+	c, err := NewClientWithCeAuth(logr.Discard(), srv.URL, "tenant", "proj", "dev", "token")
 	if err != nil {
 		t.Fatalf("creating client: %v", err)
 	}
@@ -367,7 +368,7 @@ func TestDeleteControlPlaneVirtualServer_FullCMPCleanup(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c, err := NewClientWithCeAuth(logr.Discard(), srv.URL, "tenant", "proj", "token")
+	c, err := NewClientWithCeAuth(logr.Discard(), srv.URL, "tenant", "proj", "dev", "token")
 	if err != nil {
 		t.Fatalf("creating client: %v", err)
 	}
@@ -389,6 +390,88 @@ func TestDeleteControlPlaneVirtualServer_FullCMPCleanup(t *testing.T) {
 	}
 	if !deletedLB {
 		t.Fatalf("expected LB Service to be deleted")
+	}
+}
+
+func TestGetLBServiceVIPs_PaginatesAndRetriesWithResolvedSubnetHeader(t *testing.T) {
+	var (
+		listCalls         int
+		observedSubnetIDs []string
+	)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/lb_service/lb-1") {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"id":"lb-1","network_id":"b99ae08f-9e1d-4311-8bc1-94294df24f24"}`))
+			return
+		}
+
+		if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/lb_service/lb-1/vip") {
+			listCalls++
+			subnetID := strings.TrimSpace(r.Header.Get("subnet-id"))
+			observedSubnetIDs = append(observedSubnetIDs, subnetID)
+
+			if subnetID == "" {
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte(`{"message":"Failed to list VIP ports"}`))
+				return
+			}
+
+			offset := r.URL.Query().Get("offset")
+			limit := r.URL.Query().Get("limit")
+			if limit != "100" {
+				t.Fatalf("expected limit=100, got %q", limit)
+			}
+
+			switch offset {
+			case "0":
+				items := make([]string, 0, 100)
+				for i := 1; i <= 100; i++ {
+					items = append(items, fmt.Sprintf(`{"id":"%d","address":"10.0.0.%d"}`, i, i))
+				}
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte("[" + strings.Join(items, ",") + "]"))
+			case "100":
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`[{"id":"101","address":"10.0.0.101"},{"id":"102","address":"10.0.0.102"}]`))
+			default:
+				t.Fatalf("unexpected offset %q", offset)
+			}
+			return
+		}
+
+		t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+	}))
+	defer srv.Close()
+
+	c, err := NewClientWithCeAuth(logr.Discard(), srv.URL, "tenant", "proj", "dev", "token")
+	if err != nil {
+		t.Fatalf("creating client: %v", err)
+	}
+
+	items, err := c.GetLBServiceVIPs(context.Background(), "lb-1", "")
+	if err != nil {
+		t.Fatalf("GetLBServiceVIPs returned error: %v", err)
+	}
+	if len(items) != 102 {
+		t.Fatalf("expected 102 VIPs across two pages, got %d", len(items))
+	}
+	if listCalls != 3 {
+		t.Fatalf("expected 3 VIP list calls (initial failure + 2 paged retries), got %d", listCalls)
+	}
+	if len(observedSubnetIDs) < 3 {
+		t.Fatalf("expected at least 3 subnet header observations, got %d", len(observedSubnetIDs))
+	}
+	if observedSubnetIDs[0] != "" {
+		t.Fatalf("expected first list call without subnet-id header, got %q", observedSubnetIDs[0])
+	}
+	if observedSubnetIDs[1] != "b99ae08f-9e1d-4311-8bc1-94294df24f24" {
+		t.Fatalf("expected second list call with resolved subnet-id, got %q", observedSubnetIDs[1])
+	}
+	if observedSubnetIDs[2] != "b99ae08f-9e1d-4311-8bc1-94294df24f24" {
+		t.Fatalf("expected third list call with resolved subnet-id, got %q", observedSubnetIDs[2])
 	}
 }
 
@@ -423,7 +506,7 @@ func TestListLoadBalancers_UsesPrefixQueryAndHeaders(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c, err := NewClientWithCeAuth(logr.Discard(), srv.URL, "tenant", "proj", "token")
+	c, err := NewClientWithCeAuth(logr.Discard(), srv.URL, "tenant", "proj", "dev", "token")
 	if err != nil {
 		t.Fatalf("creating client: %v", err)
 	}
@@ -477,7 +560,7 @@ func TestCreateLoadBalancer_UsesPrefixHeadersAndFormEncoding(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c, err := NewClientWithCeAuth(logr.Discard(), srv.URL, "tenant", "proj", "token")
+	c, err := NewClientWithCeAuth(logr.Discard(), srv.URL, "tenant", "proj", "dev", "token")
 	if err != nil {
 		t.Fatalf("creating client: %v", err)
 	}
@@ -530,7 +613,7 @@ func TestCreateLBService_UsesPrefixCeAuthHeadersAndFormEncoding(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c, err := NewClientWithCeAuth(logr.Discard(), srv.URL, "tenant", "proj", "token")
+	c, err := NewClientWithCeAuth(logr.Discard(), srv.URL, "tenant", "proj", "dev", "token")
 	if err != nil {
 		t.Fatalf("creating client: %v", err)
 	}
@@ -591,7 +674,7 @@ func TestGetDeleteOptionsLoadBalancer_UsesPrefixAndHeaders(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c, err := NewClientWithCeAuth(logr.Discard(), srv.URL, "tenant", "proj", "token")
+	c, err := NewClientWithCeAuth(logr.Discard(), srv.URL, "tenant", "proj", "dev", "token")
 	if err != nil {
 		t.Fatalf("creating client: %v", err)
 	}
@@ -652,7 +735,7 @@ func TestUpdateLoadBalancer_UsesPrefixHeadersAndFormEncoding(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c, err := NewClientWithCeAuth(logr.Discard(), srv.URL, "tenant", "proj", "token")
+	c, err := NewClientWithCeAuth(logr.Discard(), srv.URL, "tenant", "proj", "dev", "token")
 	if err != nil {
 		t.Fatalf("creating client: %v", err)
 	}
@@ -676,7 +759,7 @@ func TestRoutingRulesUseLBServiceSwaggerHierarchy(t *testing.T) {
 		_, _ = w.Write([]byte("[]"))
 	}))
 	defer srv.Close()
-	c, err := NewClientWithCeAuth(logr.Discard(), srv.URL, "tenant", "proj", "token")
+	c, err := NewClientWithCeAuth(logr.Discard(), srv.URL, "tenant", "proj", "dev", "token")
 	if err != nil {
 		t.Fatal(err)
 	}

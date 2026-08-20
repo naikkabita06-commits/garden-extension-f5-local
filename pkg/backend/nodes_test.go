@@ -4,6 +4,8 @@ import (
 	"context"
 	"testing"
 
+	lbannotations "github.com/gardener/gardener-extension-f5/pkg/annotations"
+
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -77,5 +79,46 @@ func TestListReadyNodeBackendsForPortFiltersEndpointSlicePorts(t *testing.T) {
 	}
 	if len(backends) != 1 || backends[0].IP != "10.0.0.2" {
 		t.Fatalf("unexpected port-aware backends: %#v", backends)
+	}
+}
+
+func TestListReadyNodeBackendsCarriesProviderIDComputeIDAndBackendIP(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "web"}}
+	node := readyNode("n1", "10.0.0.1")
+	node.Spec.ProviderID = "cmp://compute-1"
+
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(svc, node).Build()
+	backends, err := ListReadyNodeBackends(context.Background(), c, svc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(backends) != 1 || backends[0].NodeName != "n1" || backends[0].ProviderID != "cmp://compute-1" || backends[0].ComputeID != "compute-1" || backends[0].IP != "10.0.0.1" {
+		t.Fatalf("unexpected backend identity: %#v", backends)
+	}
+}
+
+func TestListReadyNodeBackendsUsesDevelopmentAnnotations(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "web"}}
+	node := readyNode("n1", "10.0.0.1")
+	node.Annotations = map[string]string{
+		lbannotations.CMPComputeID: "compute-dev",
+		lbannotations.BackendIP:    "10.10.1.145",
+	}
+
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(svc, node).Build()
+	backends, err := ListReadyNodeBackends(context.Background(), c, svc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(backends) != 1 || backends[0].ComputeID != "compute-dev" || backends[0].IP != "10.10.1.145" {
+		t.Fatalf("unexpected development backend identity: %#v", backends)
 	}
 }

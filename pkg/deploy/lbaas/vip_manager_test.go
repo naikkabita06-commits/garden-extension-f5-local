@@ -8,7 +8,7 @@ import (
 
 func TestVIPManagerVerifiesCurrentIDAndBackfillsAddress(t *testing.T) {
 	stub := &stubClient{vips: []VIP{{ID: "vip-1", Address: "10.0.0.7"}}}
-	id, address, changed, err := NewVIPManager(stub).Ensure(context.Background(), "lb-1", "vip-1", "")
+	id, address, changed, err := NewVIPManager(stub).Ensure(context.Background(), "lb-1", "subnet-1", "vip-1", "", false)
 	if err != nil {
 		t.Fatalf("Ensure failed: %v", err)
 	}
@@ -17,33 +17,33 @@ func TestVIPManagerVerifiesCurrentIDAndBackfillsAddress(t *testing.T) {
 	}
 }
 
-func TestVIPManagerRejectsReplacementWhenStaleIdentityIsAmbiguous(t *testing.T) {
+func TestVIPManagerRecreatesWhenCurrentVIPIsMissing(t *testing.T) {
 	stub := &stubClient{vips: []VIP{{ID: "vip-other", Address: "10.0.0.8"}}}
-	_, _, _, err := NewVIPManager(stub).Ensure(context.Background(), "lb-1", "vip-1", "10.0.0.7")
-	if err == nil || !strings.Contains(err.Error(), "cannot adopt VIP") {
-		t.Fatalf("expected ambiguous stale VIP error, got %v", err)
+	id, address, changed, err := NewVIPManager(stub).Ensure(context.Background(), "lb-1", "subnet-1", "vip-1", "10.0.0.7", false)
+	if err != nil || id != "7" || address != "10.0.0.7" || !changed || stub.createdVIP != 1 {
+		t.Fatalf("expected VIP recreation, id=%q address=%q changed=%t created=%d err=%v", id, address, changed, stub.createdVIP, err)
 	}
 }
 
 func TestVIPManagerRecreatesDeletedVIPWhenNoOtherVIPExists(t *testing.T) {
 	stub := &stubClient{}
-	id, address, changed, err := NewVIPManager(stub).Ensure(context.Background(), "lb-1", "vip-old", "10.0.0.7")
+	id, address, changed, err := NewVIPManager(stub).Ensure(context.Background(), "lb-1", "subnet-1", "vip-old", "10.0.0.7", false)
 	if err != nil || id != "7" || address != "10.0.0.7" || !changed || stub.createdVIP != 1 {
 		t.Fatalf("expected deleted VIP recreation, id=%q address=%q changed=%t created=%d err=%v", id, address, changed, stub.createdVIP, err)
 	}
 }
 
-func TestVIPManagerRejectsAmbiguousExistingVIPsWithoutStableIdentity(t *testing.T) {
+func TestVIPManagerCreatesNewVIPEvenWhenOthersExist(t *testing.T) {
 	stub := &stubClient{vips: []VIP{{ID: "vip-1", Address: "10.0.0.7"}, {ID: "vip-2", Address: "10.0.0.8"}}}
-	_, _, _, err := NewVIPManager(stub).Ensure(context.Background(), "lb-1", "", "")
-	if err == nil || !strings.Contains(err.Error(), "cannot adopt VIP") {
-		t.Fatalf("expected ambiguous VIP adoption error, got %v", err)
+	id, _, changed, err := NewVIPManager(stub).Ensure(context.Background(), "lb-1", "subnet-1", "", "", false)
+	if err != nil || id != "7" || !changed || stub.createdVIP != 1 {
+		t.Fatalf("expected fresh VIP allocation, id=%q changed=%t created=%d err=%v", id, changed, stub.createdVIP, err)
 	}
 }
 
 func TestVIPManagerCreatesWhenNoObservedVIPExists(t *testing.T) {
 	stub := &stubClient{}
-	id, address, changed, err := NewVIPManager(stub).Ensure(context.Background(), "lb-1", "", "")
+	id, address, changed, err := NewVIPManager(stub).Ensure(context.Background(), "lb-1", "subnet-1", "", "", false)
 	if err != nil {
 		t.Fatalf("Ensure failed: %v", err)
 	}
@@ -52,10 +52,10 @@ func TestVIPManagerCreatesWhenNoObservedVIPExists(t *testing.T) {
 	}
 }
 
-func TestVIPManagerDoesNotAdoptSameAddressVIP(t *testing.T) {
+func TestVIPManagerRejectsMissingSuppliedVIPWhenStrict(t *testing.T) {
 	stub := &stubClient{vips: []VIP{{ID: "vip-other", Address: "10.0.0.7"}}}
-	_, _, _, err := NewVIPManager(stub).Ensure(context.Background(), "lb-1", "vip-stale", "10.0.0.7")
-	if err == nil || !strings.Contains(err.Error(), "cannot adopt VIP") {
-		t.Fatalf("expected ownership-safe VIP error, got %v", err)
+	_, _, _, err := NewVIPManager(stub).Ensure(context.Background(), "lb-1", "subnet-1", "vip-stale", "10.0.0.7", true)
+	if err == nil || !strings.Contains(err.Error(), "supplied VIP") {
+		t.Fatalf("expected strict supplied VIP error, got %v", err)
 	}
 }

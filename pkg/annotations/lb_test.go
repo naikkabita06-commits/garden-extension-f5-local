@@ -53,3 +53,23 @@ func TestParseServiceIgnoresInvalidNumericAndProtocolAnnotations(t *testing.T) {
 		t.Fatalf("expected defaults for invalid numeric values, got %#v", cfg)
 	}
 }
+
+func TestParseServiceReadsPlacementAnnotations(t *testing.T) {
+	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+		VPCID:     "vpc-1",
+		NetworkID: "legacy-network",
+		SubnetID:  "subnet-1",
+		FlavorID:  "25",
+	}}}
+
+	cfg := ParseService(svc)
+	if cfg.VPCID != "vpc-1" {
+		t.Fatalf("expected vpc-id annotation, got %q", cfg.VPCID)
+	}
+	if cfg.NetworkID != "subnet-1" {
+		t.Fatalf("expected subnet-id annotation to win over network-id, got %q", cfg.NetworkID)
+	}
+	if cfg.FlavorID != 25 {
+		t.Fatalf("expected flavor-id annotation, got %d", cfg.FlavorID)
+	}
+}

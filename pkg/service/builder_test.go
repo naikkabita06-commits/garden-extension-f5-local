@@ -52,8 +52,13 @@ func TestBuildLoadBalancerStackUsesVIPGroupOnlyForSharedParent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildLoadBalancerStack: %v", err)
 	}
-	if stack.LBService.Name != "app-group-ns-blue-team" || stack.LBService.Ownership.SharedGroup != "Blue Team" {
-		t.Fatalf("expected grouped parent LB, got %#v", stack.LBService)
+	expectedLBName := LBServiceName(svc)
+	if stack.LBService.Name != expectedLBName ||
+	stack.LBService.Ownership.SharedGroup != "Blue Team" {
+	t.Fatalf(
+		"expected grouped parent LB name %q, got %#v",
+		expectedLBName,
+		stack.LBService,)
 	}
 	if stack.VirtualServers[0].Name != "app-vs-ns-web-443" || stack.VirtualServers[0].Ownership.SharedGroup != "" {
 		t.Fatalf("expected owner-specific listener, got %#v", stack.VirtualServers[0])

@@ -93,15 +93,18 @@ type Certificate struct {
 	Certificate string
 	PrivateKey  string
 	CA          string
-	Ownership  Ownership
+	Ownership   Ownership
 }
 
 // BackendMember is the normalized backend representation used by model
 // builders before a deployer translates it into CMP-specific request fields.
 type BackendMember struct {
-	IP     string
-	Port   int32
-	Weight int
+	NodeName   string
+	ProviderID string
+	ComputeID  string
+	IP         string
+	Port       int32
+	Weight     int
 }
 
 // Monitor is the desired health-monitor configuration.
