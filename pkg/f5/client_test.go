@@ -771,3 +771,34 @@ func TestRoutingRulesUseLBServiceSwaggerHierarchy(t *testing.T) {
 		t.Fatalf("routing-rule path=%q, want %q", gotPath, want)
 	}
 }
+
+func TestCreateLBVirtualServerUsesAggregateFormContract(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("method=%s, want POST", r.Method)
+		}
+		if r.URL.RawQuery != "" {
+			t.Fatalf("aggregate request fields must be in the body, query=%q", r.URL.RawQuery)
+		}
+		if got := r.Header.Get("Content-Type"); !strings.HasPrefix(got, "application/x-www-form-urlencoded") {
+			t.Fatalf("content-type=%q", got)
+		}
+		if err := r.ParseForm(); err != nil {
+			t.Fatal(err)
+		}
+		if r.Form.Get("vip_port_id") != "36944" || r.Form.Get("pool_name") != "pool-web" || r.Form.Get("monitor_protocol") != "TCP" || len(r.Form["nodes"]) != 1 {
+			t.Fatalf("unexpected aggregate form: %#v", r.Form)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"vs-1","status":"Creating"}`))
+	}))
+	defer srv.Close()
+	c, err := NewClientWithCeAuth(logr.Discard(), srv.URL, "tenant", "proj", "dev", "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	form := url.Values{"vip_port_id": {"36944"}, "pool_name": {"pool-web"}, "monitor_protocol": {"TCP"}, "nodes": {`{"resource_id":"compute-1"}`}}
+	if _, err := c.CreateLBVirtualServer(context.Background(), "lb-1", form); err != nil {
+		t.Fatal(err)
+	}
+}

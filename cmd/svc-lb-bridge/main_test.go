@@ -37,7 +37,6 @@ type stubCMP struct {
 	deleteVSN           int
 	deleteVN            int
 	deleteLBN           int
-	searchN             int
 	lastVSQ             url.Values
 	createCertN         int
 	lastCertQ           url.Values
@@ -73,8 +72,11 @@ func (s *stubCMP) GetLBService(
 	_ context.Context,
 	id string,
 ) (json.RawMessage, error) {
+	if s.deleteLBN > 0 {
+		return nil, &f5client.HTTPStatusError{StatusCode: 404, Status: "404 Not Found"}
+	}
 	return json.RawMessage(
-		fmt.Sprintf(`{"id":%q,"name":"test-lb"}`, id),
+		fmt.Sprintf(`{"id":%q,"name":"test-lb","status":"Created","operating_status":"Active","vpc_id":"vpc-1","vpc_name":"vpc-1","network_id":"subnet-service","region":"dev"}`, id),
 	), nil
 }
 
@@ -100,13 +102,24 @@ func (s *stubCMP) DeleteLBServiceVIP(_ context.Context, _, _ string) error {
 func (s *stubCMP) CreateLBVirtualServer(_ context.Context, _ string, q url.Values) (json.RawMessage, error) {
 	s.createVSN++
 	s.lastVSQ = q
-	created := json.RawMessage(`{"id":"vs-001","name":"test-vs"}`)
+	created := json.RawMessage(fmt.Sprintf(`{"id":"vs-%03d","name":%q,"status":"Active","protocol":%q,"port":%s,"vip_port":{"id":%s}}`, s.createVSN, q.Get("name"), q.Get("protocol"), q.Get("port"), q.Get("vip_port_id")))
 	s.vsList = append(s.vsList, created)
 	return created, nil
 }
 func (s *stubCMP) ListLBVirtualServers(_ context.Context, _ string) ([]json.RawMessage, error) {
 	s.listVSN++
 	return append([]json.RawMessage(nil), s.vsList...), nil
+}
+func (s *stubCMP) GetLBVirtualServer(_ context.Context, _, id string) (json.RawMessage, error) {
+	for _, raw := range s.vsList {
+		var item struct {
+			ID string `json:"id"`
+		}
+		if json.Unmarshal(raw, &item) == nil && item.ID == id {
+			return raw, nil
+		}
+	}
+	return nil, &f5client.HTTPStatusError{StatusCode: 404, Status: "404 Not Found"}
 }
 func (s *stubCMP) DeleteLBVirtualServer(_ context.Context, _, id string) error {
 	s.deleteVSN++
@@ -139,7 +152,7 @@ func (s *stubCMP) DetachLBVirtualServerCertificate(context.Context, string, stri
 	return nil
 }
 func (s *stubCMP) GetCompute(_ context.Context, id string) (json.RawMessage, error) {
-	return json.RawMessage(`{"id":"` + id + `","vpc_id":"vpc-1","network_id":"subnet-service","ports":[{"id":5001,"fixed_ips":[{"ip_address":"172.18.0.10"}],"network_id":"subnet-service","device_id":"` + id + `","device_type":"compute"}]}`), nil
+	return json.RawMessage(`{"id":"` + id + `","instance_name":"node-` + id + `","vpc_id":"vpc-1","network_id":"subnet-service","ports":[{"id":5001,"fixed_ips":["` + id + `"],"network_id":"subnet-service","device_id":"` + id + `","device_type":"compute"}]}`), nil
 }
 func (s *stubCMP) ListLBVirtualServerPools(_ context.Context, _, _ string) ([]json.RawMessage, error) {
 	return nil, nil
@@ -160,11 +173,6 @@ func (s *stubCMP) UpdateLBVirtualServerPoolMember(_ context.Context, _, _, _, _ 
 }
 func (s *stubCMP) DeleteLBVirtualServerPoolMember(_ context.Context, _, _, _, _ string) error {
 	return nil
-}
-
-func (s *stubCMP) SearchNetworkPortsByIP(_ context.Context, ip string) ([]json.RawMessage, error) {
-	s.searchN++
-	return []json.RawMessage{json.RawMessage(`{"id":5001,"resource_id":"compute-` + ip + `","resource_type":"compute","fixed_ip":"` + ip + `"}`)}, nil
 }
 
 func newTestReconciler(t *testing.T, objs ...client.Object) (*serviceReconciler, client.Client, *stubCMP) {
@@ -207,10 +215,10 @@ func TestReconcile_AllocatesVIPAndProgramsCMPVirtualServer(t *testing.T) {
 	svc.Spec.Ports = []corev1.ServicePort{{Port: 8080, NodePort: 30080}}
 	svc.Spec.LoadBalancerClass = ptr.To(defaultLBClass)
 
-	n1 := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n1"}}
+	n1 := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n1"}, Spec: corev1.NodeSpec{ProviderID: "cmp://172.18.0.10"}}
 	n1.Status.Addresses = []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "172.18.0.10"}}
 	n1.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}
-	n2 := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n2"}}
+	n2 := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n2"}, Spec: corev1.NodeSpec{ProviderID: "cmp://172.18.0.11"}}
 	n2.Status.Addresses = []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "172.18.0.11"}}
 	n2.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}
 
@@ -221,8 +229,8 @@ func TestReconcile_AllocatesVIPAndProgramsCMPVirtualServer(t *testing.T) {
 		t.Fatalf("Reconcile: %v", err)
 	}
 
-	if stub.listLBN != 0 {
-		t.Fatalf("expected no ListLBServices call on initial create, got %d", stub.listLBN)
+	if stub.listLBN != 1 {
+		t.Fatalf("expected one deterministic pre-create LB lookup, got %d", stub.listLBN)
 	}
 	if stub.createLBN != 1 {
 		t.Fatalf("expected CreateLBService called once, got %d", stub.createLBN)
@@ -361,10 +369,10 @@ func TestReconcile_RecreatesVirtualServerWhenNodesChange(t *testing.T) {
 	svc.Spec.Ports = []corev1.ServicePort{{Port: 8080, NodePort: 30080}}
 	svc.Spec.LoadBalancerClass = ptr.To(defaultLBClass)
 
-	n1 := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n1"}}
+	n1 := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n1"}, Spec: corev1.NodeSpec{ProviderID: "cmp://172.18.0.10"}}
 	n1.Status.Addresses = []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "172.18.0.10"}}
 	n1.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}
-	n2 := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n2"}}
+	n2 := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n2"}, Spec: corev1.NodeSpec{ProviderID: "cmp://172.18.0.11"}}
 	n2.Status.Addresses = []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "172.18.0.11"}}
 	n2.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}
 
@@ -379,8 +387,9 @@ func TestReconcile_RecreatesVirtualServerWhenNodesChange(t *testing.T) {
 		t.Fatalf("expected CreateLBVirtualServer called once, got %d", stub.createVSN)
 	}
 
-	// Add a new node, then reconcile again; pool-member convergence must preserve the listener.
-	n3 := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n3"}}
+	// Add a new node, then reconcile again. CMP's aggregate API owns the pool
+	// members, so a backend-set change begins a delete-before-recreate cycle.
+	n3 := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n3"}, Spec: corev1.NodeSpec{ProviderID: "cmp://172.18.0.12"}}
 	n3.Status.Addresses = []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "172.18.0.12"}}
 	n3.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}
 	if err := c.Create(ctx, n3); err != nil {
@@ -391,11 +400,11 @@ func TestReconcile_RecreatesVirtualServerWhenNodesChange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile(2): %v", err)
 	}
-	if stub.deleteVSN != 0 {
-		t.Fatalf("expected listener preservation during member reconciliation, got %d deletes", stub.deleteVSN)
+	if stub.deleteVSN != 1 {
+		t.Fatalf("expected one aggregate listener replacement delete, got %d", stub.deleteVSN)
 	}
 	if stub.createVSN != 1 {
-		t.Fatalf("expected no listener recreation, got %d creates", stub.createVSN)
+		t.Fatalf("expected replacement to wait for deletion before a second create, got %d creates", stub.createVSN)
 	}
 }
 
@@ -578,7 +587,7 @@ func TestReconcile_PersistsLBCheckpointBeforeVIPAndVS(t *testing.T) {
 	svc.Spec.Type = corev1.ServiceTypeLoadBalancer
 	svc.Spec.Ports = []corev1.ServicePort{{Port: 8080, NodePort: 30080}}
 	svc.Spec.LoadBalancerClass = ptr.To(defaultLBClass)
-	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n1"}}
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n1"}, Spec: corev1.NodeSpec{ProviderID: "cmp://172.18.0.10"}}
 	node.Status.Addresses = []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "172.18.0.10"}}
 	node.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}
 
@@ -616,7 +625,7 @@ func TestReconcile_ProgramsAndTracksEveryServicePortIndependently(t *testing.T) 
 		{Name: "https", Port: 443, NodePort: 30443, Protocol: corev1.ProtocolTCP},
 	}
 	svc.Spec.LoadBalancerClass = ptr.To(defaultLBClass)
-	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n1"}}
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n1"}, Spec: corev1.NodeSpec{ProviderID: "cmp://172.18.0.10"}}
 	node.Status.Addresses = []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "172.18.0.10"}}
 	node.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}
 
@@ -632,7 +641,7 @@ func TestReconcile_ProgramsAndTracksEveryServicePortIndependently(t *testing.T) 
 		t.Fatalf("getting Service: %v", err)
 	}
 	observed := readServicePortObserved(got.Annotations)
-	if len(observed) != 2 || observed["http/80/http"].VirtualServerID == "" || observed["https/443/https"].VirtualServerID == "" {
+	if len(observed) != 2 || observed["http/80/tcp"].VirtualServerID == "" || observed["https/443/tcp"].VirtualServerID == "" {
 		t.Fatalf("expected per-port observed virtual servers, got %#v", observed)
 	}
 }
@@ -651,7 +660,7 @@ func TestReconcile_VIPGroupBootstrapsSharedParentWithoutSibling(t *testing.T) {
 	svc.Spec.Ports = []corev1.ServicePort{{Name: "http", Port: 8080, NodePort: 30080, Protocol: corev1.ProtocolTCP}}
 	svc.Spec.LoadBalancerClass = ptr.To(defaultLBClass)
 
-	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n1"}}
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n1"}, Spec: corev1.NodeSpec{ProviderID: "cmp://172.18.0.10"}}
 	node.Status.Addresses = []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "172.18.0.10"}}
 	node.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}
 

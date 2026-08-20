@@ -11,9 +11,10 @@ import (
 )
 
 type CleanupRequest struct {
-	Current         model.ObservedState
-	DeleteVIP       bool
-	DeleteLBService bool
+	Current                 model.ObservedState
+	DeleteVIP               bool
+	DeleteLBService         bool
+	AggregateVirtualServers bool
 }
 
 type CleanupResult struct {
@@ -43,45 +44,52 @@ func (d *Deployer) CleanupStack(ctx context.Context, req CleanupRequest) (*Clean
 		return result, nil
 	}
 
-	for _, rule := range sortedResources(current.Graph.RoutingRules) {
-		if d.routingRules == nil {
-			return result, fmt.Errorf("routing-rule cleanup requires a RoutingRuleManager")
+	if !req.AggregateVirtualServers {
+		for _, rule := range sortedResources(current.Graph.RoutingRules) {
+			if d.routingRules == nil {
+				return result, fmt.Errorf("routing-rule cleanup requires a RoutingRuleManager")
+			}
+			vsID := virtualServerIDForGraphKey(current.Graph, rule.LogicalID)
+			if err := d.routingRules.Cleanup(ctx, lbID, vsID, rule.ExternalID); err != nil && !f5client.IsNotFound(err) {
+				return result, fmt.Errorf("deleting routing rule %s: %w", rule.ExternalID, err)
+			}
 		}
-		vsID := virtualServerIDForGraphKey(current.Graph, rule.LogicalID)
-		if err := d.routingRules.Cleanup(ctx, lbID, vsID, rule.ExternalID); err != nil && !f5client.IsNotFound(err) {
-			return result, fmt.Errorf("deleting routing rule %s: %w", rule.ExternalID, err)
+		for _, member := range sortedResources(current.Graph.Members) {
+			if d.pools == nil {
+				return result, fmt.Errorf("member cleanup requires a PoolManager")
+			}
+			vsID, poolID := poolParentIDsForGraphKey(current.Graph, member.LogicalID)
+			if err := d.pools.members.client.DeletePoolMember(ctx, lbID, vsID, poolID, member.ExternalID); err != nil && !f5client.IsNotFound(err) {
+				return result, fmt.Errorf("deleting pool member %s: %w", member.ExternalID, err)
+			}
 		}
-	}
-	for _, member := range sortedResources(current.Graph.Members) {
-		if d.pools == nil {
-			return result, fmt.Errorf("member cleanup requires a PoolManager")
+		for _, monitor := range sortedResources(current.Graph.Monitors) {
+			if d.monitors == nil {
+				return result, fmt.Errorf("monitor cleanup requires a MonitorManager")
+			}
+			vsID, poolID := poolParentIDsForGraphKey(current.Graph, monitor.LogicalID)
+			if err := d.monitors.Cleanup(ctx, lbID, vsID, poolID, monitor.ExternalID); err != nil && !f5client.IsNotFound(err) {
+				return result, fmt.Errorf("deleting monitor %s: %w", monitor.ExternalID, err)
+			}
 		}
-		vsID, poolID := poolParentIDsForGraphKey(current.Graph, member.LogicalID)
-		if err := d.pools.members.client.DeletePoolMember(ctx, lbID, vsID, poolID, member.ExternalID); err != nil && !f5client.IsNotFound(err) {
-			return result, fmt.Errorf("deleting pool member %s: %w", member.ExternalID, err)
-		}
-	}
-	for _, monitor := range sortedResources(current.Graph.Monitors) {
-		if d.monitors == nil {
-			return result, fmt.Errorf("monitor cleanup requires a MonitorManager")
-		}
-		vsID, poolID := poolParentIDsForGraphKey(current.Graph, monitor.LogicalID)
-		if err := d.monitors.Cleanup(ctx, lbID, vsID, poolID, monitor.ExternalID); err != nil && !f5client.IsNotFound(err) {
-			return result, fmt.Errorf("deleting monitor %s: %w", monitor.ExternalID, err)
-		}
-	}
-	for _, pool := range sortedResources(current.Graph.Pools) {
-		if d.pools == nil {
-			return result, fmt.Errorf("pool cleanup requires a PoolManager")
-		}
-		vsID := virtualServerIDForGraphKey(current.Graph, pool.LogicalID)
-		if err := d.pools.Cleanup(ctx, lbID, vsID, pool.ExternalID); err != nil && !f5client.IsNotFound(err) {
-			return result, fmt.Errorf("deleting pool %s: %w", pool.ExternalID, err)
+		for _, pool := range sortedResources(current.Graph.Pools) {
+			if d.pools == nil {
+				return result, fmt.Errorf("pool cleanup requires a PoolManager")
+			}
+			vsID := virtualServerIDForGraphKey(current.Graph, pool.LogicalID)
+			if err := d.pools.Cleanup(ctx, lbID, vsID, pool.ExternalID); err != nil && !f5client.IsNotFound(err) {
+				return result, fmt.Errorf("deleting pool %s: %w", pool.ExternalID, err)
+			}
 		}
 	}
 	for _, vs := range sortedResources(current.Graph.VirtualServers) {
 		if err := d.client.DeleteVirtualServer(ctx, lbID, vs.ExternalID); err != nil && !f5client.IsNotFound(err) {
 			return result, fmt.Errorf("deleting virtual server %s: %w", vs.ExternalID, err)
+		}
+		if _, err := d.client.GetVirtualServer(ctx, lbID, vs.ExternalID); err == nil {
+			return result, &ProvisioningPendingError{ResourceType: "VirtualServer", ResourceID: vs.ExternalID, Status: "deleting", Detail: "waiting for CMP deletion"}
+		} else if !f5client.IsNotFound(err) {
+			return result, fmt.Errorf("checking deleted virtual server %s: %w", vs.ExternalID, err)
 		}
 		result.DeletedVirtualServer = true
 	}
@@ -96,6 +104,11 @@ func (d *Deployer) CleanupStack(ctx context.Context, req CleanupRequest) (*Clean
 	if req.DeleteLBService {
 		if err := d.client.DeleteLBService(ctx, lbID); err != nil && !f5client.IsNotFound(err) {
 			return result, fmt.Errorf("deleting LB service %s: %w", lbID, err)
+		}
+		if _, err := d.client.GetLBService(ctx, lbID); err == nil {
+			return result, &ProvisioningPendingError{ResourceType: "LBService", ResourceID: lbID, Status: "deleting", Detail: "waiting for CMP deletion"}
+		} else if !f5client.IsNotFound(err) {
+			return result, fmt.Errorf("checking deleted LB service %s: %w", lbID, err)
 		}
 		result.DeletedLBService = true
 	}

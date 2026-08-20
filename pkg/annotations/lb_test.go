@@ -21,8 +21,8 @@ func TestParseServicePrefersSpecSourceRangesAndClientIPAffinity(t *testing.T) {
 	}
 
 	cfg := ParseService(svc)
-	if cfg.PersistenceType != "source_addr" {
-		t.Fatalf("expected source_addr persistence, got %q", cfg.PersistenceType)
+	if cfg.PersistenceType != "source_ip" {
+		t.Fatalf("expected source_ip persistence, got %q", cfg.PersistenceType)
 	}
 	if len(cfg.SourceRanges) != 1 || cfg.SourceRanges[0] != "10.0.0.0/24" {
 		t.Fatalf("expected spec source ranges to win, got %#v", cfg.SourceRanges)

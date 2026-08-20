@@ -153,7 +153,6 @@ type Client interface {
 
 	// CMP Compute and Network API (v2.1)
 	GetCompute(ctx context.Context, id string) (json.RawMessage, error)
-	SearchNetworkPortsByIP(ctx context.Context, ip string) ([]json.RawMessage, error)
 
 	// CMP LBaaS Virtual Server Pools/Members (v2.1)
 	ListLBVirtualServerPools(ctx context.Context, lbServiceID, vsID string) ([]json.RawMessage, error)
@@ -1317,21 +1316,17 @@ func (c *client) ListLBVirtualServers(ctx context.Context, lbServiceID string) (
 	return out, nil
 }
 
-// CreateLBVirtualServer calls POST /load-balancers/{lbServiceID}/virtual-servers.
-// Per the CMP Swagger v2.1, parameters are query params.
-func (c *client) CreateLBVirtualServer(ctx context.Context, lbServiceID string, query url.Values) (json.RawMessage, error) {
+// CreateLBVirtualServer calls the CMP aggregate virtual-server endpoint. CMP
+// expects application/x-www-form-urlencoded data and creates the listener,
+// default pool, members, and monitor as one operation.
+func (c *client) CreateLBVirtualServer(ctx context.Context, lbServiceID string, form url.Values) (json.RawMessage, error) {
 	lbServiceID = strings.TrimSpace(lbServiceID)
 	if lbServiceID == "" {
 		return nil, fmt.Errorf("lb service id must not be empty")
 	}
 	path := "/" + lbServiceID + "/virtual-servers"
-	if query != nil {
-		if enc := query.Encode(); enc != "" {
-			path += "?" + enc
-		}
-	}
 	var out json.RawMessage
-	if err := c.doRequest(ctx, http.MethodPost, c.lbPath(path), nil, &out); err != nil {
+	if err := c.doFormRequest(ctx, http.MethodPost, c.lbPath(path), form, &out); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -1612,21 +1607,6 @@ func (c *client) GetCompute(ctx context.Context, id string) (json.RawMessage, er
 	return out, nil
 }
 
-// SearchNetworkPortsByIP calls GET /networks/ports/search-by-ip/?fixed_ip={ip}.
-func (c *client) SearchNetworkPortsByIP(ctx context.Context, ip string) ([]json.RawMessage, error) {
-	ip = strings.TrimSpace(ip)
-	if ip == "" {
-		return nil, fmt.Errorf("ip must not be empty")
-	}
-	q := url.Values{}
-	q.Set("fixed_ip", ip)
-	var out []json.RawMessage
-	if err := c.doRequest(ctx, http.MethodGet, c.networkPath("/ports/search-by-ip/?"+q.Encode()), nil, &out); err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
 // ListLBFlavors calls GET /load-balancers/lb-flavor/.
 func (c *client) ListLBFlavors(ctx context.Context) ([]json.RawMessage, error) {
 	var out []json.RawMessage
@@ -1656,16 +1636,6 @@ func (c *client) lbPath(subPath string) string {
 			subPath)
 	}
 	return c.withPrefix("/load-balancers" + subPath)
-}
-
-func (c *client) networkPath(subPath string) string {
-	if c.organisationName != "" && c.projectID != "" {
-		return fmt.Sprintf("/api/v2.1/networks/domain/%s/project/%s/networks%s",
-			url.PathEscape(c.organisationName),
-			url.PathEscape(c.projectID),
-			subPath)
-	}
-	return c.withPrefix("/networks" + subPath)
 }
 
 func (c *client) computePath(subPath string) string {
@@ -1884,6 +1854,10 @@ func (c *client) doRequestWithBodyAndHeaders(
 				if seconds, parseErr := strconv.Atoi(value); parseErr == nil &&
 					seconds > 0 {
 					retryAfter = time.Duration(seconds) * time.Second
+				} else if retryAt, dateErr := http.ParseTime(value); dateErr == nil {
+					if delay := time.Until(retryAt); delay > 0 {
+						retryAfter = delay
+					}
 				}
 			}
 

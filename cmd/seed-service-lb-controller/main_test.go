@@ -47,8 +47,11 @@ func (s *stubCMP) GetLBService(
 	_ context.Context,
 	id string,
 ) (json.RawMessage, error) {
+	if s.deleteLBN > 0 {
+		return nil, &f5client.HTTPStatusError{StatusCode: 404, Status: "404 Not Found"}
+	}
 	return json.RawMessage(
-		fmt.Sprintf(`{"id":%q,"name":"test-lb"}`, id),
+		fmt.Sprintf(`{"id":%q,"name":"test-lb","status":"Created","operating_status":"Active"}`, id),
 	), nil
 }
 
@@ -65,6 +68,12 @@ func (s *stubCMP) DeleteLBServiceVIP(_ context.Context, _, _ string) error {
 }
 func (s *stubCMP) ListLBVirtualServers(_ context.Context, _ string) ([]json.RawMessage, error) {
 	return nil, nil
+}
+func (s *stubCMP) GetLBVirtualServer(_ context.Context, _, id string) (json.RawMessage, error) {
+	if s.deleteVSN > 0 {
+		return nil, &f5client.HTTPStatusError{StatusCode: 404, Status: "404 Not Found"}
+	}
+	return json.RawMessage(`{"id":"` + id + `","status":"Active","protocol":"TCP","port":443,"vip_port":{"id":101}}`), nil
 }
 func (s *stubCMP) CreateLBVirtualServer(_ context.Context, _ string, _ url.Values) (json.RawMessage, error) {
 	s.createVSN++
@@ -115,10 +124,6 @@ func (s *stubCMP) DeleteLBVirtualServerPoolMember(context.Context, string, strin
 	return nil
 }
 
-func (s *stubCMP) SearchNetworkPortsByIP(_ context.Context, ip string) ([]json.RawMessage, error) {
-	return []json.RawMessage{json.RawMessage(`{"id":5001,"resource_id":"compute-` + ip + `","resource_type":"compute","fixed_ip":"` + ip + `"}`)}, nil
-}
-
 func newTestClient(t *testing.T, objs ...client.Object) (client.Client, *runtime.Scheme) {
 	t.Helper()
 
@@ -144,8 +149,8 @@ func TestReconcile_ProvisionsCMPAndSetsAnnotations(t *testing.T) {
 	svc.Spec.LoadBalancerClass = ptr.To(defaultLBClass)
 	svc.Spec.Ports = []corev1.ServicePort{{Name: "https", Port: 443, NodePort: 30443}}
 
-	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n1"}}
-	node.Status.Addresses = []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "172.18.0.10"}}
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n1"}, Spec: corev1.NodeSpec{ProviderID: "cmp://compute-1"}}
+	node.Status.Addresses = []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "10.0.0.1"}}
 
 	c, scheme := newTestClient(t, svc, node)
 	stub := &stubCMP{}

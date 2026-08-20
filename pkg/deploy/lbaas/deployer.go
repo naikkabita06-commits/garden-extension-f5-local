@@ -42,6 +42,7 @@ type EnsureRequest struct {
 	NetworkID     string
 	VPCID         string
 	VPCName       string
+	Region        string
 
 	VirtualServer model.VirtualServer
 	Backends      []model.BackendMember
@@ -91,6 +92,7 @@ func (d *Deployer) Ensure(ctx context.Context, req EnsureRequest) (*EnsureResult
 		LBServiceID:             result.Observed.LBServiceID,
 		VIPPortID:               result.Observed.VIPPortID,
 		NetworkID:               req.NetworkID,
+		Region:                  req.Region,
 		Desired:                 req.VirtualServer,
 		Backends:                req.Backends,
 		CurrentID:               result.Observed.VirtualServerID,
@@ -130,17 +132,18 @@ func DesiredBackendHash(frontendPort, nodePort int32, backends []model.BackendMe
 	return hex.EncodeToString(h[:])
 }
 
-// DesiredVirtualServerHash covers the listener fields that should trigger a
-// CMP virtual-server replacement. Backend membership changes are handled by
-// pool-member reconciliation and must not recreate the listener.
-func DesiredVirtualServerHash(vs model.VirtualServer, _ []model.BackendMember) string {
+// DesiredVirtualServerHash covers the complete aggregate CMP request. The CMP
+// Service contract creates listener, pool, monitor, and members atomically, so
+// a backend or monitor change requires a delete-before-recreate cycle.
+func DesiredVirtualServerHash(vs model.VirtualServer, backends []model.BackendMember) string {
 	ranges := append([]string(nil), vs.SourceRanges...)
 	sort.Strings(ranges)
 	b := strings.Builder{}
 	b.WriteString(fmt.Sprintf("frontend=%d;nodeport=%d;name=%s;protocol=%s;algorithm=%s;persistence=%s;draining=%d;ranges=%s;default-pool=%s;", vs.FrontendPort, vs.BackendNodePort, vs.Name, vs.Protocol, vs.RoutingAlgorithm, vs.PersistenceType, vs.DrainingTimeout, strings.Join(ranges, ","), vs.DefaultPoolName))
 	if vs.Monitor != nil {
-		b.WriteString(fmt.Sprintf("monitor=%s:%s:%s:%d;", vs.Monitor.Name, vs.Monitor.Type, vs.Monitor.Path, vs.Monitor.Interval))
+		b.WriteString(fmt.Sprintf("monitor=%s:%s:%s:%d:%d:%d;", vs.Monitor.Name, vs.Monitor.Type, vs.Monitor.Path, vs.Monitor.Interval, vs.Monitor.Port, vs.Monitor.Timeout))
 	}
+	b.WriteString("backends=" + DesiredBackendHash(vs.FrontendPort, vs.BackendNodePort, backends))
 	h := sha256.Sum256([]byte(b.String()))
 	return hex.EncodeToString(h[:])
 }
@@ -154,6 +157,9 @@ type StackEnsureRequest struct {
 	StrictVIPPortID             bool
 	RecoverVirtualServersByName bool
 	LBReadyHook                 func(model.ObservedState) error
+	// AggregateVirtualServer tells the deployer that CMP creates each Service
+	// listener, default pool, members, and monitor in one virtual-server POST.
+	AggregateVirtualServer bool
 }
 
 // StackEnsureResult is the graph returned after all supported resource managers
@@ -210,6 +216,7 @@ func (d *Deployer) EnsureStack(ctx context.Context, req StackEnsureRequest) (*St
 		LBName: req.Stack.LBService.Name, LBDescription: req.Stack.LBService.Description,
 		FlavorID: req.Stack.LBService.FlavorID, NetworkID: req.Stack.LBService.NetworkID,
 		VPCID: req.Stack.LBService.VPCID, VPCName: req.Stack.LBService.VPCName,
+		Region:        req.Stack.LBService.Region,
 		VirtualServer: req.Stack.VirtualServers[0], Current: observed,
 	}
 	lbID, changed, err := d.lbServices.Ensure(ctx, lbReq, observed.LBServiceID, req.StrictLBServiceID)
@@ -288,13 +295,25 @@ func (d *Deployer) EnsureStack(ctx context.Context, req StackEnsureRequest) (*St
 
 	for _, vs := range req.Stack.VirtualServers {
 		backends := stackBackends(req.Stack, vs)
+		var aggregatePool *model.Pool
+		if req.AggregateVirtualServer {
+			for i := range req.Stack.Pools {
+				if req.Stack.Pools[i].Name == vs.DefaultPoolName {
+					aggregatePool = &req.Stack.Pools[i]
+					break
+				}
+			}
+			if aggregatePool == nil {
+				return nil, fmt.Errorf("virtual server %q has no aggregate default pool %q", vs.Name, vs.DefaultPoolName)
+			}
+		}
 		currentID := observed.Graph.VirtualServers[vs.Name].ExternalID
 		if currentID == "" && len(req.Stack.VirtualServers) == 1 {
 			currentID = observed.VirtualServerID
 		}
 		desiredHash := DesiredVirtualServerHash(vs, backends)
 		currentHash := observed.Graph.VirtualServers[vs.Name].DesiredHash
-		vsID, vsName, vsChanged, err := d.virtualServers.Ensure(ctx, VirtualServerEnsureRequest{LBServiceID: lbID, VIPPortID: vipID, NetworkID: req.Stack.LBService.NetworkID, Desired: vs, Backends: backends, CurrentID: currentID, CurrentHash: currentHash, DesiredHash: desiredHash, RecreateWhenHashMissing: true, RecoverByName: req.RecoverVirtualServersByName})
+		vsID, vsName, vsChanged, err := d.virtualServers.Ensure(ctx, VirtualServerEnsureRequest{LBServiceID: lbID, VIPPortID: vipID, NetworkID: req.Stack.LBService.NetworkID, Region: req.Stack.LBService.Region, Desired: vs, Pool: aggregatePool, Backends: backends, CurrentID: currentID, CurrentHash: currentHash, DesiredHash: desiredHash, RecreateWhenHashMissing: true, RecoverByName: req.RecoverVirtualServersByName})
 		if err != nil {
 			return nil, err
 		}
@@ -316,6 +335,9 @@ func (d *Deployer) EnsureStack(ctx context.Context, req StackEnsureRequest) (*St
 			changed = changed || certChanged
 		}
 
+		if req.AggregateVirtualServer {
+			continue
+		}
 		poolIDs := map[string]string{}
 		for _, pool := range poolsForVirtualServer(req.Stack, vs) {
 			memberSpecs, err := d.virtualServers.poolMemberSpecs(ctx, pool.Members, req.Stack.LBService.NetworkID)
@@ -397,11 +419,13 @@ func (d *Deployer) EnsureStack(ctx context.Context, req StackEnsureRequest) (*St
 	// resource has been observed under its logical graph key, drop the alias so
 	// it cannot later be mistaken for an obsolete listener during cleanup.
 	dropMigratedLegacyAliases(&observed)
-	poolsDeleted, err := d.deleteObsoletePools(ctx, lbID, &observed, req.Stack)
-	if err != nil {
-		return nil, err
+	if !req.AggregateVirtualServer {
+		poolsDeleted, err := d.deleteObsoletePools(ctx, lbID, &observed, req.Stack)
+		if err != nil {
+			return nil, err
+		}
+		changed = changed || poolsDeleted
 	}
-	changed = changed || poolsDeleted
 	virtualServersDeleted, err := d.deleteObsoleteVirtualServers(ctx, lbID, &observed, req.Stack)
 	if err != nil {
 		return nil, err

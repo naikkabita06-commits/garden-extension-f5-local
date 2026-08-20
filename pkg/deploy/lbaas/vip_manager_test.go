@@ -59,3 +59,19 @@ func TestVIPManagerRejectsMissingSuppliedVIPWhenStrict(t *testing.T) {
 		t.Fatalf("expected strict supplied VIP error, got %v", err)
 	}
 }
+
+func TestVIPManagerValidatesProvidedVIP(t *testing.T) {
+	stub := &stubClient{vips: []VIP{{ID: "vip-1", Address: "10.0.0.7", Status: "Active", NetworkID: "subnet-1", IPVersion: "IPv4"}}}
+	id, address, changed, err := NewVIPManager(stub).Ensure(context.Background(), "lb-1", "subnet-1", "vip-1", "", true)
+	if err != nil || id != "vip-1" || address != "10.0.0.7" || !changed {
+		t.Fatalf("expected valid provided VIP, id=%q address=%q changed=%t err=%v", id, address, changed, err)
+	}
+}
+
+func TestVIPManagerRejectsProvidedVIPSubnetMismatch(t *testing.T) {
+	stub := &stubClient{vips: []VIP{{ID: "vip-1", Address: "10.0.0.7", Status: "Active", NetworkID: "other-subnet", IPVersion: "IPv4"}}}
+	_, _, _, err := NewVIPManager(stub).Ensure(context.Background(), "lb-1", "subnet-1", "vip-1", "", true)
+	if err == nil || !strings.Contains(err.Error(), "subnet") {
+		t.Fatalf("expected provided VIP subnet mismatch, got %v", err)
+	}
+}

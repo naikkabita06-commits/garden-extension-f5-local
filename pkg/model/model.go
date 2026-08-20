@@ -32,6 +32,7 @@ type LBService struct {
 	NetworkID   string
 	VPCID       string
 	VPCName     string
+	Region      string
 	Ownership   Ownership
 }
 
@@ -113,6 +114,8 @@ type Monitor struct {
 	Type     string
 	Path     string
 	Interval int32
+	Port     int32
+	Timeout  int32
 }
 
 // ObservedResource describes one CMP/F5 resource discovered or created by the

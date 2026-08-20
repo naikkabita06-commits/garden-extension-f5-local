@@ -11,7 +11,6 @@ import (
 )
 
 type rawAdapterStub struct {
-	ports               []json.RawMessage
 	compute             json.RawMessage
 	lastListVIPSubnet   string
 	lastCreateVIPSubnet string
@@ -42,6 +41,9 @@ func (s rawAdapterStub) DeleteLBServiceVIP(context.Context, string, string) erro
 func (s rawAdapterStub) ListLBVirtualServers(context.Context, string) ([]json.RawMessage, error) {
 	return nil, nil
 }
+func (s rawAdapterStub) GetLBVirtualServer(context.Context, string, string) (json.RawMessage, error) {
+	return json.RawMessage(`{"id":"vs-1","status":"Active","protocol":"TCP","port":8080,"vip_port":{"id":1}}`), nil
+}
 func (s rawAdapterStub) CreateLBVirtualServer(context.Context, string, url.Values) (json.RawMessage, error) {
 	return nil, nil
 }
@@ -65,28 +67,17 @@ func (s rawAdapterStub) GetCompute(context.Context, string) (json.RawMessage, er
 	}
 	return json.RawMessage(`{"id":"compute-1","vpc_id":"vpc-1","network_id":"net-1","ports":[{"id":5001,"fixed_ips":[{"ip_address":"10.0.0.1"}],"network_id":"net-1","device_id":"compute-1","device_type":"compute"}]}`), nil
 }
-func (s rawAdapterStub) SearchNetworkPortsByIP(context.Context, string) ([]json.RawMessage, error) {
-	return append([]json.RawMessage(nil), s.ports...), nil
+func TestParseVIPPreservesNumericIDPlacementAndReadiness(t *testing.T) {
+	vip := parseVIP(json.RawMessage(`{"id":36944,"fixed_ips":["10.0.20.28"],"status":"Active","network_id":"subnet-1","ip_version":"IPv4","attached_to_lb":false}`))
+	if vip.ID != "36944" || vip.Address != "10.0.20.28" || vip.Status != "Active" || vip.NetworkID != "subnet-1" || vip.IPVersion != "IPv4" || vip.AttachedToLB {
+		t.Fatalf("unexpected VIP parse result: %#v", vip)
+	}
 }
 
-func TestRawAdapterSearchNetworkPortsByIPParsesCMPShapes(t *testing.T) {
-	adapter := NewRawClient(&rawAdapterStub{ports: []json.RawMessage{
-		json.RawMessage(`{"id":5001,"resource_id":"compute-1","resource_type":"compute","fixed_ip":"10.0.0.1"}`),
-		json.RawMessage(`{"id_str":"5002","device_id":"compute-2","device_owner":"compute:nova","fixed_ips":[{"ip_address":"10.0.0.2"}]}`),
-	}})
-
-	ports, err := adapter.SearchNetworkPortsByIP(context.Background(), "10.0.0.1")
-	if err != nil {
-		t.Fatalf("SearchNetworkPortsByIP failed: %v", err)
-	}
-	if len(ports) != 2 {
-		t.Fatalf("expected two parsed ports, got %d", len(ports))
-	}
-	if ports[0].ID != 5001 || ports[0].ResourceID != "compute-1" || ports[0].ResourceType != "compute" || ports[0].IP != "10.0.0.1" {
-		t.Fatalf("unexpected first port: %#v", ports[0])
-	}
-	if ports[1].ID != 5002 || ports[1].ResourceID != "compute-2" || ports[1].ResourceType != "compute" || ports[1].IP != "10.0.0.2" {
-		t.Fatalf("unexpected second port: %#v", ports[1])
+func TestParseComputePreservesAllFixedIPs(t *testing.T) {
+	compute := parseCompute(json.RawMessage(`{"id":"compute-1","instance_name":"worker-1","vpc_id":"vpc-1","network_id":"subnet-1","region":"dev","ports":[{"id":38135,"fixed_ips":["10.10.1.145","10.10.1.146"],"network_id":"subnet-1","device_id":"compute-1","device_type":"compute"}]}`))
+	if compute.ID != "compute-1" || compute.Name != "worker-1" || compute.Region != "dev" || len(compute.Ports) != 1 || len(compute.Ports[0].FixedIPs) != 2 || compute.Ports[0].ID != 38135 {
+		t.Fatalf("unexpected compute parse result: %#v", compute)
 	}
 }
 
@@ -105,7 +96,7 @@ func TestRawAdapterGetComputeParsesPorts(t *testing.T) {
 	if compute.ID != "compute-1" || compute.VPCID != "vpc-1" || compute.NetworkID != "net-1" {
 		t.Fatalf("unexpected compute metadata: %#v", compute)
 	}
-	if len(compute.Ports) != 1 || compute.Ports[0].ID != 38135 || compute.Ports[0].IP != "10.10.1.145" || compute.Ports[0].DeviceID != "compute-1" {
+	if len(compute.Ports) != 1 || compute.Ports[0].ID != 38135 || len(compute.Ports[0].FixedIPs) != 1 || compute.Ports[0].FixedIPs[0] != "10.10.1.145" || compute.Ports[0].DeviceID != "compute-1" {
 		t.Fatalf("unexpected compute ports: %#v", compute.Ports)
 	}
 }

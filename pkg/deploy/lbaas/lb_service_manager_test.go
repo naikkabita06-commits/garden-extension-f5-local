@@ -6,7 +6,7 @@ import (
 )
 
 func TestLBServiceManagerVerifiesCurrentID(t *testing.T) {
-	stub := &stubClient{lbServices: []LBService{{ID: "lb-1", Name: "app"}}}
+	stub := &stubClient{lbServices: []LBService{{ID: "lb-1", Name: "app", Status: "Active"}}}
 	id, changed, err := NewLBServiceManager(stub, "").Ensure(context.Background(), EnsureRequest{LBName: "app"}, "lb-1", false)
 	if err != nil {
 		t.Fatalf("Ensure failed: %v", err)
@@ -16,11 +16,11 @@ func TestLBServiceManagerVerifiesCurrentID(t *testing.T) {
 	}
 }
 
-func TestLBServiceManagerDoesNotAdoptSameNameResource(t *testing.T) {
-	stub := &stubClient{lbServices: []LBService{{ID: "lb-other", Name: "app"}}}
+func TestLBServiceManagerRecoversUniqueDeterministicNameAfterRecordedIDDisappears(t *testing.T) {
+	stub := &stubClient{lbServices: []LBService{{ID: "lb-other", Name: "app", Status: "Active"}}}
 	id, changed, err := NewLBServiceManager(stub, "").Ensure(context.Background(), EnsureRequest{LBName: "app"}, "lb-1", false)
-	if err != nil || id != "lb-1" || !changed || stub.createdLB != 1 {
-		t.Fatalf("expected owned replacement creation, id=%q changed=%t created=%d err=%v", id, changed, stub.createdLB, err)
+	if err != nil || id != "lb-other" || !changed || stub.createdLB != 0 {
+		t.Fatalf("expected deterministic recovery, id=%q changed=%t created=%d err=%v", id, changed, stub.createdLB, err)
 	}
 }
 
@@ -36,7 +36,7 @@ func TestLBServiceManagerCreatesWhenNoObservedMatchExists(t *testing.T) {
 }
 
 func TestLBServiceManagerRejectsMissingSuppliedIDWhenStrict(t *testing.T) {
-	stub := &stubClient{lbServices: []LBService{{ID: "lb-other", Name: "app"}}}
+	stub := &stubClient{lbServices: []LBService{{ID: "lb-other", Name: "app", Status: "Active"}}}
 	_, _, err := NewLBServiceManager(stub, "").Ensure(context.Background(), EnsureRequest{LBName: "app"}, "lb-1", true)
 	if err == nil {
 		t.Fatal("expected strict supplied LB ID validation to fail")
@@ -69,27 +69,37 @@ func TestLBServiceManagerProvidedFailedLBDoesNotRecreate(t *testing.T) {
 	}
 }
 
-func TestLBServiceManagerManagedFailedLBRecreates(t *testing.T) {
+func TestLBServiceManagerManagedFailedLBWaitsForDeletion(t *testing.T) {
 	stub := &stubClient{lbServices: []LBService{{
 		ID:              "lb-1",
 		Name:            "app",
 		Status:          "Failed",
 		OperatingStatus: "Error",
 	}}}
-	id, changed, err := NewLBServiceManager(stub, "").Ensure(context.Background(), EnsureRequest{LBName: "app"}, "lb-1", false)
-	if err != nil {
-		t.Fatalf("expected managed failed LB to self-heal, got error: %v", err)
-	}
-	if id != "lb-1" {
-		t.Fatalf("expected recreated stub id lb-1, got %q", id)
-	}
-	if !changed {
-		t.Fatal("expected changed=true after failed LB delete+recreate")
+	_, _, err := NewLBServiceManager(stub, "").Ensure(context.Background(), EnsureRequest{LBName: "app"}, "lb-1", false)
+	if _, ok := IsProvisioningPending(err); !ok {
+		t.Fatalf("expected deletion pending state, got %v", err)
 	}
 	if stub.deletedLB != 1 {
 		t.Fatalf("expected one failed LB deletion, got %d", stub.deletedLB)
 	}
-	if stub.createdLB != 1 {
-		t.Fatalf("expected one LB recreation, got %d", stub.createdLB)
+	if stub.createdLB != 0 {
+		t.Fatalf("expected no replacement until deletion is observed, got %d", stub.createdLB)
+	}
+}
+
+func TestLBServiceManagerValidatesProvidedPlacement(t *testing.T) {
+	stub := &stubClient{lbServices: []LBService{{ID: "lb-1", Name: "app", Status: "Created", OperatingStatus: "Active", VPCID: "vpc-1", NetworkID: "subnet-1", Region: "dev"}}}
+	id, changed, err := NewLBServiceManager(stub, "vpc-1").Ensure(context.Background(), EnsureRequest{LBName: "app", VPCID: "vpc-1", NetworkID: "subnet-1", Region: "dev"}, "lb-1", true)
+	if err != nil || id != "lb-1" || changed {
+		t.Fatalf("expected valid provided LB placement, id=%q changed=%t err=%v", id, changed, err)
+	}
+}
+
+func TestLBServiceManagerRejectsProvidedSubnetMismatch(t *testing.T) {
+	stub := &stubClient{lbServices: []LBService{{ID: "lb-1", Name: "app", Status: "Active", VPCID: "vpc-1", NetworkID: "other-subnet", Region: "dev"}}}
+	_, _, err := NewLBServiceManager(stub, "vpc-1").Ensure(context.Background(), EnsureRequest{LBName: "app", VPCID: "vpc-1", NetworkID: "subnet-1", Region: "dev"}, "lb-1", true)
+	if err == nil {
+		t.Fatal("expected provided LB subnet mismatch")
 	}
 }

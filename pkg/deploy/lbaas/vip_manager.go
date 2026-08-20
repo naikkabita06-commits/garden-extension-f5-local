@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"strings"
+
+	f5client "github.com/gardener/gardener-extension-f5/pkg/f5"
 )
 
 type VIPManager struct{ client Client }
@@ -20,6 +22,15 @@ func (m *VIPManager) Ensure(ctx context.Context, lbServiceID, subnetID, currentI
 		}
 		for _, vip := range vips {
 			if strings.TrimSpace(vip.ID) == currentID {
+				if err := validateVIP(vip, subnetID, strictExistingID); err != nil {
+					if _, terminal := IsTerminalProvisioning(err); terminal && !strictExistingID {
+						if deleteErr := m.client.DeleteVIP(ctx, lbServiceID, currentID); deleteErr != nil && !f5client.IsNotFound(deleteErr) {
+							return currentID, currentAddress, false, fmt.Errorf("deleting failed managed VIP %q: %w", currentID, deleteErr)
+						}
+						return currentID, currentAddress, true, &ProvisioningPendingError{ResourceType: "VIP", ResourceID: currentID, Status: "deleting", Detail: "failed managed VIP deleted; waiting before replacement"}
+					}
+					return currentID, currentAddress, false, err
+				}
 				address := strings.TrimSpace(vip.Address)
 				if address == "" {
 					address = currentAddress
@@ -64,4 +75,25 @@ func (m *VIPManager) Ensure(ctx context.Context, lbServiceID, subnetID, currentI
 		}
 	}
 	return strings.TrimSpace(vip.ID), address, true, nil
+}
+
+func validateVIP(vip VIP, subnetID string, strict bool) error {
+	if strings.TrimSpace(vip.NetworkID) != "" && strings.TrimSpace(subnetID) != "" && strings.TrimSpace(vip.NetworkID) != strings.TrimSpace(subnetID) {
+		return fmt.Errorf("VIP %q belongs to subnet %q, expected %q", vip.ID, vip.NetworkID, subnetID)
+	}
+	if version := strings.TrimSpace(vip.IPVersion); version != "" && !strings.EqualFold(version, "IPv4") {
+		return fmt.Errorf("VIP %q uses unsupported IP version %q", vip.ID, version)
+	}
+	status := strings.ToLower(strings.TrimSpace(vip.Status))
+	if strict && status == "" {
+		return fmt.Errorf("supplied VIP %q response has no status", vip.ID)
+	}
+	switch status {
+	case "", "active", "created", "ready", "available":
+		return nil
+	case "failed", "error", "errored":
+		return &TerminalProvisioningError{ResourceType: "VIP", ResourceID: vip.ID, Status: vip.Status}
+	default:
+		return &ProvisioningPendingError{ResourceType: "VIP", ResourceID: vip.ID, Status: vip.Status, Detail: "waiting for CMP VIP readiness"}
+	}
 }
