@@ -491,6 +491,23 @@ func TestVirtualServerManagerDeletesTerminalResourceOnlyForRepair(t *testing.T) 
 	}
 }
 
+func TestVirtualServerManagerRepairsTerminalResourceAfterVIPChange(t *testing.T) {
+	stub := &stubClient{vsList: []VirtualServer{{ID: "vs-failed", Name: "vs", VIPPortID: "7", Status: "Failed", Protocol: "TCP", Port: 8080}}}
+	_, _, changed, err := NewVirtualServerManager(stub, "vpc-1").Ensure(context.Background(), VirtualServerEnsureRequest{
+		LBServiceID:   "lb-1",
+		VIPPortID:     "8",
+		Desired:       model.VirtualServer{Name: "vs", FrontendPort: 8080, Protocol: "TCP"},
+		CurrentID:     "vs-failed",
+		RepairTerminal: true,
+	})
+	if _, ok := IsProvisioningPending(err); !ok {
+		t.Fatalf("expected deletion wait after VIP change, got %v", err)
+	}
+	if !changed || stub.deletedVS != 1 {
+		t.Fatalf("VIP change must replace the recorded terminal virtual server, changed=%t deleted=%d", changed, stub.deletedVS)
+	}
+}
+
 func TestVirtualServerManagerPreservesFailedRepairReplacement(t *testing.T) {
 	stub := &stubClient{createdVSResult: &VirtualServer{ID: "vs-replacement", Name: "vs", VIPPortID: "7", Status: "Failed", Protocol: "TCP", Port: 8080}}
 	_, _, changed, err := NewVirtualServerManager(stub, "vpc-1").Ensure(context.Background(), VirtualServerEnsureRequest{

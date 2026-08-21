@@ -74,11 +74,17 @@ func (m *VirtualServerManager) Ensure(ctx context.Context, req VirtualServerEnsu
 				if getErr != nil {
 					return "", "", false, fmt.Errorf("checking recorded virtual server %s: %w", currentID, getErr)
 				}
+				// A desired VIP/listener change intentionally makes the old failed
+				// resource fail tuple validation. Honour the repair authorization
+				// before tuple validation so the recorded terminal resource can be
+				// replaced instead of becoming stuck on a mismatch error.
+				if req.RepairTerminal {
+					if terminalErr := terminalVirtualServerError(detail); terminalErr != nil {
+						return m.deleteFailed(ctx, req.LBServiceID, detail, terminalErr)
+					}
+				}
 				if err := validateVirtualServer(detail, req.VIPPortID, req.Desired); err != nil {
 					if _, terminal := IsTerminalProvisioning(err); terminal {
-						if req.RepairTerminal {
-							return m.deleteFailed(ctx, req.LBServiceID, detail, err)
-						}
 						return detail.ID, detail.Name, false, err
 					}
 					return "", "", false, err
@@ -100,11 +106,13 @@ func (m *VirtualServerManager) Ensure(ctx context.Context, req VirtualServerEnsu
 			if getErr != nil {
 				return "", "", false, fmt.Errorf("checking recovered virtual server %s: %w", adoptedID, getErr)
 			}
+			if req.RepairTerminal {
+				if terminalErr := terminalVirtualServerError(candidate); terminalErr != nil {
+					return m.deleteFailed(ctx, req.LBServiceID, candidate, terminalErr)
+				}
+			}
 			if err := validateVirtualServer(candidate, req.VIPPortID, req.Desired); err != nil {
 				if _, terminal := IsTerminalProvisioning(err); terminal {
-					if req.RepairTerminal {
-						return m.deleteFailed(ctx, req.LBServiceID, candidate, err)
-					}
 					return candidate.ID, candidate.Name, false, err
 				}
 				return "", "", false, err
@@ -165,14 +173,24 @@ func validateVirtualServer(vs VirtualServer, vipPortID string, desired model.Vir
 	if strings.TrimSpace(vs.Protocol) != "" && !strings.EqualFold(vs.Protocol, desired.Protocol) {
 		return fmt.Errorf("virtual server %s uses protocol %q, expected %q", vs.ID, vs.Protocol, desired.Protocol)
 	}
+	if terminalErr := terminalVirtualServerError(vs); terminalErr != nil {
+		return terminalErr
+	}
 	status := strings.ToLower(strings.TrimSpace(vs.Status))
 	switch status {
 	case "active", "created", "ready", "available", "online":
 		return nil
+	default:
+		return &ProvisioningPendingError{ResourceType: "VirtualServer", ResourceID: vs.ID, Status: vs.Status, Detail: "waiting for CMP virtual server readiness"}
+	}
+}
+
+func terminalVirtualServerError(vs VirtualServer) error {
+	switch strings.ToLower(strings.TrimSpace(vs.Status)) {
 	case "failed", "error", "errored":
 		return &TerminalProvisioningError{ResourceType: "VirtualServer", ResourceID: vs.ID, Status: vs.Status}
 	default:
-		return &ProvisioningPendingError{ResourceType: "VirtualServer", ResourceID: vs.ID, Status: vs.Status, Detail: "waiting for CMP virtual server readiness"}
+		return nil
 	}
 }
 
