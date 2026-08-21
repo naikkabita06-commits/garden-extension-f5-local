@@ -48,6 +48,21 @@ All four binaries are compiled into a single multi-stage Docker image (`distrole
   - `f5.extensions.gardener.cloud/virtual-server-id`
   - `f5.extensions.gardener.cloud/vip-address`
   - `f5.extensions.gardener.cloud/backend-hash` (detects pool-member drift)
+- Treats CMP VirtualServer `Failed`/`Error` as terminal for the current desired
+  configuration. The failed resource is preserved for provider diagnosis and
+  periodic retries stop. Reconciliation resumes when the Service's effective
+  LB/VIP/listener/backend configuration changes, or when an operator supplies a
+  new explicit repair token:
+
+  ```bash
+  kubectl -n <namespace> annotate service <name> \
+    f5.extensions.gardener.cloud/repair-request="$(date +%s)" --overwrite
+  ```
+
+  An explicit repair deletes the recorded failed VirtualServer once, waits for
+  CMP deletion to finish, and creates one replacement. If the replacement also
+  fails, it is preserved and a different repair token is required for another
+  attempt.
 - Uses finalizer `f5.extensions.gardener.cloud/svc-lb-bridge` for safe cleanup.
 
 ### `seed-service-lb-controller` — Seed Ingress LB Controller (Seed-side)
