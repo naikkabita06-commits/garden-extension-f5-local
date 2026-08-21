@@ -30,7 +30,7 @@ spec:
 
           vpcId: "ff1067a7-3582-447d-a325-244d89c36cd5"
           vpcName: "vpc-27oct"
-          networkId: "b4ca8d86-b6f2-400e-9cb4-c3be9c2d8bad"
+          networkId: "c15dc29d-218f-4d07-8403-2f1ecf9797cb"
           flavorId: 25
           region: "dev"
 

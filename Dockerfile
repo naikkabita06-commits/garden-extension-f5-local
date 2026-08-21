@@ -5,16 +5,16 @@ WORKDIR /src
 COPY . .
 
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH:-amd64} \
-    go build -mod=vendor -trimpath -ldflags="-s -w" \
+    go build -mod=readonly -trimpath -ldflags="-s -w" \
     -o /out/gardener-extension-f5 ./cmd/gardener-extension-f5
 
 
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH:-amd64} \
-    go build -mod=vendor -trimpath -ldflags="-s -w" \
+    go build -mod=readonly -trimpath -ldflags="-s -w" \
     -o /out/svc-lb-bridge  ./cmd/svc-lb-bridge 
 
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH:-amd64} \
-    go build -mod=vendor -trimpath -ldflags="-s -w" \
+    go build -mod=readonly -trimpath -ldflags="-s -w" \
     -o /out/seed-service-lb-controller ./cmd/seed-service-lb-controller
 
 

@@ -5,10 +5,10 @@ go 1.25.6
 
 require (
 	// Gardener core library – pulls in matching controller-runtime + k8s versions.
-	github.com/gardener/gardener v1.138.0
+	github.com/gardener/gardener v1.139.2
 	// Nested sub-module of gardener; must be pinned to the same version to override
 	// gardener's own go.mod which references it as v0.0.0 (local replace only).
-	github.com/gardener/gardener/pkg/apis v1.138.0
+	github.com/gardener/gardener/pkg/apis v1.139.2
 
 	// Logging helper (used directly by your code).
 	github.com/go-logr/logr v1.4.3
