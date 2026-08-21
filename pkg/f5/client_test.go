@@ -2,6 +2,7 @@ package f5
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -47,6 +48,34 @@ func TestClientWithCeAuth_SetsHeaders(t *testing.T) {
 	}
 	if len(items) != 1 {
 		t.Fatalf("expected 1 item, got %d", len(items))
+	}
+}
+
+func TestGetNetworkUsesScopedV21Endpoint(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Fatalf("expected GET, got %s", r.Method)
+		}
+		if r.URL.Path != "/api/v2.1/networks/domain/tenant/project/proj/networks/subnet-1/" {
+			t.Fatalf("unexpected network path %q", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"subnet-1","vpc_id":"vpc-1","status":"Active"}`))
+	}))
+	defer srv.Close()
+
+	c, err := NewClientWithCeAuth(logr.Discard(), srv.URL, "tenant", "proj", "dev", "token")
+	if err != nil {
+		t.Fatalf("creating client: %v", err)
+	}
+	networkClient, ok := c.(interface {
+		GetNetwork(context.Context, string) (json.RawMessage, error)
+	})
+	if !ok {
+		t.Fatal("client does not expose network lookup")
+	}
+	if _, err := networkClient.GetNetwork(context.Background(), "subnet-1"); err != nil {
+		t.Fatalf("GetNetwork returned error: %v", err)
 	}
 }
 

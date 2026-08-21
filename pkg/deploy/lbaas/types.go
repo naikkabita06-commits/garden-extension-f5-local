@@ -86,6 +86,18 @@ type ComputePort struct {
 	DeviceType string
 }
 
+// Network is the CMP subnet/network placement record used to validate an
+// explicit Service subnet override before creating provider resources.
+type Network struct {
+	ID     string
+	VPCID  string
+	Status string
+}
+
+type NetworkClient interface {
+	GetNetwork(ctx context.Context, id string) (Network, error)
+}
+
 type LBServiceSpec struct {
 	Name, Description         string
 	FlavorID                  int32

@@ -56,6 +56,7 @@ type stubClient struct {
 	deletedVIP      int
 	deletedLB       int
 	computes        map[string]Compute
+	networks        map[string]Network
 }
 
 func (s *stubClient) ListLBServices(
@@ -155,6 +156,13 @@ func (s *stubClient) GetCompute(_ context.Context, id string) (Compute, error) {
 		}
 	}
 	return Compute{ID: id, Name: "node-1", VPCID: "vpc-1", NetworkID: "net-1", Ports: []ComputePort{{ID: 5001, FixedIPs: []string{"10.0.0.1"}, NetworkID: "net-1", DeviceID: id, DeviceType: "compute"}}}, nil
+}
+
+func (s *stubClient) GetNetwork(_ context.Context, id string) (Network, error) {
+	if network, ok := s.networks[id]; ok {
+		return network, nil
+	}
+	return Network{}, &f5client.HTTPStatusError{StatusCode: http.StatusNotFound, Status: "404 Not Found"}
 }
 
 func TestEnsureCreatesLBVIPAndVirtualServer(t *testing.T) {
@@ -468,7 +476,7 @@ func TestEnsureUsesComputeDetailsWhenBackendHasComputeID(t *testing.T) {
 	}
 }
 
-func TestEnsureRejectsComputeSubnetMismatch(t *testing.T) {
+func TestEnsureAllowsComputeAndLBSubnetsToDifferWithinVPC(t *testing.T) {
 	stub := &stubClient{computes: map[string]Compute{
 		"compute-1": {ID: "compute-1", Name: "node-1", VPCID: "vpc-1", NetworkID: "other-net", Ports: []ComputePort{{ID: 38135, FixedIPs: []string{"10.10.1.145"}, NetworkID: "other-net", DeviceID: "compute-1", DeviceType: "compute"}}},
 	}}
@@ -478,8 +486,61 @@ func TestEnsureRejectsComputeSubnetMismatch(t *testing.T) {
 		VirtualServer: model.VirtualServer{Name: "vs", FrontendPort: 80, BackendNodePort: 30080, Protocol: "HTTP", RoutingAlgorithm: "round_robin"},
 		Backends:      []model.BackendMember{{ComputeID: "compute-1", IP: "10.10.1.145", Port: 30080, Weight: 1}},
 	})
-	if err == nil || !strings.Contains(err.Error(), "subnet") {
-		t.Fatalf("expected subnet mismatch error, got %v", err)
+	if err != nil {
+		t.Fatalf("expected same-VPC cross-subnet backend to succeed, got %v", err)
+	}
+	if len(stub.lastVSSpec.Nodes) != 1 || stub.lastVSSpec.Nodes[0].BackendPortID != 38135 {
+		t.Fatalf("expected backend port from compute subnet, got %#v", stub.lastVSSpec.Nodes)
+	}
+}
+
+func TestEnsureStackAdoptsProvidedLBSubnetWithoutApplyingDefaultSubnet(t *testing.T) {
+	stub := &stubClient{
+		lbServices: []LBService{{ID: "lb-provided", Name: "existing", Status: "Created", OperatingStatus: "Active", VPCID: "vpc-1", NetworkID: "lb-subnet", Region: "dev"}},
+		vips:       []VIP{{ID: "vip-provided", Address: "10.20.0.10", Status: "Active", NetworkID: "lb-subnet", IPVersion: "IPv4"}},
+		computes: map[string]Compute{
+			"compute-1": {ID: "compute-1", Name: "worker-1", VPCID: "vpc-1", NetworkID: "compute-subnet", Region: "dev", Ports: []ComputePort{{ID: 38135, FixedIPs: []string{"10.10.1.238"}, NetworkID: "compute-subnet", DeviceID: "compute-1", DeviceType: "compute"}}},
+		},
+	}
+	d := New(stub, "vpc-1")
+	result, err := d.EnsureStack(context.Background(), StackEnsureRequest{
+		Stack: &model.LoadBalancerStack{
+			LBService: model.LBService{Name: "existing", VPCID: "vpc-1", NetworkID: "extension-default-subnet", Region: "dev"},
+			VIP:       model.VIP{Name: "vip"},
+			VirtualServers: []model.VirtualServer{{Name: "vs", FrontendPort: 8080, BackendNodePort: 30729, Protocol: "TCP", RoutingAlgorithm: "ROUND_ROBIN", DefaultPoolName: "pool"}},
+			Pools: []model.Pool{{Name: "pool", Members: []model.BackendMember{{NodeName: "worker-1", ComputeID: "compute-1", IP: "10.10.1.238", Port: 30729, Weight: 1}}}},
+		},
+		Current:                model.ObservedState{LBServiceID: "lb-provided", VIPPortID: "vip-provided", VIPAddress: "10.20.0.10"},
+		StrictLBServiceID:      true,
+		StrictVIPPortID:        true,
+		AggregateVirtualServer: true,
+	})
+	if err != nil {
+		t.Fatalf("expected provided same-VPC cross-subnet stack to succeed: %v", err)
+	}
+	if result.Observed.LBServiceID != "lb-provided" || stub.lastVIPSubnet != "lb-subnet" {
+		t.Fatalf("expected provided LB subnet adoption, result=%#v vipSubnet=%q", result.Observed, stub.lastVIPSubnet)
+	}
+	if len(stub.lastVSSpec.Nodes) != 1 || stub.lastVSSpec.Nodes[0].BackendPortID != 38135 {
+		t.Fatalf("expected backend port resolved from compute subnet, got %#v", stub.lastVSSpec.Nodes)
+	}
+}
+
+func TestEnsureStackValidatesExplicitSubnetBelongsToComputeVPC(t *testing.T) {
+	stub := &stubClient{networks: map[string]Network{
+		"requested-subnet": {ID: "requested-subnet", VPCID: "other-vpc", Status: "Active"},
+	}}
+	d := New(stub, "vpc-1")
+	d.networks = stub
+	_, err := d.EnsureStack(context.Background(), StackEnsureRequest{
+		Stack: &model.LoadBalancerStack{
+			LBService:      model.LBService{Name: "lb", VPCID: "vpc-1", NetworkID: "requested-subnet", Region: "dev"},
+			VirtualServers: []model.VirtualServer{{Name: "vs"}},
+		},
+		NetworkIDExplicit: true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "belongs to VPC") {
+		t.Fatalf("expected explicit subnet/VPC validation failure, got %v", err)
 	}
 }
 

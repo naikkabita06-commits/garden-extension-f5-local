@@ -18,6 +18,7 @@ type Deployer struct {
 	lbServices     *LBServiceManager
 	vips           *VIPManager
 	virtualServers *VirtualServerManager
+	networks       NetworkClient
 	pools          *PoolManager
 	monitors       *MonitorManager
 	routingRules   *RoutingRuleManager
@@ -157,6 +158,11 @@ type StackEnsureRequest struct {
 	StrictVIPPortID             bool
 	RecoverVirtualServersByName bool
 	LBReadyHook                 func(model.ObservedState) error
+	// NetworkIDExplicit distinguishes a customer placement constraint from the
+	// Extension default. Defaults select placement only when creating managed
+	// LB/VIP resources; they must not reject a provided LB in another subnet of
+	// the same VPC.
+	NetworkIDExplicit bool
 	// AggregateVirtualServer tells the deployer that CMP creates each Service
 	// listener, default pool, members, and monitor in one virtual-server POST.
 	AggregateVirtualServer bool
@@ -200,7 +206,7 @@ func (d *Deployer) EnsureStack(ctx context.Context, req StackEnsureRequest) (*St
 	if len(req.Stack.VirtualServers) == 0 {
 		return nil, fmt.Errorf("load-balancer stack has no virtual servers")
 	}
-	if len(req.Stack.Pools) != 0 && d.pools == nil {
+	if len(req.Stack.Pools) != 0 && d.pools == nil && !req.AggregateVirtualServer {
 		return nil, fmt.Errorf("pool reconciliation requires a PoolManager")
 	}
 	if len(req.Stack.RoutingRules) != 0 && d.routingRules == nil {
@@ -212,9 +218,50 @@ func (d *Deployer) EnsureStack(ctx context.Context, req StackEnsureRequest) (*St
 
 	observed := req.Current
 	observed.EnsureGraph()
+	effectiveNetworkID := strings.TrimSpace(req.Stack.LBService.NetworkID)
+	if req.NetworkIDExplicit {
+		if d.networks == nil {
+			return nil, fmt.Errorf("validating explicit subnet %q: CMP network lookup capability is unavailable", effectiveNetworkID)
+		}
+		network, err := d.networks.GetNetwork(ctx, effectiveNetworkID)
+		if err != nil {
+			return nil, fmt.Errorf("validating explicit subnet %q: %w", effectiveNetworkID, err)
+		}
+		if strings.TrimSpace(network.VPCID) == "" {
+			return nil, fmt.Errorf("explicit subnet %q response has no VPC identity", effectiveNetworkID)
+		}
+		if strings.TrimSpace(network.VPCID) != strings.TrimSpace(req.Stack.LBService.VPCID) {
+			return nil, fmt.Errorf("explicit subnet %q belongs to VPC %q, expected %q", effectiveNetworkID, network.VPCID, req.Stack.LBService.VPCID)
+		}
+		status := strings.ToLower(strings.TrimSpace(network.Status))
+		switch status {
+		case "active", "allocated", "available", "created", "ready":
+			// Usable CMP network/subnet states.
+		case "":
+			return nil, fmt.Errorf("explicit subnet %q response has no status", effectiveNetworkID)
+		default:
+			return nil, fmt.Errorf("explicit subnet %q is not usable: status %q", effectiveNetworkID, network.Status)
+		}
+	}
+	// A supplied LB owns its placement. When the customer did not explicitly
+	// constrain the subnet, adopt the subnet returned by that LB rather than
+	// comparing it with the Extension's creation default.
+	if req.StrictLBServiceID && !req.NetworkIDExplicit && strings.TrimSpace(observed.LBServiceID) != "" {
+		supplied, err := d.client.GetLBService(ctx, observed.LBServiceID)
+		if err != nil {
+			return nil, fmt.Errorf("checking supplied LBService %q placement: %w", observed.LBServiceID, err)
+		}
+		if err := validateLBServicePlacement(supplied, EnsureRequest{VPCID: req.Stack.LBService.VPCID, Region: req.Stack.LBService.Region}); err != nil {
+			return nil, err
+		}
+		if strings.TrimSpace(supplied.NetworkID) == "" {
+			return nil, fmt.Errorf("supplied LBService %q response has no subnet identity", supplied.ID)
+		}
+		effectiveNetworkID = strings.TrimSpace(supplied.NetworkID)
+	}
 	lbReq := EnsureRequest{
 		LBName: req.Stack.LBService.Name, LBDescription: req.Stack.LBService.Description,
-		FlavorID: req.Stack.LBService.FlavorID, NetworkID: req.Stack.LBService.NetworkID,
+		FlavorID: req.Stack.LBService.FlavorID, NetworkID: effectiveNetworkID,
 		VPCID: req.Stack.LBService.VPCID, VPCName: req.Stack.LBService.VPCName,
 		Region:        req.Stack.LBService.Region,
 		VirtualServer: req.Stack.VirtualServers[0], Current: observed,
@@ -260,7 +307,7 @@ func (d *Deployer) EnsureStack(ctx context.Context, req StackEnsureRequest) (*St
 	}
 
 	if req.RecoverVirtualServersByName && strings.TrimSpace(observed.VIPPortID) == "" {
-		found, recoveredVIPID, recoveredVIPAddress, err := d.recoverVirtualServersByName(ctx, lbID, req.Stack.LBService.NetworkID, req.Stack.VirtualServers)
+		found, recoveredVIPID, recoveredVIPAddress, err := d.recoverVirtualServersByName(ctx, lbID, effectiveNetworkID, req.Stack.VirtualServers)
 		if err != nil {
 			return nil, err
 		}
@@ -285,7 +332,7 @@ func (d *Deployer) EnsureStack(ctx context.Context, req StackEnsureRequest) (*St
 		}
 	}
 
-	vipID, vipAddress, vipChanged, err := d.vips.Ensure(ctx, lbID, req.Stack.LBService.NetworkID, observed.VIPPortID, observed.VIPAddress, req.StrictVIPPortID)
+	vipID, vipAddress, vipChanged, err := d.vips.Ensure(ctx, lbID, effectiveNetworkID, observed.VIPPortID, observed.VIPAddress, req.StrictVIPPortID)
 	if err != nil {
 		return nil, err
 	}
@@ -313,7 +360,7 @@ func (d *Deployer) EnsureStack(ctx context.Context, req StackEnsureRequest) (*St
 		}
 		desiredHash := DesiredVirtualServerHash(vs, backends)
 		currentHash := observed.Graph.VirtualServers[vs.Name].DesiredHash
-		vsID, vsName, vsChanged, err := d.virtualServers.Ensure(ctx, VirtualServerEnsureRequest{LBServiceID: lbID, VIPPortID: vipID, NetworkID: req.Stack.LBService.NetworkID, Region: req.Stack.LBService.Region, Desired: vs, Pool: aggregatePool, Backends: backends, CurrentID: currentID, CurrentHash: currentHash, DesiredHash: desiredHash, RecreateWhenHashMissing: true, RecoverByName: req.RecoverVirtualServersByName})
+		vsID, vsName, vsChanged, err := d.virtualServers.Ensure(ctx, VirtualServerEnsureRequest{LBServiceID: lbID, VIPPortID: vipID, NetworkID: effectiveNetworkID, Region: req.Stack.LBService.Region, Desired: vs, Pool: aggregatePool, Backends: backends, CurrentID: currentID, CurrentHash: currentHash, DesiredHash: desiredHash, RecreateWhenHashMissing: true, RecoverByName: req.RecoverVirtualServersByName})
 		if err != nil {
 			return nil, err
 		}
@@ -340,7 +387,7 @@ func (d *Deployer) EnsureStack(ctx context.Context, req StackEnsureRequest) (*St
 		}
 		poolIDs := map[string]string{}
 		for _, pool := range poolsForVirtualServer(req.Stack, vs) {
-			memberSpecs, err := d.virtualServers.poolMemberSpecs(ctx, pool.Members, req.Stack.LBService.NetworkID)
+			memberSpecs, err := d.virtualServers.poolMemberSpecs(ctx, pool.Members, effectiveNetworkID)
 			if err != nil {
 				return nil, err
 			}

@@ -154,6 +154,9 @@ func (s *stubCMP) DetachLBVirtualServerCertificate(context.Context, string, stri
 func (s *stubCMP) GetCompute(_ context.Context, id string) (json.RawMessage, error) {
 	return json.RawMessage(`{"id":"` + id + `","instance_name":"node-` + id + `","vpc_id":"vpc-1","network_id":"subnet-service","ports":[{"id":5001,"fixed_ips":["` + id + `"],"network_id":"subnet-service","device_id":"` + id + `","device_type":"compute"}]}`), nil
 }
+func (s *stubCMP) GetNetwork(_ context.Context, id string) (json.RawMessage, error) {
+	return json.RawMessage(`{"id":"` + id + `","vpc_id":"vpc-1","status":"Active"}`), nil
+}
 func (s *stubCMP) ListLBVirtualServerPools(_ context.Context, _, _ string) ([]json.RawMessage, error) {
 	return nil, nil
 }
@@ -197,6 +200,10 @@ func newTestReconciler(t *testing.T, objs ...client.Object) (*serviceReconciler,
 		loadBalancerClass: defaultLBClass,
 		Recorder:          record.NewFakeRecorder(10),
 		shootNamespace:    "shoot-test",
+		defaultVPCID:      "vpc-1",
+		defaultVPCName:    "vpc-1",
+		defaultNetworkID:  "subnet-service",
+		defaultRegion:     "dev",
 	}
 	return r, c, stub
 }

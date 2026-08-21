@@ -259,7 +259,7 @@ func (m *VirtualServerManager) resolveBackendPort(ctx context.Context, backend m
 	return m.resolveComputeBackendPort(ctx, computeID, ip, networkID, region)
 }
 
-func (m *VirtualServerManager) resolveComputeBackendPort(ctx context.Context, computeID, ip, networkID, region string) (NetworkPort, error) {
+func (m *VirtualServerManager) resolveComputeBackendPort(ctx context.Context, computeID, ip, _ string, region string) (NetworkPort, error) {
 	compute, err := m.client.GetCompute(ctx, computeID)
 	if err != nil {
 		return NetworkPort{}, fmt.Errorf("fetching CMP compute %s: %w", computeID, err)
@@ -269,12 +269,6 @@ func (m *VirtualServerManager) resolveComputeBackendPort(ctx context.Context, co
 	}
 	if strings.TrimSpace(m.vpcID) != "" && strings.TrimSpace(compute.VPCID) != strings.TrimSpace(m.vpcID) {
 		return NetworkPort{}, fmt.Errorf("CMP compute %s belongs to VPC %q, expected %q", computeID, compute.VPCID, m.vpcID)
-	}
-	if strings.TrimSpace(networkID) != "" && strings.TrimSpace(compute.NetworkID) == "" {
-		return NetworkPort{}, fmt.Errorf("CMP compute %s response has no subnet identity", computeID)
-	}
-	if strings.TrimSpace(networkID) != "" && strings.TrimSpace(compute.NetworkID) != strings.TrimSpace(networkID) {
-		return NetworkPort{}, fmt.Errorf("CMP compute %s belongs to subnet %q, expected %q", computeID, compute.NetworkID, networkID)
 	}
 	if strings.TrimSpace(region) != "" {
 		if strings.TrimSpace(compute.Region) == "" {
@@ -295,9 +289,6 @@ func (m *VirtualServerManager) resolveComputeBackendPort(ctx context.Context, co
 		}
 		if strings.TrimSpace(port.DeviceType) != "" && !strings.EqualFold(strings.TrimSpace(port.DeviceType), "compute") {
 			return NetworkPort{}, fmt.Errorf("CMP compute %s port %d has device_type %q", computeID, port.ID, port.DeviceType)
-		}
-		if strings.TrimSpace(networkID) != "" && strings.TrimSpace(port.NetworkID) != "" && strings.TrimSpace(port.NetworkID) != strings.TrimSpace(networkID) {
-			return NetworkPort{}, fmt.Errorf("CMP compute %s port %d belongs to subnet %q, expected %q", computeID, port.ID, port.NetworkID, networkID)
 		}
 		if match != nil {
 			return NetworkPort{}, fmt.Errorf("multiple CMP compute ports match backend IP %s on compute %s", ip, computeID)
