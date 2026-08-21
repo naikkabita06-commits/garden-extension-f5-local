@@ -74,6 +74,12 @@ const (
 	annObservedGeneration = "f5.extensions.gardener.cloud/observed-generation"
 	annManagedLBRepairID  = "f5.extensions.gardener.cloud/managed-lb-repair-id"
 	annManagedLBRepairs   = "f5.extensions.gardener.cloud/managed-lb-repair-attempts"
+	annVSRepairRequest    = "f5.extensions.gardener.cloud/repair-request"
+	annVSRepairHandled    = "f5.extensions.gardener.cloud/repair-request-handled"
+	annVSTerminalID       = "f5.extensions.gardener.cloud/terminal-virtual-server-id"
+	annVSTerminalStatus   = "f5.extensions.gardener.cloud/terminal-virtual-server-status"
+	annVSTerminalDetail   = "f5.extensions.gardener.cloud/terminal-virtual-server-detail"
+	annVSTerminalHash     = "f5.extensions.gardener.cloud/terminal-desired-hash"
 
 	maxManagedLBRepairAttempts = 3
 )
@@ -437,6 +443,21 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 	}
 	strictLBServiceID, strictVIPPortID := strictProvidedResourcePolicies(svc, shared)
+	desiredTerminalHash := virtualServerTerminalFingerprint(stack, shared.LBServiceID, shared.VIPPortID)
+	repairRequest := strings.TrimSpace(svc.Annotations[annVSRepairRequest])
+	handledRepairRequest := strings.TrimSpace(svc.Annotations[annVSRepairHandled])
+	recordedTerminalID := strings.TrimSpace(svc.Annotations[annVSTerminalID])
+	recordedTerminalHash := strings.TrimSpace(svc.Annotations[annVSTerminalHash])
+	repairTerminalVS := recordedTerminalID != "" && (recordedTerminalHash != desiredTerminalHash || (repairRequest != "" && repairRequest != handledRepairRequest))
+	if recordedTerminalID != "" && !repairTerminalVS {
+		log.Info(
+			"virtual server is in terminal state; waiting for desired-state change or explicit repair request",
+			"virtualServerID", recordedTerminalID,
+			"status", strings.TrimSpace(svc.Annotations[annVSTerminalStatus]),
+			"repairAnnotation", annVSRepairRequest,
+		)
+		return ctrl.Result{}, nil
+	}
 	cmpStart := time.Now()
 	stackResult, err := lbaasdeploy.NewFromRaw(r.cmp, r.defaultVPCID).EnsureStack(ctx, lbaasdeploy.StackEnsureRequest{
 		Stack:                       stack,
@@ -445,6 +466,7 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		StrictVIPPortID:             strictVIPPortID,
 		RecoverVirtualServersByName: true,
 		AggregateVirtualServer:      true,
+		RepairTerminalVirtualServers: repairTerminalVS,
 		NetworkIDExplicit:           strings.TrimSpace(lbCfg.NetworkID) != "",
 		LBReadyHook: func(observed model.ObservedState) error {
 			return r.persistLBCheckpoint(ctx, svc, observed, strictLBServiceID)
@@ -525,6 +547,29 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 				retryAfter,
 			)
 			return ctrl.Result{RequeueAfter: retryAfter}, nil
+		}
+
+		if terminal, ok := lbaasdeploy.IsTerminalProvisioning(err); ok && terminal.ResourceType == "VirtualServer" {
+			if persistErr := r.persistVirtualServerTerminal(ctx, svc, terminal, desiredTerminalHash, repairRequest); persistErr != nil {
+				return ctrl.Result{}, persistErr
+			}
+			r.Recorder.Eventf(
+				svc,
+				corev1.EventTypeWarning,
+				"VirtualServerTerminalFailed",
+				"VirtualServer %s entered terminal state (status=%s detail=%s). It is preserved for diagnosis; change the Service/LB/VIP configuration or set %s to a new token to request replacement.",
+				terminal.ResourceID,
+				terminal.Status,
+				terminal.Detail,
+				annVSRepairRequest,
+			)
+			log.Info(
+				"virtual server entered terminal state; preserving it and stopping periodic retries",
+				"virtualServerID", terminal.ResourceID,
+				"status", terminal.Status,
+				"detail", terminal.Detail,
+			)
+			return ctrl.Result{}, nil
 		}
 
 		// CMP explicitly returned 429. Honour Retry-After.
@@ -635,6 +680,13 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 	delete(svc.Annotations, annManagedLBRepairID)
 	delete(svc.Annotations, annManagedLBRepairs)
+	delete(svc.Annotations, annVSTerminalID)
+	delete(svc.Annotations, annVSTerminalStatus)
+	delete(svc.Annotations, annVSTerminalDetail)
+	delete(svc.Annotations, annVSTerminalHash)
+	if repairRequest != "" {
+		svc.Annotations[annVSRepairHandled] = repairRequest
+	}
 	svc.Annotations[annLBServiceID] = lastIDs.LBServiceID
 	svc.Annotations[annVIPPortID] = lastIDs.VIPPortID
 	// Preserve legacy values for existing consumers while persisting every listener.
@@ -738,6 +790,59 @@ func writeObservedGraph(annotations map[string]string, graph model.ObservedGraph
 	}
 	annotations[annObservedGraph] = string(b)
 	return nil
+}
+
+// virtualServerTerminalFingerprint identifies the exact desired listener
+// attempt. It deliberately includes the selected parent IDs so changing a
+// provided LB or VIP releases a previously terminal Service without requiring
+// a separate repair token.
+func virtualServerTerminalFingerprint(stack *model.LoadBalancerStack, lbServiceID, vipPortID string) string {
+	type listenerFingerprint struct {
+		Name string `json:"name"`
+		Hash string `json:"hash"`
+	}
+	payload := struct {
+		LBServiceID string                `json:"lbServiceID"`
+		VIPPortID   string                `json:"vipPortID"`
+		Listeners   []listenerFingerprint `json:"listeners"`
+	}{LBServiceID: strings.TrimSpace(lbServiceID), VIPPortID: strings.TrimSpace(vipPortID)}
+	if stack != nil {
+		for _, vs := range stack.VirtualServers {
+			var backends []model.BackendMember
+			for _, pool := range stack.Pools {
+				if pool.Name == vs.DefaultPoolName {
+					backends = append(backends, pool.Members...)
+					break
+				}
+			}
+			payload.Listeners = append(payload.Listeners, listenerFingerprint{Name: vs.Name, Hash: lbaasdeploy.DesiredVirtualServerHash(vs, backends)})
+		}
+	}
+	b, _ := json.Marshal(payload)
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+func (r *serviceReconciler) persistVirtualServerTerminal(ctx context.Context, svc *corev1.Service, terminal *lbaasdeploy.TerminalProvisioningError, desiredHash, repairRequest string) error {
+	base := svc.DeepCopy()
+	if svc.Annotations == nil {
+		svc.Annotations = map[string]string{}
+	}
+	svc.Annotations[annVSTerminalID] = strings.TrimSpace(terminal.ResourceID)
+	svc.Annotations[annVSTerminalStatus] = strings.TrimSpace(terminal.Status)
+	detail := strings.TrimSpace(terminal.Detail)
+	if len(detail) > 2048 {
+		detail = detail[:2048]
+	}
+	svc.Annotations[annVSTerminalDetail] = detail
+	svc.Annotations[annVSTerminalHash] = strings.TrimSpace(desiredHash)
+	if id := strings.TrimSpace(terminal.ResourceID); id != "" {
+		svc.Annotations[annVirtualServerID] = id
+	}
+	if token := strings.TrimSpace(repairRequest); token != "" {
+		svc.Annotations[annVSRepairHandled] = token
+	}
+	return r.Patch(ctx, svc, client.MergeFrom(base))
 }
 
 func (r *serviceReconciler) desiredLBServiceName(svc *corev1.Service) string {
