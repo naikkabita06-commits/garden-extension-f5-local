@@ -12,6 +12,7 @@ import (
 
 type rawAdapterStub struct {
 	compute             json.RawMessage
+	network             json.RawMessage
 	lastListVIPSubnet   string
 	lastCreateVIPSubnet string
 }
@@ -67,6 +68,12 @@ func (s rawAdapterStub) GetCompute(context.Context, string) (json.RawMessage, er
 	}
 	return json.RawMessage(`{"id":"compute-1","vpc_id":"vpc-1","network_id":"net-1","ports":[{"id":5001,"fixed_ips":[{"ip_address":"10.0.0.1"}],"network_id":"net-1","device_id":"compute-1","device_type":"compute"}]}`), nil
 }
+func (s rawAdapterStub) GetNetwork(context.Context, string) (json.RawMessage, error) {
+	if len(s.network) != 0 {
+		return s.network, nil
+	}
+	return json.RawMessage(`{"id":"subnet-1","vpc_id":"vpc-1","status":"Active"}`), nil
+}
 func TestParseVIPPreservesNumericIDPlacementAndReadiness(t *testing.T) {
 	vip := parseVIP(json.RawMessage(`{"id":36944,"fixed_ips":["10.0.20.28"],"status":"Active","network_id":"subnet-1","ip_version":"IPv4","attached_to_lb":false}`))
 	if vip.ID != "36944" || vip.Address != "10.0.20.28" || vip.Status != "Active" || vip.NetworkID != "subnet-1" || vip.IPVersion != "IPv4" || vip.AttachedToLB {
@@ -98,6 +105,17 @@ func TestRawAdapterGetComputeParsesPorts(t *testing.T) {
 	}
 	if len(compute.Ports) != 1 || compute.Ports[0].ID != 38135 || len(compute.Ports[0].FixedIPs) != 1 || compute.Ports[0].FixedIPs[0] != "10.10.1.145" || compute.Ports[0].DeviceID != "compute-1" {
 		t.Fatalf("unexpected compute ports: %#v", compute.Ports)
+	}
+}
+
+func TestRawNetworkAdapterPreservesVPCAndStatus(t *testing.T) {
+	adapter := rawNetworkAdapter{raw: rawAdapterStub{network: json.RawMessage(`{"id":"subnet-1","vpc_id":"vpc-1","status":"Active"}`)}}
+	network, err := adapter.GetNetwork(context.Background(), "subnet-1")
+	if err != nil {
+		t.Fatalf("GetNetwork failed: %v", err)
+	}
+	if network.ID != "subnet-1" || network.VPCID != "vpc-1" || network.Status != "Active" {
+		t.Fatalf("unexpected network placement: %#v", network)
 	}
 }
 

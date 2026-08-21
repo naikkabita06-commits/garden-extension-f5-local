@@ -445,6 +445,7 @@ func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		StrictVIPPortID:             strictVIPPortID,
 		RecoverVirtualServersByName: true,
 		AggregateVirtualServer:      true,
+		NetworkIDExplicit:           strings.TrimSpace(lbCfg.NetworkID) != "",
 		LBReadyHook: func(observed model.ObservedState) error {
 			return r.persistLBCheckpoint(ctx, svc, observed, strictLBServiceID)
 		},

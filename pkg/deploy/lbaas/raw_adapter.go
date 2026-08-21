@@ -30,6 +30,13 @@ type RawClient interface {
 	GetCompute(ctx context.Context, id string) (json.RawMessage, error)
 }
 
+// RawNetworkClient is optional because older CMP clients and test doubles did
+// not expose network lookup. Production clients implement it so explicit
+// Service subnet overrides can be validated against their VPC before create.
+type RawNetworkClient interface {
+	GetNetwork(ctx context.Context, id string) (json.RawMessage, error)
+}
+
 type rawAdapter struct{ raw RawClient }
 
 func NewRawClient(raw RawClient) Client { return rawAdapter{raw: raw} }
@@ -44,6 +51,9 @@ func NewCertificateClientFromRaw(raw RawClient) CertificateClient {
 // raw CMP client.
 func NewFromRaw(raw RawClient, vpcID string) *Deployer {
 	d := New(NewRawClient(raw), vpcID)
+	if networks, ok := raw.(RawNetworkClient); ok {
+		d.networks = rawNetworkAdapter{raw: networks}
+	}
 	if pools, ok := raw.(RawPoolClient); ok {
 		d.pools = NewPoolManager(NewPoolClientFromRaw(pools))
 	}
@@ -57,6 +67,27 @@ func NewFromRaw(raw RawClient, vpcID string) *Deployer {
 		d.certificates = NewCertificateManager(NewCertificateClientFromRaw(certificates))
 	}
 	return d
+}
+
+type rawNetworkAdapter struct{ raw RawNetworkClient }
+
+func (a rawNetworkAdapter) GetNetwork(ctx context.Context, id string) (Network, error) {
+	raw, err := a.raw.GetNetwork(ctx, id)
+	if err != nil {
+		return Network{}, err
+	}
+	var network struct {
+		ID     string `json:"id"`
+		VPCID  string `json:"vpc_id"`
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(raw, &network); err != nil {
+		return Network{}, fmt.Errorf("parsing CMP network %q: %w", id, err)
+	}
+	if strings.TrimSpace(network.ID) == "" {
+		network.ID = strings.TrimSpace(id)
+	}
+	return Network{ID: strings.TrimSpace(network.ID), VPCID: strings.TrimSpace(network.VPCID), Status: strings.TrimSpace(network.Status)}, nil
 }
 
 func (a rawAdapter) ListLBServices(

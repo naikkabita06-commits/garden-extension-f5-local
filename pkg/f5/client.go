@@ -1607,6 +1607,21 @@ func (c *client) GetCompute(ctx context.Context, id string) (json.RawMessage, er
 	return out, nil
 }
 
+// GetNetwork calls GET /networks/{id}/. It is intentionally a concrete-client
+// capability discovered through a narrow optional interface by the LB
+// deployer, so legacy raw clients do not have to implement it.
+func (c *client) GetNetwork(ctx context.Context, id string) (json.RawMessage, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil, fmt.Errorf("network id must not be empty")
+	}
+	var out json.RawMessage
+	if err := c.doRequest(ctx, http.MethodGet, c.networkPath("/"+url.PathEscape(id)+"/"), nil, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ListLBFlavors calls GET /load-balancers/lb-flavor/.
 func (c *client) ListLBFlavors(ctx context.Context) ([]json.RawMessage, error) {
 	var out []json.RawMessage
@@ -1646,6 +1661,16 @@ func (c *client) computePath(subPath string) string {
 			subPath)
 	}
 	return c.withPrefix("/computes" + subPath)
+}
+
+func (c *client) networkPath(subPath string) string {
+	if c.organisationName != "" && c.projectID != "" {
+		return fmt.Sprintf("/api/v2.1/networks/domain/%s/project/%s/networks%s",
+			url.PathEscape(c.organisationName),
+			url.PathEscape(c.projectID),
+			subPath)
+	}
+	return c.withPrefix("/networks" + subPath)
 }
 
 // doRequest is a small helper for JSON-based HTTP requests.
