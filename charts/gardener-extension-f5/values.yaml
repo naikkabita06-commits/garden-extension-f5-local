@@ -36,9 +36,12 @@ nameOverride: ""
 fullnameOverride: ""
 
 image:
-  repository: europe-docker.pkg.dev/gardener-project/public/gardener/extensions/f5
-  tag: latest
+  repository: b2bimagerepo.airteluat.cloud/gkaas/gardener-extension-f5
+  tag: dev
   pullPolicy: IfNotPresent
+
+imagePullSecrets:
+  - name: airtel-registry-pull
 
 serviceAccount:
   create: true
