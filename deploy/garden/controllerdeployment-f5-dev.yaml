@@ -1,0 +1,22 @@
+apiVersion: core.gardener.cloud/v1
+kind: ControllerDeployment
+metadata:
+  name: gardener-extension-f5
+
+helm:
+  ociRepository:
+    pullSecretRef:
+      name: provider-local-airtel-registry-pull
+    repository: b2bimagerepo.airteluat.cloud/gkaas/gardener-extension-f5
+    tag: 0.1.1
+
+  values:
+    image:
+      repository: b2bimagerepo.airteluat.cloud/gkaas/gardener-extension-f5
+      tag: dev
+
+    imagePullSecrets:
+      - name: airtel-registry-pull
+
+    rbac:
+      clusterAdmin: true
