@@ -133,6 +133,15 @@ func validateLBServiceReadiness(svc LBService) error {
 		return nil
 	}
 
+	if status == "" && opStatus == "" {
+		return &ProvisioningPendingError{
+			ResourceType: "LBService",
+			ResourceID:   id,
+			Status:       "unknown",
+			Detail:       "CMP LBService response omitted status and operating_status",
+		}
+	}
+
 	return &ProvisioningPendingError{
 		ResourceType: "LBService",
 		ResourceID:   id,
@@ -174,7 +183,7 @@ func validateLBServicePlacement(svc LBService, req EnsureRequest) error {
 
 func isReadyLBStatus(status string) bool {
 	switch strings.ToLower(strings.TrimSpace(status)) {
-	case "active", "ready", "available", "online", "success", "ok":
+	case "created", "active", "ready", "available", "online", "success", "ok":
 		return true
 	default:
 		return false

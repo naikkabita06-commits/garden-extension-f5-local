@@ -2,6 +2,7 @@ package lbaas
 
 import (
 	"context"
+	"strings"
 	"testing"
 )
 
@@ -13,6 +14,26 @@ func TestLBServiceManagerVerifiesCurrentID(t *testing.T) {
 	}
 	if id != "lb-1" || changed || stub.createdLB != 0 {
 		t.Fatalf("unexpected result id=%q changed=%t created=%d", id, changed, stub.createdLB)
+	}
+}
+
+func TestLBServiceManagerTreatsCreatedStatusAsReady(t *testing.T) {
+	stub := &stubClient{lbServices: []LBService{{ID: "lb-1", Name: "app", Status: "Created"}}}
+	id, changed, err := NewLBServiceManager(stub, "").Ensure(context.Background(), EnsureRequest{LBName: "app"}, "lb-1", false)
+	if err != nil || id != "lb-1" || changed {
+		t.Fatalf("expected Created LB to be ready, id=%q changed=%t err=%v", id, changed, err)
+	}
+}
+
+func TestLBServiceManagerKeepsMissingReadinessStatusPending(t *testing.T) {
+	stub := &stubClient{lbServices: []LBService{{ID: "lb-1", Name: "app"}}}
+	_, _, err := NewLBServiceManager(stub, "").Ensure(context.Background(), EnsureRequest{LBName: "app"}, "lb-1", false)
+	pending, ok := IsProvisioningPending(err)
+	if !ok {
+		t.Fatalf("expected missing readiness fields to remain pending, got %v", err)
+	}
+	if pending.Status != "unknown" || !strings.Contains(pending.Detail, "omitted status") {
+		t.Fatalf("expected explicit missing-status diagnostic, got %#v", pending)
 	}
 }
 

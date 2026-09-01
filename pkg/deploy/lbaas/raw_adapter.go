@@ -280,7 +280,7 @@ func (a rawAdapter) CreateVirtualServer(ctx context.Context, lbServiceID string,
 	q.Set("vip_port_id", spec.VIPPortID)
 	q.Set("protocol", spec.Protocol)
 	q.Set("port", fmt.Sprintf("%d", spec.Port))
-	q.Set("routing_algorithm", spec.RoutingAlgorithm)
+	q.Set("routing_algorithm", canonicalRoutingAlgorithm(spec.RoutingAlgorithm))
 	if spec.PoolName != "" {
 		q.Set("pool_name", spec.PoolName)
 	}
@@ -518,7 +518,7 @@ func poolSpecQuery(spec PoolSpec) url.Values {
 		q.Set("pool_members_protocol", spec.Protocol)
 	}
 	if spec.RoutingAlgorithm != "" {
-		q.Set("routing_algorithm", spec.RoutingAlgorithm)
+		q.Set("routing_algorithm", canonicalRoutingAlgorithm(spec.RoutingAlgorithm))
 	}
 	if spec.Monitor != nil {
 		if spec.Monitor.Name != "" {
@@ -539,6 +539,13 @@ func poolSpecQuery(spec PoolSpec) url.Values {
 		q.Add("nodes", string(b))
 	}
 	return q
+}
+
+func canonicalRoutingAlgorithm(value string) string {
+	value = strings.TrimSpace(value)
+	value = strings.ReplaceAll(value, "-", "_")
+	value = strings.Join(strings.Fields(value), "_")
+	return strings.ToUpper(value)
 }
 
 func poolMemberSpecQuery(spec PoolMemberSpec) url.Values {

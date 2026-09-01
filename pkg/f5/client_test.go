@@ -14,6 +14,18 @@ import (
 	"github.com/go-logr/logr"
 )
 
+func TestCanonicalRoutingAlgorithm(t *testing.T) {
+	for input, expected := range map[string]string{
+		"round_robin":      "ROUND_ROBIN",
+		"ROUND_ROBIN":      "ROUND_ROBIN",
+		"least-connections": "LEAST_CONNECTIONS",
+	} {
+		if got := canonicalRoutingAlgorithm(input); got != expected {
+			t.Errorf("canonicalRoutingAlgorithm(%q) = %q, want %q", input, got, expected)
+		}
+	}
+}
+
 func TestClientWithCeAuth_SetsHeaders(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {

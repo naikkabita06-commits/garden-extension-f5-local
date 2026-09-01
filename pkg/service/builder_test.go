@@ -30,8 +30,11 @@ func TestBuildLoadBalancerStackBuildsPortsAndBackends(t *testing.T) {
 	if port.FrontendPort != 80 || port.NodePort != 30080 || port.Protocol != "TCP" {
 		t.Fatalf("unexpected port model: %#v", port)
 	}
-	if len(port.Backends) != 1 || port.Backends[0].IP != "10.0.0.1" || port.Backends[0].Port != 30080 || port.Backends[0].Weight != 1 {
+	if len(port.Backends) != 1 || port.Backends[0].IP != "10.0.0.1" || port.Backends[0].Port != 30080 || port.Backends[0].Weight != 50 {
 		t.Fatalf("unexpected backends: %#v", port.Backends)
+	}
+	if stack.Pools[0].Members[0].Weight != 50 {
+		t.Fatalf("expected calculated backend weight in pool, got %#v", stack.Pools[0].Members)
 	}
 	if stack.LBService.Name != "app-ns-web" || stack.VIP.Name != "app-vip-ns-web" {
 		t.Fatalf("expected deterministic parent resources, got LB=%#v VIP=%#v", stack.LBService, stack.VIP)

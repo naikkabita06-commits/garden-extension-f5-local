@@ -2,9 +2,6 @@ FROM golang:1.25 AS builder
 
 WORKDIR /src
 
-COPY zscaler-root-ca.crt /usr/local/share/ca-certificates/zscaler-root-ca.crt
-RUN update-ca-certificates
-
 COPY . .
 
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH:-amd64} \

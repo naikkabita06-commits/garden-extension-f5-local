@@ -130,6 +130,20 @@ For example, the VM demo uses the local registry:
 
 See `deploy/kind/` and `docs/demo-a-z.md` for the copy/paste demo flow.
 
+### Private image registry trust
+
+Registry TLS is verified by the container runtime on each Seed or Shoot worker
+before an extension container starts. Consequently, adding a corporate or
+private registry CA to the extension image cannot fix `ImagePullBackOff` errors.
+
+For development, configure the worker's containerd registry host entry under
+`/etc/containerd/certs.d/<registry>/hosts.toml`. `skip_verify = true` is only a
+temporary development escape hatch. Production workers must trust the
+registry's issuing CA through their machine image or bootstrap configuration.
+
+`F5_CA_BUNDLE_PATH` is separate: use it only when the running extension needs a
+custom CA for CMP API HTTPS calls. It does not affect image pulls.
+
 ## Troubleshooting: VIP created but traffic fails (application plane)
 
 If CIS created the Virtual Server on BIG-IP but `curl` to the VIP hangs/resets, check backend reachability first.
