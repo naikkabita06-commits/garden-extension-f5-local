@@ -101,6 +101,47 @@ func TestListReadyNodeBackendsCarriesProviderIDComputeIDAndBackendIP(t *testing.
 	}
 }
 
+func TestListReadyNodeBackendsParsesAPCProviderID(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "web"}}
+	node := readyNode("n1", "10.0.87.192")
+	node.Spec.ProviderID = "apc:///dev/79bf2d7e-d547-4da4-84c4-fcadd9bb9fd7"
+
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(svc, node).Build()
+	backends, err := ListReadyNodeBackends(context.Background(), c, svc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(backends) != 1 || backends[0].ProviderID != node.Spec.ProviderID || backends[0].ComputeID != "79bf2d7e-d547-4da4-84c4-fcadd9bb9fd7" || backends[0].IP != "10.0.87.192" {
+		t.Fatalf("unexpected APC backend identity: %#v", backends)
+	}
+}
+
+func TestComputeIDRejectsMalformedAPCProviderIDAndUsesAnnotationFallback(t *testing.T) {
+	tests := []struct {
+		name       string
+		providerID string
+	}{
+		{name: "missing region", providerID: "apc:////compute-1"},
+		{name: "missing compute id", providerID: "apc:///dev/"},
+		{name: "extra path segment", providerID: "apc:///dev/compute-1/extra"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			node := &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{lbannotations.CMPComputeID: "annotation-compute"}},
+				Spec:       corev1.NodeSpec{ProviderID: test.providerID},
+			}
+			if got := ComputeID(node); got != "annotation-compute" {
+				t.Fatalf("expected annotation fallback for malformed provider ID %q, got %q", test.providerID, got)
+			}
+		})
+	}
+}
+
 func TestListReadyNodeBackendsUsesDevelopmentAnnotations(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := clientgoscheme.AddToScheme(scheme); err != nil {
