@@ -130,6 +130,36 @@ For example, the VM demo uses the local registry:
 
 See `deploy/kind/` and `docs/demo-a-z.md` for the copy/paste demo flow.
 
+### Private image registry trust
+
+Three separate clients can require private CA configuration:
+
+1. The Docker builder downloads Go modules. On a corporate workstation, pass
+   the local CA to the optional BuildKit secret:
+
+   ```bash
+   docker buildx build \
+     --secret id=corporate_ca,src=zscaler-root-ca.crt \
+     --platform linux/amd64 \
+     -t <registry>/gardener-extension-f5:<tag> \
+     --load .
+   ```
+
+2. Docker BuildKit pushes the finished image. Configure registry trust in the
+   BuildKit daemon; a CA installed in the builder stage does not affect pushes.
+
+3. Seed or Shoot worker containerd pulls the image before the extension starts.
+   Configure registry trust on those workers; a CA inside the extension image
+   cannot fix `ImagePullBackOff` errors.
+
+For development, configure the worker's containerd registry host entry under
+`/etc/containerd/certs.d/<registry>/hosts.toml`. `skip_verify = true` is only a
+temporary development escape hatch. Production workers must trust the
+registry's issuing CA through their machine image or bootstrap configuration.
+
+`F5_CA_BUNDLE_PATH` is separate: use it only when the running extension needs a
+custom CA for CMP API HTTPS calls. It does not affect image pulls.
+
 ## Troubleshooting: VIP created but traffic fails (application plane)
 
 If CIS created the Virtual Server on BIG-IP but `curl` to the VIP hangs/resets, check backend reachability first.

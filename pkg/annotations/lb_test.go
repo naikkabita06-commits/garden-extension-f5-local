@@ -33,8 +33,21 @@ func TestParseServicePrefersSpecSourceRangesAndClientIPAffinity(t *testing.T) {
 	if cfg.HealthType != "http" || cfg.HealthPath != "/healthz" {
 		t.Fatalf("expected http health path, got type=%q path=%q", cfg.HealthType, cfg.HealthPath)
 	}
-	if cfg.HealthInterval != 15 || cfg.DrainingTimeout != 30 || cfg.RoutingAlgorithm != "least_connections" {
+	if cfg.HealthInterval != 15 || cfg.DrainingTimeout != 30 || cfg.RoutingAlgorithm != "LEAST_CONNECTIONS" {
 		t.Fatalf("unexpected config: %#v", cfg)
+	}
+}
+
+func TestNormalizeRoutingAlgorithm(t *testing.T) {
+	for input, expected := range map[string]string{
+		"round_robin":      "ROUND_ROBIN",
+		"ROUND_ROBIN":      "ROUND_ROBIN",
+		"least-connections": "LEAST_CONNECTIONS",
+		" least connections ": "LEAST_CONNECTIONS",
+	} {
+		if got := NormalizeRoutingAlgorithm(input); got != expected {
+			t.Errorf("NormalizeRoutingAlgorithm(%q) = %q, want %q", input, got, expected)
+		}
 	}
 }
 

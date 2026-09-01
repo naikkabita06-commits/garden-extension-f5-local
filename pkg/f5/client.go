@@ -208,14 +208,21 @@ func (c *client) SetCMPLBaaSConfig(cfg CMPLBaaSConfig) {
 	c.cpNetworkID = cfg.NetworkID
 	c.cpVPCID = cfg.VPCID
 	c.cpVPCName = cfg.VPCName
-	c.cpRoutingAlgorithm = cfg.RoutingAlgorithm
+	c.cpRoutingAlgorithm = canonicalRoutingAlgorithm(cfg.RoutingAlgorithm)
 	if c.cpRoutingAlgorithm == "" {
-		c.cpRoutingAlgorithm = "round_robin"
+		c.cpRoutingAlgorithm = "ROUND_ROBIN"
 	}
 	c.cpMonitorInterval = cfg.MonitorInterval
 	if c.cpMonitorInterval <= 0 {
 		c.cpMonitorInterval = 30
 	}
+}
+
+func canonicalRoutingAlgorithm(value string) string {
+	value = strings.TrimSpace(value)
+	value = strings.ReplaceAll(value, "-", "_")
+	value = strings.Join(strings.Fields(value), "_")
+	return strings.ToUpper(value)
 }
 
 // client is a concrete implementation of Client.

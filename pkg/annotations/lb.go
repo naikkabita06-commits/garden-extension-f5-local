@@ -52,6 +52,16 @@ func DefaultLBConfig() LBConfig {
 	return LBConfig{RoutingAlgorithm: "ROUND_ROBIN", HealthInterval: 30, HealthTimeout: 16, HealthType: "tcp"}
 }
 
+// NormalizeRoutingAlgorithm converts user-facing spellings to CMP's canonical
+// enum representation. CMP UI requests and responses use uppercase values such
+// as ROUND_ROBIN and LEAST_CONNECTIONS.
+func NormalizeRoutingAlgorithm(value string) string {
+	value = strings.TrimSpace(value)
+	value = strings.ReplaceAll(value, "-", "_")
+	value = strings.Join(strings.Fields(value), "_")
+	return strings.ToUpper(value)
+}
+
 // ParseService reads supported F5 annotations and Kubernetes-native Service
 // fields. spec.loadBalancerSourceRanges takes precedence over the annotation.
 func ParseService(svc *corev1.Service) LBConfig {
@@ -92,7 +102,7 @@ func parseAnnotations(cfg *LBConfig, ann map[string]string) {
 		}
 	}
 	if v := strings.TrimSpace(ann[RoutingAlgorithm]); v != "" {
-		cfg.RoutingAlgorithm = v
+		cfg.RoutingAlgorithm = NormalizeRoutingAlgorithm(v)
 	}
 	if v := strings.TrimSpace(ann[HealthInterval]); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {

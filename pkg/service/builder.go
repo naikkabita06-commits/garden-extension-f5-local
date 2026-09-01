@@ -75,7 +75,11 @@ func BuildLoadBalancerStackWithPortBackends(svc *corev1.Service, cfg lbannotatio
 		}
 		pool := model.Pool{Name: PoolName(svc, p.Port), Monitor: vs.Monitor, Ownership: model.OwnershipFor(owner, "", "pool", VIPGroup(svc))}
 		for _, n := range backendsForPort(p) {
-			member := model.BackendMember{NodeName: n.NodeName, ProviderID: n.ProviderID, ComputeID: n.ComputeID, IP: n.IP, Port: p.NodePort, Weight: 1}
+			weight := n.Weight
+			if weight <= 0 {
+				weight = 1
+			}
+			member := model.BackendMember{NodeName: n.NodeName, ProviderID: n.ProviderID, ComputeID: n.ComputeID, IP: n.IP, Port: p.NodePort, Weight: weight}
 			sp.Backends = append(sp.Backends, member)
 			pool.Members = append(pool.Members, member)
 		}

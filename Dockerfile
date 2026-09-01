@@ -1,9 +1,18 @@
+# syntax=docker/dockerfile:1.7
+
 FROM golang:1.25 AS builder
 
 WORKDIR /src
 
-COPY zscaler-root-ca.crt /usr/local/share/ca-certificates/zscaler-root-ca.crt
-RUN update-ca-certificates
+# Corporate TLS interception can require an additional CA while the builder
+# downloads Go modules. The secret is optional so clean CI/production builds do
+# not depend on a workstation-only certificate, and it never enters the runtime
+# image.
+RUN --mount=type=secret,id=corporate_ca,required=false \
+    if [ -f /run/secrets/corporate_ca ]; then \
+      cp /run/secrets/corporate_ca /usr/local/share/ca-certificates/corporate-ca.crt && \
+      update-ca-certificates; \
+    fi
 
 COPY . .
 

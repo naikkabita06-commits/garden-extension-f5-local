@@ -206,6 +206,12 @@ func TestRawPoolAdapterEncodesSwaggerQueries(t *testing.T) {
 	}
 }
 
+func TestCanonicalRoutingAlgorithm(t *testing.T) {
+	if got := canonicalRoutingAlgorithm("round-robin"); got != "ROUND_ROBIN" {
+		t.Fatalf("expected CMP canonical routing algorithm, got %q", got)
+	}
+}
+
 func TestRawPoolAdapterListsPools(t *testing.T) {
 	raw := &rawPoolAdapterStub{pools: []json.RawMessage{json.RawMessage(`{"id":"pool-1","pool_name":"pool-web"}`)}}
 	pools, err := NewPoolClientFromRaw(raw).ListPools(context.Background(), "lb-1", "vs-1")
