@@ -11,6 +11,7 @@ import (
 	"time"
 
 	lbannotations "github.com/gardener/gardener-extension-f5/pkg/annotations"
+	lbbackend "github.com/gardener/gardener-extension-f5/pkg/backend"
 	f5client "github.com/gardener/gardener-extension-f5/pkg/f5"
 	"github.com/gardener/gardener-extension-f5/pkg/model"
 
@@ -45,6 +46,7 @@ type stubCMP struct {
 	lastVIPListSubnet   string
 	lastVIPCreateSubnet string
 	vipCreateErr        error
+	computeIPs          map[string]string
 
 	// Optional canned responses for list calls.
 	lbServices []json.RawMessage
@@ -152,7 +154,17 @@ func (s *stubCMP) DetachLBVirtualServerCertificate(context.Context, string, stri
 	return nil
 }
 func (s *stubCMP) GetCompute(_ context.Context, id string) (json.RawMessage, error) {
-	return json.RawMessage(`{"id":"` + id + `","instance_name":"node-` + id + `","vpc_id":"vpc-1","network_id":"subnet-service","region":"dev","ports":[{"id":5001,"fixed_ips":["` + id + `"],"network_id":"subnet-service","device_id":"` + id + `","device_type":"compute"}]}`), nil
+	ip := strings.TrimSpace(s.computeIPs[id])
+	if ip == "" {
+		return nil, fmt.Errorf("test stub has no backend IP registered for compute %q", id)
+	}
+	return json.RawMessage(fmt.Sprintf(
+		`{"id":%q,"instance_name":%q,"vpc_id":"vpc-1","network_id":"subnet-service","region":"dev","ports":[{"id":5001,"fixed_ips":[%q],"network_id":"subnet-service","device_id":%q,"device_type":"compute"}]}`,
+		id,
+		"node-"+id,
+		ip,
+		id,
+	)), nil
 }
 func (s *stubCMP) GetNetwork(_ context.Context, id string) (json.RawMessage, error) {
 	return json.RawMessage(`{"id":"` + id + `","vpc_id":"vpc-1","status":"Active"}`), nil
@@ -192,7 +204,18 @@ func newTestReconciler(t *testing.T, objs ...client.Object) (*serviceReconciler,
 		WithStatusSubresource(&corev1.Service{}).
 		Build()
 
-	stub := &stubCMP{}
+	stub := &stubCMP{computeIPs: map[string]string{}}
+	for _, obj := range objs {
+		node, ok := obj.(*corev1.Node)
+		if !ok {
+			continue
+		}
+		computeID := lbbackend.ComputeID(node)
+		backendIP := lbbackend.InternalIP(node)
+		if computeID != "" && backendIP != "" {
+			stub.computeIPs[computeID] = backendIP
+		}
+	}
 	r := &serviceReconciler{
 		Client:            c,
 		Scheme:            s,
@@ -222,10 +245,10 @@ func TestReconcile_AllocatesVIPAndProgramsCMPVirtualServer(t *testing.T) {
 	svc.Spec.Ports = []corev1.ServicePort{{Port: 8080, NodePort: 30080}}
 	svc.Spec.LoadBalancerClass = ptr.To(defaultLBClass)
 
-	n1 := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n1"}, Spec: corev1.NodeSpec{ProviderID: "apc:///dev/172.18.0.10"}}
+	n1 := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n1"}, Spec: corev1.NodeSpec{ProviderID: "apc:///dev/79bf2d7e-d547-4da4-84c4-fcadd9bb9fd7"}}
 	n1.Status.Addresses = []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "172.18.0.10"}}
 	n1.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}
-	n2 := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n2"}, Spec: corev1.NodeSpec{ProviderID: "apc:///dev/172.18.0.11"}}
+	n2 := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n2"}, Spec: corev1.NodeSpec{ProviderID: "apc:///dev/6e20c6dc-c69b-4f4e-a507-bcc08d86f2d1"}}
 	n2.Status.Addresses = []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "172.18.0.11"}}
 	n2.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}
 
@@ -376,10 +399,10 @@ func TestReconcile_RecreatesVirtualServerWhenNodesChange(t *testing.T) {
 	svc.Spec.Ports = []corev1.ServicePort{{Port: 8080, NodePort: 30080}}
 	svc.Spec.LoadBalancerClass = ptr.To(defaultLBClass)
 
-	n1 := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n1"}, Spec: corev1.NodeSpec{ProviderID: "apc:///dev/172.18.0.10"}}
+	n1 := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n1"}, Spec: corev1.NodeSpec{ProviderID: "apc:///dev/79bf2d7e-d547-4da4-84c4-fcadd9bb9fd7"}}
 	n1.Status.Addresses = []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "172.18.0.10"}}
 	n1.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}
-	n2 := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n2"}, Spec: corev1.NodeSpec{ProviderID: "apc:///dev/172.18.0.11"}}
+	n2 := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n2"}, Spec: corev1.NodeSpec{ProviderID: "apc:///dev/6e20c6dc-c69b-4f4e-a507-bcc08d86f2d1"}}
 	n2.Status.Addresses = []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "172.18.0.11"}}
 	n2.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}
 
@@ -396,7 +419,7 @@ func TestReconcile_RecreatesVirtualServerWhenNodesChange(t *testing.T) {
 
 	// Add a new node, then reconcile again. CMP's aggregate API owns the pool
 	// members, so a backend-set change begins a delete-before-recreate cycle.
-	n3 := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n3"}, Spec: corev1.NodeSpec{ProviderID: "apc:///dev/172.18.0.12"}}
+	n3 := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n3"}, Spec: corev1.NodeSpec{ProviderID: "apc:///dev/4f7706d9-317a-4f50-9cbd-8fedf5b21988"}}
 	n3.Status.Addresses = []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "172.18.0.12"}}
 	n3.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}
 	if err := c.Create(ctx, n3); err != nil {
@@ -594,7 +617,7 @@ func TestReconcile_PersistsLBCheckpointBeforeVIPAndVS(t *testing.T) {
 	svc.Spec.Type = corev1.ServiceTypeLoadBalancer
 	svc.Spec.Ports = []corev1.ServicePort{{Port: 8080, NodePort: 30080}}
 	svc.Spec.LoadBalancerClass = ptr.To(defaultLBClass)
-	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n1"}, Spec: corev1.NodeSpec{ProviderID: "apc:///dev/172.18.0.10"}}
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n1"}, Spec: corev1.NodeSpec{ProviderID: "apc:///dev/79bf2d7e-d547-4da4-84c4-fcadd9bb9fd7"}}
 	node.Status.Addresses = []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "172.18.0.10"}}
 	node.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}
 
@@ -632,7 +655,7 @@ func TestReconcile_ProgramsAndTracksEveryServicePortIndependently(t *testing.T) 
 		{Name: "https", Port: 443, NodePort: 30443, Protocol: corev1.ProtocolTCP},
 	}
 	svc.Spec.LoadBalancerClass = ptr.To(defaultLBClass)
-	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n1"}, Spec: corev1.NodeSpec{ProviderID: "apc:///dev/172.18.0.10"}}
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n1"}, Spec: corev1.NodeSpec{ProviderID: "apc:///dev/79bf2d7e-d547-4da4-84c4-fcadd9bb9fd7"}}
 	node.Status.Addresses = []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "172.18.0.10"}}
 	node.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}
 
@@ -667,7 +690,7 @@ func TestReconcile_VIPGroupBootstrapsSharedParentWithoutSibling(t *testing.T) {
 	svc.Spec.Ports = []corev1.ServicePort{{Name: "http", Port: 8080, NodePort: 30080, Protocol: corev1.ProtocolTCP}}
 	svc.Spec.LoadBalancerClass = ptr.To(defaultLBClass)
 
-	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n1"}, Spec: corev1.NodeSpec{ProviderID: "apc:///dev/172.18.0.10"}}
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n1"}, Spec: corev1.NodeSpec{ProviderID: "apc:///dev/79bf2d7e-d547-4da4-84c4-fcadd9bb9fd7"}}
 	node.Status.Addresses = []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "172.18.0.10"}}
 	node.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}
 
