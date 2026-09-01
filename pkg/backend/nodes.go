@@ -190,6 +190,16 @@ func ComputeID(node *corev1.Node) string {
 	if strings.HasPrefix(providerID, "cmp://") {
 		return strings.TrimSpace(strings.TrimPrefix(providerID, "cmp://"))
 	}
+	// provider-airtelcloud publishes worker identities as
+	// apc:///<region>/<compute-uuid> (for example,
+	// apc:///dev/79bf2d7e-d547-4da4-84c4-fcadd9bb9fd7). The final path
+	// segment is the CMP compute UUID used by the LBaaS backend API.
+	if strings.HasPrefix(providerID, "apc:///") {
+		parts := strings.Split(strings.TrimPrefix(providerID, "apc:///"), "/")
+		if len(parts) == 2 && strings.TrimSpace(parts[0]) != "" && strings.TrimSpace(parts[1]) != "" {
+			return strings.TrimSpace(parts[1])
+		}
+	}
 	return strings.TrimSpace(node.Annotations[lbannotations.CMPComputeID])
 }
 
