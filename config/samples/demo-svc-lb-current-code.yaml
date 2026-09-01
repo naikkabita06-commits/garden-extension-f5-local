@@ -132,3 +132,128 @@ spec:
       protocol: TCP
       port: 8080
       targetPort: 5678
+
+
+#3 testing for app b exisying lb and vip
+kubectl --kubeconfig "$SHOOT_KC" apply -f - <<'EOF'
+apiVersion: v1
+kind: Service
+metadata:
+  name: app-b-lb8dd-test
+  namespace: demo-svc-lb
+  annotations:
+    f5.extensions.gardener.cloud/lb-service-id: "8dddef7f-45be-4eb2-8c1a-bdaac9f14c01"
+    f5.extensions.gardener.cloud/lb-service-id-mode: "provided"
+    f5.extensions.gardener.cloud/vip-port-id: "28684"
+    f5.extensions.gardener.cloud/vip-port-id-mode: "provided"
+spec:
+  type: LoadBalancer
+  loadBalancerClass: f5.extensions.gardener.cloud/bigip
+  selector:
+    app: f5-app-a
+  ports:
+    - name: tcp-8081
+      protocol: TCP
+      port: 8081
+      targetPort: 5678
+EOF
+
+
+
+
+kubectl --kubeconfig=/tmp/shoot--local--f5-test.conf apply -f - <<'EOF'
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: f5-svc-lb
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: f5-app-a
+  namespace: f5-svc-lb
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: f5-app-a
+  template:
+    metadata:
+      labels:
+        app: f5-app-a
+    spec:
+      containers:
+      - name: app
+        image: europe-docker.pkg.dev/gardener-project/releases/gardener/alpine-conntrack:3.23.3
+        imagePullPolicy: IfNotPresent
+        command:
+        - /bin/sh
+        - -c
+        - |
+          while true; do
+            printf 'HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nAPP-A' | nc -l -p 8080
+          done
+        ports:
+        - name: http
+          containerPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: f5-app-b
+  namespace: f5-svc-lb
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: f5-app-b
+  template:
+    metadata:
+      labels:
+        app: f5-app-b
+    spec:
+      containers:
+      - name: app
+        image: europe-docker.pkg.dev/gardener-project/releases/gardener/alpine-conntrack:3.23.3
+        imagePullPolicy: IfNotPresent
+        command:
+        - /bin/sh
+        - -c
+        - |
+          while true; do
+            printf 'HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nAPP-B' | nc -l -p 8080
+          done
+        ports:
+        - name: http
+          containerPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: f5-app-c
+  namespace: f5-svc-lb
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: f5-app-c
+  template:
+    metadata:
+      labels:
+        app: f5-app-c
+    spec:
+      containers:
+      - name: app
+        image: europe-docker.pkg.dev/gardener-project/releases/gardener/alpine-conntrack:3.23.3
+        imagePullPolicy: IfNotPresent
+        command:
+        - /bin/sh
+        - -c
+        - |
+          while true; do
+            printf 'HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nAPP-C' | nc -l -p 8080
+          done
+        ports:
+        - name: http
+          containerPort: 8080
+EOF

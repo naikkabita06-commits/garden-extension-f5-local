@@ -32,6 +32,87 @@ extension deployed into Seed
 
 ./hack/usage/generate-admin-kubeconf.sh > /tmp/shoot-local.kubeconfig
 export SHOOT_KC=/tmp/shoot-local.kubeconfig
+
+
+
+echo '172.18.255.1 api.local.local.external.local.gardener.cloud' |
+sudo tee -a /etc/hosts
+
+
+
+For this local-provider test, keep the CMP compute UUID on the Shoot Node as an annotation. Do not replace the existing `kind://...` providerID.
+
+After the Shoot reaches `Create Succeeded`, run:
+
+```bash
+NODE_NAME=$(kubectl --kubeconfig "$SHOOT_KC" get nodes -o jsonpath='{.items[0].metadata.name}')
+
+kubectl --kubeconfig "$SHOOT_KC" annotate node "$NODE_NAME" \
+  f5.extensions.gardener.cloud/cmp-compute-id="8c6bde46-3dd2-4407-90ff-8c2705427694" \
+  f5.extensions.gardener.cloud/backend-ip="10.10.1.238" \
+  --overwrite
+```
+
+The bridge will then use:
+
+```text
+CMP compute UUID = Node annotation cmp-compute-id
+Backend IP       = Node annotation backend-ip
+Backend port ID  = matching entry from CMP compute.ports[]
+Backend app port = Kubernetes Service NodePort
+```
+
+Verify it with:
+
+```bash
+kubectl --kubeconfig "$SHOOT_KC" get node "$NODE_NAME" \
+  -o jsonpath='computeID={.metadata.annotations.f5\.extensions\.gardener\.cloud/cmp-compute-id}{"\n"}backendIP={.metadata.annotations.f5\.extensions\.gardener\.cloud/backend-ip}{"\n"}'
+```
+
+For local development, the annotation must be reapplied if the Shoot worker Node is deleted and recreated. In production, the Airtel provider should set:
+
+```yaml
+spec:
+  providerID: cmp://8c6bde46-3dd2-4407-90ff-8c2705427694
+```
+
+automatically, so the manual compute-ID annotation is unnecessary. The `backend-ip` annotation is also only needed locally because the Kind Node InternalIP is `172.18.0.8`, not the CMP VM IP `10.10.1.238`.
+
+
+docker exec gardener-local-control-plane \
+  iptables -I cali-FORWARD 1 -i eth0 -s 172.18.0.1/32 -p tcp -j ACCEPT
+
+nohup bash -c 'while true; do
+  docker exec gardener-local-control-plane \
+    iptables -C cali-FORWARD -i eth0 -s 172.18.0.1/32 -p tcp -j ACCEPT 2>/dev/null ||
+  docker exec gardener-local-control-plane \
+    iptables -I cali-FORWARD 1 -i eth0 -s 172.18.0.1/32 -p tcp -j ACCEPT
+  sleep 2
+done' >/tmp/f5-calico-forward.log 2>&1 &
+
+The path VM host → Kind container → Shoot node → app-b pod
+sudo ip route replace 10.0.130.192/32 via 172.18.0.8 dev br-5d738cbda630
+
+Next, forward traffic arriving from CMP/F5 at 10.10.1.238:31514 to the Shoot NodePort:
+sudo iptables -t nat -I PREROUTING 1 \
+  -i enp3s0 -p tcp -d 10.10.1.238 --dport 31514 \
+  -j DNAT --to-destination 10.0.130.192:31514
+
+complete return-path handling so external F5 traffic is translated to the Docker host address and accepted by our Calico rule:
+
+  sudo iptables -t nat -I POSTROUTING 1 \
+  -p tcp -d 10.0.130.192 --dport 31514 \
+  -j MASQUERADE
+
+for app c nodeport
+  sudo iptables -t nat -I PREROUTING 1 \
+  -i enp3s0 -p tcp -d 10.10.1.238 --dport 31146 \
+  -j DNAT --to-destination 10.0.130.192:31146
+
+  sudo iptables -t nat -I POSTROUTING 1 \
+  -p tcp -d 10.0.130.192 --dport 31146 \
+  -j MASQUERADE
+
 ## 0. Environment
 
 ```bash
@@ -216,3 +297,132 @@ kubectl --kubeconfig "$SHOOT_KC" -n "$NS" delete svc app-c-svc app-b-svc app-a-s
 kubectl --kubeconfig "$SHOOT_KC" -n "$NS" get svc
 kubectl --kubeconfig "$SHOOT_KC" delete namespace "$NS"
 ```
+
+
+
+# for garden dev cluster
+
+kubectl --kubeconfig=/home/gardener/admin.conf \
+  -n garden get secret airtel-registry-pull \
+  -o jsonpath='{.data.\.dockerconfigjson}' \
+  | base64 -d > /tmp/airtel-registry-dockerconfig.json
+  
+kubectl --kubeconfig=/home/gardener/admin.conf \
+  -n extension-gardener-extension-f5-7jdgg \
+  create secret generic airtel-registry-pull \
+  --type=kubernetes.io/dockerconfigjson \
+  --from-file=.dockerconfigjson=/tmp/airtel-registry-dockerconfig.json
+
+
+kubectl --kubeconfig=/home/gardener/admin.conf \
+  -n extension-gardener-extension-f5-7jdgg \
+  label secret airtel-registry-pull \
+  gardener.cloud/role=helm-pull-secret
+
+# To access shoot
+
+kubectl --kubeconfig="$VG" \
+  -n garden-local \
+  create --raw \
+  "/apis/core.gardener.cloud/v1beta1/namespaces/garden-local/shoots/f5-test/adminkubeconfig" \
+  -f - <<'EOF' > /tmp/shoot--local--f5-test-kubeconfig-response.json
+{
+  "apiVersion": "authentication.gardener.cloud/v1alpha1",
+  "kind": "AdminKubeconfigRequest",
+  "spec": {
+    "expirationSeconds": 3600
+  }
+}
+EOF
+
+
+cat /tmp/shoot--local--f5-test-kubeconfig-response.json \
+  | python3 -c 'import sys,json,base64; print(base64.b64decode(json.load(sys.stdin)["status"]["kubeconfig"]).decode())' \
+  > /tmp/shoot--local--f5-test.conf
+
+
+env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy \
+kubectl --kubeconfig=/tmp/shoot--local--f5-test.conf get nodes
+No resources found
+[gardener@gardener-k8s-master-1 ~]$ 
+
+  env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy \
+kubectl --kubeconfig=/tmp/shoot--local--f5-test.conf \
+  --context garden-local--smoke-local-internal \
+  api-resources --api-group=apps
+
+
+
+# workerless shoot 
+
+[gardener@gardener-k8s-master-1 ~]$ kubectl --kubeconfig="$VG" \
+  -n garden-local \
+  get shoot smoke-local \
+  -o jsonpath='{.spec.provider.workers}{"\n"}'
+
+[gardener@gardener-k8s-master-1 ~]$ 
+ 
+ # Extract VG admin kubeconfig
+kubectl --kubeconfig=/home/gardener/admin.conf -n garden get secret gardener -o jsonpath='{.data.kubeconfig}' | base64 -d > /tmp/vg.conf
+
+export VG=/tmp/vg.conf
+ 
+export NO_PROXY="${NO_PROXY},api.virtual-garden.100.65.239.241.nip.io,.virtual-garden.100.65.239.241.nip.io"
+export no_proxy="${NO_PROXY}"
+
+# Talk to Virtual Garden
+kubectl --kubeconfig="$VG" get ns
+kubectl --kubeconfig="$VG" get seeds
+kubectl --kubeconfig="$VG" get shoots -A
+kubectl --kubeconfig="$VG" get shoot smoke-local -n garden-local -o wide
+
+# worker shoot for f5 test
+
+cp /home/gardener/src/gardener-v1.139.2/example/provider-local/shoot.yaml \
+   /tmp/f5-test-shoot.yaml
+
+sed '0,/^  name: local$/s//  name: f5-test/' \
+  /home/gardener/src/gardener-v1.139.2/example/provider-local/shoot.yaml \
+
+
+sed -i '/^[[:space:]]*type: calico$/d' /tmp/f5-test-shoot.yaml
+
+
+
+python3 - <<'PY'
+from pathlib import Path
+
+p = Path("/tmp/f5-test-shoot.yaml")
+s = p.read_text()
+
+s = s.replace(
+"""  networking:
+    ipFamilies:
+    - IPv4
+    nodes: 10.0.0.0/16
+    services: 10.201.0.0/16
+""",
+"""  networking:
+    type: calico
+    ipFamilies:
+    - IPv4
+    nodes: 10.0.0.0/16
+    services: 10.201.0.0/16
+""",
+1,
+)
+
+p.write_text(s)
+PY
+
+sed -i '/authentication\.gardener\.cloud\/issuer: "managed"/d' /tmp/f5-test-shoot.yaml
+
+
+ kubectl --kubeconfig="$VG" apply -f /tmp/f5-test-shoot.yaml
+
+
+ kubectl --kubeconfig="$VG" -n garden-local create secret generic cmp-f5-credentials \
+  --from-literal=api-key-id='fa5ee955-0b3a-412a-8a68-d7f39978840b' \
+  --from-literal=api-secret='hxy00x7HVC8a/B5vJ9lTh94pX46sc9iy-wM1oPzH' \
+  --from-literal=project-id='qa-first-cell' \
+  --from-literal=organisation-name='qa-tenant'
