@@ -296,9 +296,11 @@ func TestReconcile_AllocatesVIPAndProgramsCMPVirtualServer(t *testing.T) {
 	}
 	for _, raw := range nodeParams {
 		var n struct {
-			ResourceIP   string `json:"resource_ip"`
-			ResourceType string `json:"resource_type"`
-			Port         int32  `json:"port"`
+			ResourceID    string `json:"resource_id"`
+			ResourceIP    string `json:"resource_ip"`
+			ResourceType  string `json:"resource_type"`
+			BackendPortID int    `json:"backend_port_id"`
+			Port          int32  `json:"port"`
 		}
 		if err := json.Unmarshal([]byte(raw), &n); err != nil {
 			t.Fatalf("unmarshal node param %q: %v", raw, err)
@@ -309,7 +311,19 @@ func TestReconcile_AllocatesVIPAndProgramsCMPVirtualServer(t *testing.T) {
 		if n.ResourceType != "compute" {
 			t.Fatalf("expected resource_type=compute, got %q", n.ResourceType)
 		}
-		if n.ResourceIP != "172.18.0.10" && n.ResourceIP != "172.18.0.11" {
+		if n.BackendPortID != 5001 {
+			t.Fatalf("expected backend_port_id=5001, got %d", n.BackendPortID)
+		}
+		switch n.ResourceIP {
+		case "172.18.0.10":
+			if n.ResourceID != "79bf2d7e-d547-4da4-84c4-fcadd9bb9fd7" {
+				t.Fatalf("expected node 172.18.0.10 to use its APC compute UUID, got %q", n.ResourceID)
+			}
+		case "172.18.0.11":
+			if n.ResourceID != "6e20c6dc-c69b-4f4e-a507-bcc08d86f2d1" {
+				t.Fatalf("expected node 172.18.0.11 to use its APC compute UUID, got %q", n.ResourceID)
+			}
+		default:
 			t.Fatalf("unexpected resource_ip %q", n.ResourceIP)
 		}
 	}
@@ -425,6 +439,7 @@ func TestReconcile_RecreatesVirtualServerWhenNodesChange(t *testing.T) {
 	if err := c.Create(ctx, n3); err != nil {
 		t.Fatalf("create node n3: %v", err)
 	}
+	stub.computeIPs[lbbackend.ComputeID(n3)] = lbbackend.InternalIP(n3)
 
 	_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(svc)})
 	if err != nil {
