@@ -31,10 +31,6 @@ type VirtualServerEnsureRequest struct {
 	DesiredHash             string
 	RecreateWhenHashMissing bool
 	RecoverByName           bool
-	// RepairTerminal permits deletion of an already-observed terminal virtual
-	// server. Without this explicit authorization, failed resources are kept so
-	// their provider diagnostics remain available.
-	RepairTerminal          bool
 }
 
 func (m *VirtualServerManager) Ensure(ctx context.Context, req VirtualServerEnsureRequest) (string, string, bool, error) {
@@ -76,10 +72,7 @@ func (m *VirtualServerManager) Ensure(ctx context.Context, req VirtualServerEnsu
 				}
 				if err := validateVirtualServer(detail, req.VIPPortID, req.Desired); err != nil {
 					if _, terminal := IsTerminalProvisioning(err); terminal {
-						if req.RepairTerminal {
-							return m.deleteFailed(ctx, req.LBServiceID, detail, err)
-						}
-						return detail.ID, detail.Name, false, err
+						return m.deleteFailed(ctx, req.LBServiceID, detail, err)
 					}
 					return "", "", false, err
 				}
@@ -102,10 +95,7 @@ func (m *VirtualServerManager) Ensure(ctx context.Context, req VirtualServerEnsu
 			}
 			if err := validateVirtualServer(candidate, req.VIPPortID, req.Desired); err != nil {
 				if _, terminal := IsTerminalProvisioning(err); terminal {
-					if req.RepairTerminal {
-						return m.deleteFailed(ctx, req.LBServiceID, candidate, err)
-					}
-					return candidate.ID, candidate.Name, false, err
+					return m.deleteFailed(ctx, req.LBServiceID, candidate, err)
 				}
 				return "", "", false, err
 			}
@@ -139,9 +129,7 @@ func (m *VirtualServerManager) Ensure(ctx context.Context, req VirtualServerEnsu
 	}
 	if err := validateVirtualServer(created, req.VIPPortID, req.Desired); err != nil {
 		if _, terminal := IsTerminalProvisioning(err); terminal {
-			// Always preserve a newly-created failed replacement. Deleting it in
-			// the same authorized repair would hide diagnostics and create a loop.
-			return created.ID, created.Name, true, err
+			return m.deleteFailed(ctx, req.LBServiceID, created, err)
 		}
 		return "", "", true, err
 	}

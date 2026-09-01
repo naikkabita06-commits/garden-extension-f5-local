@@ -37,7 +37,7 @@ spec:
           credentialsReferenceName: cmp-f5-credentials
 
           cis:
-            bridgeImage: "registry.local.gardener.cloud:5001/extensions/f5:v0.1.0-dev-gardener-1.139.2-fix7"
+            bridgeImage: "registry.local.gardener.cloud:5001/extensions/f5:dev-v0.1.0"
 
   networking:
     type: calico

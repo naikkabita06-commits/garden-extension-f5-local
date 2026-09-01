@@ -37,7 +37,7 @@ fullnameOverride: ""
 
 image:
   repository: b2bimagerepo.airteluat.cloud/gkaas/gardener-extension-f5
-  tag: dev
+  tag: dev-v0.1.0
   pullPolicy: IfNotPresent
 
 imagePullSecrets:

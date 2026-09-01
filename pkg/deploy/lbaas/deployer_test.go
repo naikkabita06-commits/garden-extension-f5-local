@@ -458,56 +458,6 @@ func TestEnsureRejectsVirtualServerCreateWithoutProviderID(t *testing.T) {
 	}
 }
 
-func TestVirtualServerManagerPreservesTerminalResourceWithoutRepair(t *testing.T) {
-	stub := &stubClient{vsList: []VirtualServer{{ID: "vs-failed", Name: "vs", VIPPortID: "7", Status: "Failed", Protocol: "TCP", Port: 8080}}}
-	_, _, changed, err := NewVirtualServerManager(stub, "vpc-1").Ensure(context.Background(), VirtualServerEnsureRequest{
-		LBServiceID: "lb-1",
-		VIPPortID:   "7",
-		Desired:     model.VirtualServer{Name: "vs", FrontendPort: 8080, Protocol: "TCP"},
-		CurrentID:   "vs-failed",
-	})
-	if _, ok := IsTerminalProvisioning(err); !ok {
-		t.Fatalf("expected terminal provisioning error, got %v", err)
-	}
-	if changed || stub.deletedVS != 0 {
-		t.Fatalf("terminal virtual server must be preserved, changed=%t deleted=%d", changed, stub.deletedVS)
-	}
-}
-
-func TestVirtualServerManagerDeletesTerminalResourceOnlyForRepair(t *testing.T) {
-	stub := &stubClient{vsList: []VirtualServer{{ID: "vs-failed", Name: "vs", VIPPortID: "7", Status: "Failed", Protocol: "TCP", Port: 8080}}}
-	_, _, changed, err := NewVirtualServerManager(stub, "vpc-1").Ensure(context.Background(), VirtualServerEnsureRequest{
-		LBServiceID:   "lb-1",
-		VIPPortID:     "7",
-		Desired:       model.VirtualServer{Name: "vs", FrontendPort: 8080, Protocol: "TCP"},
-		CurrentID:     "vs-failed",
-		RepairTerminal: true,
-	})
-	if _, ok := IsProvisioningPending(err); !ok {
-		t.Fatalf("expected deletion wait during authorized repair, got %v", err)
-	}
-	if !changed || stub.deletedVS != 1 {
-		t.Fatalf("authorized repair must delete exactly once, changed=%t deleted=%d", changed, stub.deletedVS)
-	}
-}
-
-func TestVirtualServerManagerPreservesFailedRepairReplacement(t *testing.T) {
-	stub := &stubClient{createdVSResult: &VirtualServer{ID: "vs-replacement", Name: "vs", VIPPortID: "7", Status: "Failed", Protocol: "TCP", Port: 8080}}
-	_, _, changed, err := NewVirtualServerManager(stub, "vpc-1").Ensure(context.Background(), VirtualServerEnsureRequest{
-		LBServiceID:   "lb-1",
-		VIPPortID:     "7",
-		Desired:       model.VirtualServer{Name: "vs", FrontendPort: 8080, BackendNodePort: 31146, Protocol: "TCP"},
-		Backends:      []model.BackendMember{{ComputeID: "compute-1", IP: "10.0.0.1", Port: 31146, Weight: 1}},
-		RepairTerminal: true,
-	})
-	if _, ok := IsTerminalProvisioning(err); !ok {
-		t.Fatalf("expected replacement terminal error, got %v", err)
-	}
-	if !changed || stub.createdVS != 1 || stub.deletedVS != 0 {
-		t.Fatalf("failed replacement must remain inspectable, changed=%t created=%d deleted=%d", changed, stub.createdVS, stub.deletedVS)
-	}
-}
-
 func TestEnsureUsesComputeDetailsWhenBackendHasComputeID(t *testing.T) {
 	stub := &stubClient{computes: map[string]Compute{
 		"compute-1": {ID: "compute-1", Name: "node-1", VPCID: "vpc-1", NetworkID: "net-1", Ports: []ComputePort{{ID: 38135, FixedIPs: []string{"10.10.1.145"}, NetworkID: "net-1", DeviceID: "compute-1", DeviceType: "compute"}}},

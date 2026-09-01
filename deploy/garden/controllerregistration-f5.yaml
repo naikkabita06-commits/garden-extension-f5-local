@@ -21,6 +21,6 @@ spec:
       - seed
       - shoot
   deployment:
-    policy: Always
+    policy: OnDemand
     deploymentRefs:
       - name: gardener-extension-f5

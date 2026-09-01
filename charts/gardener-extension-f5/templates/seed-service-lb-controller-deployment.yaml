@@ -23,6 +23,10 @@ spec:
 {{ include "gardener-extension-f5.labels" . | indent 8 }}
     spec:
       serviceAccountName: {{ .Values.serviceAccount.name | default (include "gardener-extension-f5.name" .) }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+{{ toYaml . | indent 8 }}
+      {{- end }}
       containers:
         - name: seed-service-lb-controller
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"

@@ -166,10 +166,6 @@ type StackEnsureRequest struct {
 	// AggregateVirtualServer tells the deployer that CMP creates each Service
 	// listener, default pool, members, and monitor in one virtual-server POST.
 	AggregateVirtualServer bool
-	// RepairTerminalVirtualServers authorizes one controlled delete/recreate
-	// attempt for an already-observed virtual server in a terminal state. A
-	// terminal resource is otherwise preserved for diagnosis.
-	RepairTerminalVirtualServers bool
 }
 
 // StackEnsureResult is the graph returned after all supported resource managers
@@ -364,7 +360,7 @@ func (d *Deployer) EnsureStack(ctx context.Context, req StackEnsureRequest) (*St
 		}
 		desiredHash := DesiredVirtualServerHash(vs, backends)
 		currentHash := observed.Graph.VirtualServers[vs.Name].DesiredHash
-		vsID, vsName, vsChanged, err := d.virtualServers.Ensure(ctx, VirtualServerEnsureRequest{LBServiceID: lbID, VIPPortID: vipID, NetworkID: effectiveNetworkID, Region: req.Stack.LBService.Region, Desired: vs, Pool: aggregatePool, Backends: backends, CurrentID: currentID, CurrentHash: currentHash, DesiredHash: desiredHash, RecreateWhenHashMissing: true, RecoverByName: req.RecoverVirtualServersByName, RepairTerminal: req.RepairTerminalVirtualServers})
+		vsID, vsName, vsChanged, err := d.virtualServers.Ensure(ctx, VirtualServerEnsureRequest{LBServiceID: lbID, VIPPortID: vipID, NetworkID: effectiveNetworkID, Region: req.Stack.LBService.Region, Desired: vs, Pool: aggregatePool, Backends: backends, CurrentID: currentID, CurrentHash: currentHash, DesiredHash: desiredHash, RecreateWhenHashMissing: true, RecoverByName: req.RecoverVirtualServersByName})
 		if err != nil {
 			return nil, err
 		}

@@ -8,12 +8,12 @@ helm:
     pullSecretRef:
       name: provider-local-airtel-registry-pull
     repository: b2bimagerepo.airteluat.cloud/gkaas/gardener-extension-f5
-    tag: 0.1.1
+    tag: 0.1.2
 
   values:
     image:
       repository: b2bimagerepo.airteluat.cloud/gkaas/gardener-extension-f5
-      tag: dev
+      tag: dev-v0.1.0
 
     imagePullSecrets:
       - name: airtel-registry-pull
