@@ -132,9 +132,25 @@ See `deploy/kind/` and `docs/demo-a-z.md` for the copy/paste demo flow.
 
 ### Private image registry trust
 
-Registry TLS is verified by the container runtime on each Seed or Shoot worker
-before an extension container starts. Consequently, adding a corporate or
-private registry CA to the extension image cannot fix `ImagePullBackOff` errors.
+Three separate clients can require private CA configuration:
+
+1. The Docker builder downloads Go modules. On a corporate workstation, pass
+   the local CA to the optional BuildKit secret:
+
+   ```bash
+   docker buildx build \
+     --secret id=corporate_ca,src=zscaler-root-ca.crt \
+     --platform linux/amd64 \
+     -t <registry>/gardener-extension-f5:<tag> \
+     --load .
+   ```
+
+2. Docker BuildKit pushes the finished image. Configure registry trust in the
+   BuildKit daemon; a CA installed in the builder stage does not affect pushes.
+
+3. Seed or Shoot worker containerd pulls the image before the extension starts.
+   Configure registry trust on those workers; a CA inside the extension image
+   cannot fix `ImagePullBackOff` errors.
 
 For development, configure the worker's containerd registry host entry under
 `/etc/containerd/certs.d/<registry>/hosts.toml`. `skip_verify = true` is only a
